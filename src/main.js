@@ -1,0 +1,370 @@
+// Tauri v2 GDS Mobile Player - main.js
+
+// State Management
+const state = {
+  serverUrl: localStorage.getItem('gds_server_url') || '',
+  apiKey: localStorage.getItem('gds_api_key') || '',
+  currentView: 'library',
+  category: 'video', // 'video', 'audio', or ''
+  library: []
+};
+
+// DOM Elements
+const views = {
+  library: document.getElementById('view-library'),
+  search: document.getElementById('view-search'),
+  settings: document.getElementById('view-settings')
+};
+
+const searchInput = document.getElementById('search-input');
+const navItems = document.querySelectorAll('.nav-item');
+const categoryTabs = document.querySelectorAll('.tab');
+const playerOverlay = document.getElementById('player-overlay');
+const mainPlayer = document.getElementById('main-player');
+const playerTitle = document.getElementById('player-title');
+const statusDot = document.getElementById('status-indicator');
+const playerBg = document.getElementById('player-bg');
+const audioVisual = document.getElementById('audio-visual');
+const audioPoster = document.getElementById('audio-poster');
+const audioTitle = document.getElementById('audio-title');
+const audioArtist = document.getElementById('audio-artist');
+const videoContainer = document.querySelector('.video-container');
+
+// Initialize
+window.addEventListener('DOMContentLoaded', () => {
+  setupNavigation();
+  setupTabs();
+  setupSettings();
+  setupSearch();
+  setupPlayer();
+  setupButtons();
+  
+  if (state.serverUrl && state.apiKey) {
+    loadLibrary();
+  } else {
+    switchView('settings');
+  }
+});
+
+// Navigation Logic
+function setupNavigation() {
+  navItems.forEach(item => {
+    item.addEventListener('click', () => {
+      switchView(item.dataset.view);
+    });
+  });
+}
+
+function switchView(viewName) {
+  Object.keys(views).forEach(key => {
+    views[key].classList.toggle('active', key === viewName);
+  });
+  
+  navItems.forEach(item => {
+    item.classList.toggle('active', item.dataset.view === viewName);
+  });
+  
+  state.currentView = viewName;
+}
+
+// Tabs Logic
+function setupTabs() {
+  categoryTabs.forEach(tab => {
+    tab.addEventListener('click', () => {
+      categoryTabs.forEach(t => t.classList.remove('active'));
+      tab.classList.add('active');
+      state.category = tab.dataset.category;
+      loadLibrary();
+    });
+  });
+}
+
+// Global API Fetch
+async function gdsFetch(endpoint) {
+  if (!state.serverUrl || !state.apiKey) throw new Error('Setup required');
+  
+  const url = `${state.serverUrl}/gds_dviewer/normal/explorer/${endpoint.replace(/^\//, '')}`;
+  const separator = url.includes('?') ? '&' : '?';
+  const finalUrl = `${url}${separator}apikey=${state.apiKey}`;
+
+  console.log(`[GDS-API] Calling: ${finalUrl}`);
+
+  // Tauri HTTP Plugin Fallback
+  const tauriHttp = window.__TAURI_PLUGIN_HTTP__ || (window.__TAURI__ && window.__TAURI__.http);
+  if (tauriHttp) {
+    try {
+      const response = await tauriHttp.fetch(finalUrl, { method: 'GET', connectTimeout: 5000 });
+      return await response.json();
+    } catch (err) {
+      console.warn('Tauri HTTP failed, using browser fetch:', err);
+    }
+  }
+
+  const response = await fetch(finalUrl);
+  return await response.json();
+}
+
+// Data Loading
+async function loadLibrary() {
+  const grid = document.getElementById('library-grid');
+  grid.innerHTML = Array(6).fill('<div class="card skeleton"></div>').join('');
+  
+  try {
+    statusDot.className = 'status-dot loading';
+    
+    const params = new URLSearchParams({
+      query: '',
+      is_dir: 'false',
+      limit: '100',
+      sort_by: 'date',
+      sort_order: 'desc'
+    });
+    if (state.category) params.append('category', state.category);
+    
+    const data = await gdsFetch(`search?${params.toString()}`);
+    
+    if (data.ret === 'success') {
+      state.library = data.list;
+      renderGrid(grid, data.list);
+      statusDot.className = 'status-dot success';
+    } else {
+      throw new Error(data.ret);
+    }
+  } catch (err) {
+    console.error('Connection Error:', err);
+    grid.innerHTML = `<div style="grid-column: 1/-1; text-align:center; padding:40px; color:var(--text-secondary)">
+      <p>Failed to connect to GDS server.</p>
+      <small>${err.message}</small>
+    </div>`;
+    statusDot.className = 'status-dot error';
+  }
+}
+
+function renderGrid(container, items) {
+  container.innerHTML = '';
+  
+  if (!items || items.length === 0) {
+    container.innerHTML = '<div style="grid-column: 1/-1; text-align:center; padding:40px; color:var(--text-secondary)">No items found.</div>';
+    return;
+  }
+
+  items.forEach((item, index) => {
+    const card = document.createElement('div');
+    card.className = 'card';
+    card.style.animation = `fadeIn 0.4s ease forwards ${index * 0.05}s`;
+    card.style.opacity = '0';
+    
+    const poster = item.meta_poster || 'https://via.placeholder.com/400x250/111/444?text=No+Preview';
+    
+    card.innerHTML = `
+      <img src="${poster}" alt="${item.name}" loading="lazy" onerror="this.src='https://via.placeholder.com/400x250/111/444?text=Error'">
+      <div class="card-info">
+        <div class="card-title">${item.name}</div>
+        <div class="card-subtitle">${item.path.split('/')[0]} / ${formatSize(item.size)}</div>
+      </div>
+    `;
+    
+    card.addEventListener('click', () => playVideo(item));
+    container.appendChild(card);
+  });
+  
+  if (window.lucide) lucide.createIcons();
+}
+
+// Search Logic
+function setupSearch() {
+  let timeout = null;
+  searchInput.addEventListener('input', (e) => {
+    const query = e.target.value.trim();
+    document.getElementById('search-placeholder').style.display = query ? 'none' : 'flex';
+    
+    clearTimeout(timeout);
+    timeout = setTimeout(() => performSearch(query), 600);
+  });
+}
+
+async function performSearch(query) {
+  const grid = document.getElementById('search-results');
+  if (!query) {
+    grid.innerHTML = '';
+    return;
+  }
+  
+  grid.innerHTML = Array(4).fill('<div class="card skeleton"></div>').join('');
+  
+  try {
+    const params = new URLSearchParams({
+      query,
+      is_dir: 'false',
+      limit: '50',
+      category: 'video' // Default search to video for player focus
+    });
+    const data = await gdsFetch(`search?${params.toString()}`);
+    if (data.ret === 'success') {
+      renderGrid(grid, data.list);
+    }
+  } catch (err) {
+    console.error('Search error:', err);
+  }
+}
+
+// Settings Logic
+function setupSettings() {
+  const serverUrlInput = document.getElementById('server-url');
+  const apiKeyInput = document.getElementById('api-key');
+  const btnSave = document.getElementById('save-settings');
+  const btnTestConnection = document.getElementById('btn-test-connection');
+  
+  serverUrlInput.value = state.serverUrl;
+  apiKeyInput.value = state.apiKey;
+  
+  async function testConnection() {
+    const url = serverUrlInput.value.trim();
+    const key = apiKeyInput.value.trim();
+    
+    if (!url || !key) {
+      alert('Please enter both Server URL and API Key');
+      return;
+    }
+
+    btnTestConnection.disabled = true;
+    btnTestConnection.innerHTML = '<i data-lucide="loader-2" class="animate-spin"></i> Testing...';
+    lucide.createIcons();
+
+    try {
+      // Use the generic explorer/search for testing
+      const testUrl = `${url.replace(/\/$/, '')}/gds_dviewer/normal/explorer/search?query=&limit=1&apikey=${key}`;
+      const response = await fetch(testUrl);
+      const data = await response.json();
+      if (data.ret === 'success' || data.list) {
+        alert('✅ Connection successful!');
+      } else {
+        alert('❌ Server responded but: ' + (data.msg || 'Check logs'));
+      }
+    } catch (err) {
+      console.error('Test failed:', err);
+      alert('❌ Connection failed. Check URL/Key and CORS.\nError: ' + err.message);
+    } finally {
+      btnTestConnection.disabled = false;
+      btnTestConnection.innerHTML = '<i data-lucide="zap"></i> Test';
+      lucide.createIcons();
+    }
+  }
+
+  function saveSettings() {
+    const url = serverUrlInput.value.trim().replace(/\/$/, '');
+    const key = apiKeyInput.value.trim();
+    
+    if (!url || !key) {
+      alert('Please enter both Server URL and API Key.');
+      return;
+    }
+
+    state.serverUrl = url;
+    state.apiKey = key;
+    
+    localStorage.setItem('gds_server_url', url);
+    localStorage.setItem('gds_api_key', key);
+    
+    loadLibrary();
+    switchView('library');
+  }
+
+  async function testConnection() {
+    const url = serverUrlInput.value.trim();
+    const key = apiKeyInput.value.trim();
+    
+    if (!url || !key) {
+      alert('Please enter both Server URL and API Key');
+      return;
+    }
+
+    btnTestConnection.disabled = true;
+    btnTestConnection.innerHTML = '<i data-lucide="loader-2" class="animate-spin"></i> Testing...';
+    lucide.createIcons();
+
+    try {
+      const response = await fetch(`${url.replace(/\/$/, '')}/explorer/search?query=&limit=1&apikey=${key}`);
+      const data = await response.json();
+      if (data.ret === 'success' || data.list) {
+        alert('✅ Connection successful!');
+      } else {
+        alert('❌ Server responded but might have errors: ' + (data.msg || 'Unknown error'));
+      }
+    } catch (err) {
+      console.error('Test failed:', err);
+      alert('❌ Connection failed. Check URL, API Key, and CORS settings.\nError: ' + err.message);
+    } finally {
+      btnTestConnection.disabled = false;
+      btnTestConnection.innerHTML = '<i data-lucide="zap"></i> Test';
+      lucide.createIcons();
+    }
+  }
+
+  btnSave.addEventListener('click', saveSettings);
+  btnTestConnection.addEventListener('click', testConnection);
+}
+
+// Global Buttons
+function setupButtons() {
+  document.getElementById('btn-refresh').addEventListener('click', loadLibrary);
+}
+
+// Player Logic
+function setupPlayer() {
+  document.getElementById('btn-close-player').addEventListener('click', () => {
+    mainPlayer.pause();
+    playerOverlay.style.display = 'none';
+    mainPlayer.src = '';
+  });
+}
+
+function playVideo(item) {
+  playerTitle.textContent = item.name;
+  
+  // Audio Player Mode logic
+  const isAudio = item.category === 'audio' || item.ext === 'flac' || item.ext === 'mp3' || item.ext === 'm4a';
+  
+  if (isAudio) {
+    videoContainer.classList.add('audio-mode');
+    audioVisual.style.display = 'flex';
+    audioTitle.textContent = item.name;
+    audioArtist.textContent = item.cast || item.folder || 'GDS Audio Library';
+    
+    // Robust Album Art Retrieval
+    const albumArtUrl = item.meta_poster || `${state.serverUrl}/gds_dviewer/normal/explorer/album_art?path=${encodeURIComponent(item.path)}&source_id=${item.source_id || 0}&apikey=${state.apiKey}`;
+    audioPoster.src = albumArtUrl;
+    playerBg.style.backgroundImage = `url(${albumArtUrl})`;
+    playerBg.style.display = 'block';
+  } else {
+    videoContainer.classList.remove('audio-mode');
+    audioVisual.style.display = 'none';
+    playerBg.style.display = 'none';
+  }
+
+  let streamUrl = item.stream_url;
+  if (!streamUrl.includes('apikey=')) {
+    const separator = streamUrl.includes('?') ? '&' : '?';
+    streamUrl += `${separator}apikey=${state.apiKey}`;
+  }
+  
+  console.log('[PLAY] URL:', streamUrl);
+  mainPlayer.src = streamUrl;
+  playerOverlay.style.display = 'flex';
+  
+  mainPlayer.play().catch(err => {
+    console.error('[PLAY_ERROR]', err);
+    if (err.name === 'NotSupportedError') {
+      alert('This format is not supported by your device browser. Try another file.');
+    }
+  });
+}
+
+// Utils
+function formatSize(bytes) {
+  if (!bytes) return '0 B';
+  const k = 1024;
+  const sizes = ['B', 'KB', 'MB', 'GB', 'TB'];
+  const i = Math.floor(Math.log(bytes) / Math.log(k));
+  return parseFloat((bytes / Math.pow(k, i)).toFixed(2)) + ' ' + sizes[i];
+}
