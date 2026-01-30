@@ -1,10 +1,12 @@
 {
-  "name": "tauri-app",
+  "name": "gds-mobile-player",
   "private": true,
   "version": "0.1.0",
   "type": "module",
   "scripts": {
-    "tauri": "tauri"
+    "tauri": "tauri",
+    "version:bump": "bash scripts/version-bump.sh",
+    "android:build": "bash scripts/version-bump.sh && npm run tauri android build -- --target aarch64"
   },
   "devDependencies": {
     "@tauri-apps/cli": "^2"

@@ -5,8 +5,10 @@ const state = {
   serverUrl: localStorage.getItem('gds_server_url') || '',
   apiKey: localStorage.getItem('gds_api_key') || '',
   currentView: 'library',
-  category: 'video', // 'video', 'audio', or ''
-  library: []
+  category: 'video', // 'video', 'audio', 'animation', 'music_video', or ''
+  library: [],
+  currentPath: '', // For folder navigation
+  pathStack: []    // Navigation history
 };
 
 // DOM Elements
@@ -74,6 +76,8 @@ function setupTabs() {
       categoryTabs.forEach(t => t.classList.remove('active'));
       tab.classList.add('active');
       state.category = tab.dataset.category;
+      state.currentPath = ''; // Reset path when switching tabs
+      state.pathStack = [];
       loadLibrary();
     });
   });
@@ -112,22 +116,54 @@ async function loadLibrary() {
   try {
     statusDot.className = 'status-dot loading';
     
-    const params = new URLSearchParams({
-      query: '',
-      is_dir: 'false',
-      limit: '100',
-      sort_by: 'date',
-      sort_order: 'desc'
-    });
-    if (state.category) params.append('category', state.category);
+    // Folder-based categories (Animation, M/V) show folders first when at root
+    const isFolderCategory = ['animation', 'music_video'].includes(state.category);
+    const isAtRoot = !state.currentPath;
     
-    const data = await gdsFetch(`search?${params.toString()}`);
+    let data;
+    
+    if (isFolderCategory && isAtRoot) {
+      // Show anime/MV title folders first - folders now have category set
+      const params = new URLSearchParams({
+        query: '',
+        is_dir: 'true',  // Folders only
+        limit: '100',
+        sort_by: 'date',
+        sort_order: 'desc'
+      });
+      if (state.category) params.append('category', state.category);
+      data = await gdsFetch(`search?${params.toString()}`);
+    } else if (state.currentPath) {
+
+      // Inside a folder - show its contents
+      const params = new URLSearchParams({
+        path: state.currentPath
+      });
+      data = await gdsFetch(`list?${params.toString()}`);
+      // Transform list response to match search format
+      if (data.ret === 'success' && data.items) {
+        data.list = data.items;
+      }
+    } else {
+      // Default: show files for non-folder categories
+      const params = new URLSearchParams({
+        query: '',
+        is_dir: 'false',
+        limit: '100',
+        sort_by: 'date',
+        sort_order: 'desc'
+      });
+      if (state.category) params.append('category', state.category);
+      data = await gdsFetch(`search?${params.toString()}`);
+    }
+
     
     if (data.ret === 'success') {
       state.library = data.list;
-      renderGrid(grid, data.list);
+      renderGrid(grid, data.list, isFolderCategory);
       statusDot.className = 'status-dot success';
     } else {
+
       throw new Error(data.ret);
     }
   } catch (err) {
@@ -140,36 +176,90 @@ async function loadLibrary() {
   }
 }
 
-function renderGrid(container, items) {
+function renderGrid(container, items, isFolderCategory = false) {
   container.innerHTML = '';
   
+  // Add back button if inside a folder
+  if (state.currentPath) {
+    const backBtn = document.createElement('div');
+    backBtn.className = 'card back-card';
+    backBtn.innerHTML = `
+      <div class="back-icon">←</div>
+      <div class="card-info">
+        <div class="card-title">돌아가기</div>
+        <div class="card-subtitle">뒤로</div>
+      </div>
+    `;
+    backBtn.addEventListener('click', () => {
+      state.pathStack.pop();
+      state.currentPath = state.pathStack[state.pathStack.length - 1] || '';
+      loadLibrary();
+    });
+    container.appendChild(backBtn);
+  }
+  
   if (!items || items.length === 0) {
-    container.innerHTML = '<div style="grid-column: 1/-1; text-align:center; padding:40px; color:var(--text-secondary)">No items found.</div>';
+    container.innerHTML += '<div style="grid-column: 1/-1; text-align:center; padding:40px; color:var(--text-secondary)">No items found.</div>';
     return;
   }
 
   items.forEach((item, index) => {
     const card = document.createElement('div');
     card.className = 'card';
-    card.style.animation = `fadeIn 0.4s ease forwards ${index * 0.05}s`;
+    card.style.animation = `fadeIn 0.4s ease forwards ${index * 0.04}s`;
     card.style.opacity = '0';
     
-    const poster = item.meta_poster || 'https://via.placeholder.com/400x250/111/444?text=No+Preview';
+    const isFolder = item.is_dir;
+    
+    // Poster logic with smart fallback
+    let poster = item.meta_poster;
+    if (!poster) {
+      if (isFolder) {
+        // For folders, try to get poster from yaml or use placeholder
+        poster = item.poster || 'https://via.placeholder.com/300x450/1a1a2e/eee?text=📁';
+      } else {
+        // For video/animation/music_video, use server thumbnail extraction
+        const category = item.category || 'other';
+        if (['video', 'animation', 'music_video'].includes(category)) {
+          poster = `${state.serverUrl}/gds_dviewer/normal/explorer/thumbnail?path=${encodeURIComponent(item.path)}&source_id=${item.source_id || 0}&w=400&apikey=${state.apiKey}`;
+        } else if (category === 'audio') {
+          poster = `${state.serverUrl}/gds_dviewer/normal/explorer/album_art?path=${encodeURIComponent(item.path)}&source_id=${item.source_id || 0}&apikey=${state.apiKey}`;
+        } else {
+          poster = 'https://via.placeholder.com/300x450/111/333?text=No+Preview';
+        }
+      }
+    }
+    
+    // Use meta_summary if available, otherwise parent folder
+    const subtitle = isFolder 
+      ? `${item.children_count || ''} 항목`
+      : (item.meta_summary || item.title || item.path.split('/').slice(-2, -1)[0] || formatSize(item.size));
     
     card.innerHTML = `
-      <img src="${poster}" alt="${item.name}" loading="lazy" onerror="this.src='https://via.placeholder.com/400x250/111/444?text=Error'">
+      <img class="card-poster" src="${poster}" alt="${item.name}" loading="lazy" onerror="this.src='https://via.placeholder.com/300x450/111/333?text=Error'">
       <div class="card-info">
-        <div class="card-title">${item.name}</div>
-        <div class="card-subtitle">${item.path.split('/')[0]} / ${formatSize(item.size)}</div>
+        <div class="card-title">${isFolder ? '📁 ' : ''}${item.title || item.name}</div>
+        <div class="card-subtitle">${subtitle}</div>
       </div>
     `;
     
-    card.addEventListener('click', () => playVideo(item));
+    if (isFolder) {
+      // Navigate into folder
+      card.addEventListener('click', () => {
+        state.pathStack.push(item.path);
+        state.currentPath = item.path;
+        loadLibrary();
+      });
+    } else {
+      // Play file
+      card.addEventListener('click', () => playVideo(item));
+    }
     container.appendChild(card);
   });
   
   if (window.lucide) lucide.createIcons();
 }
+
 
 // Search Logic
 function setupSearch() {
@@ -270,37 +360,6 @@ function setupSettings() {
     switchView('library');
   }
 
-  async function testConnection() {
-    const url = serverUrlInput.value.trim();
-    const key = apiKeyInput.value.trim();
-    
-    if (!url || !key) {
-      alert('Please enter both Server URL and API Key');
-      return;
-    }
-
-    btnTestConnection.disabled = true;
-    btnTestConnection.innerHTML = '<i data-lucide="loader-2" class="animate-spin"></i> Testing...';
-    lucide.createIcons();
-
-    try {
-      const response = await fetch(`${url.replace(/\/$/, '')}/explorer/search?query=&limit=1&apikey=${key}`);
-      const data = await response.json();
-      if (data.ret === 'success' || data.list) {
-        alert('✅ Connection successful!');
-      } else {
-        alert('❌ Server responded but might have errors: ' + (data.msg || 'Unknown error'));
-      }
-    } catch (err) {
-      console.error('Test failed:', err);
-      alert('❌ Connection failed. Check URL, API Key, and CORS settings.\nError: ' + err.message);
-    } finally {
-      btnTestConnection.disabled = false;
-      btnTestConnection.innerHTML = '<i data-lucide="zap"></i> Test';
-      lucide.createIcons();
-    }
-  }
-
   btnSave.addEventListener('click', saveSettings);
   btnTestConnection.addEventListener('click', testConnection);
 }
@@ -349,7 +408,37 @@ function playVideo(item) {
   }
   
   console.log('[PLAY] URL:', streamUrl);
+  
+  // Clear existing tracks
+  while (mainPlayer.firstChild) {
+    mainPlayer.removeChild(mainPlayer.firstChild);
+  }
+  
   mainPlayer.src = streamUrl;
+  
+  // Add subtitle track for video files
+  if (!isAudio) {
+    const subtitleUrl = `${state.serverUrl}/gds_dviewer/normal/explorer/external_subtitle?path=${encodeURIComponent(item.path)}&source_id=${item.source_id || 0}&apikey=${state.apiKey}`;
+    
+    const track = document.createElement('track');
+    track.kind = 'subtitles';
+    track.label = '한국어';
+    track.srclang = 'ko';
+    track.src = subtitleUrl;
+    track.default = true;
+    
+    mainPlayer.appendChild(track);
+    
+    // Ensure track is showing
+    mainPlayer.addEventListener('loadedmetadata', () => {
+      if (mainPlayer.textTracks.length > 0) {
+        mainPlayer.textTracks[0].mode = 'showing';
+      }
+    }, { once: true });
+    
+    console.log('[SUBTITLE] Added track:', subtitleUrl);
+  }
+  
   playerOverlay.style.display = 'flex';
   
   mainPlayer.play().catch(err => {
@@ -359,6 +448,7 @@ function playVideo(item) {
     }
   });
 }
+
 
 // Utils
 function formatSize(bytes) {
