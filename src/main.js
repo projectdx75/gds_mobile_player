@@ -887,29 +887,31 @@ function playVideo(item) {
     streamUrl += `${separator}apikey=${state.apiKey}`;
   }
 
-  // Improved extension parser (ignores query params)
-  const extension = (streamUrlRaw.split('?')[0] || '').split('.').pop().toLowerCase();
+  // Improved extension parser: Prefer item.path, then fallback to URL without query params
+  const extension = (item.path || streamUrlRaw.split('?')[0] || '').split('.').pop().toLowerCase();
   
-  console.log('[PLAY] Extension:', extension, 'isAndroid:', isAndroid);
+  console.log('[PLAY] Extension Detected:', extension, 'isAndroid:', isAndroid);
 
   // 4. [HYBRID] Native Playback Routing
   const isAudio = item.category === 'audio' || ['flac', 'mp3', 'm4a'].includes(extension);
   
+  // Android Native (ExoPlayer for MKV/AVI/TS) - Direct Bridge Priority
+  if (isAndroid && ['mkv', 'avi', 'ts'].includes(extension)) {
+    console.log('[PLAYBACK] Checking Native ExoPlayer Bridge...', extension);
+    if (window.PlayerBridge && window.PlayerBridge.openExoPlayer) {
+        console.log('[PLAYBACK] Triggering Native ExoPlayer for:', cleanTitle);
+        window.PlayerBridge.openExoPlayer(cleanTitle, streamUrl);
+        ui.playerOverlay.classList.remove('active');
+        return;
+    } else {
+        console.warn('[PLAYBACK] PlayerBridge not available, falling back to web.');
+    }
+  }
+
   // Use Tauri v2 invoke if available
   const invoke = window.__TAURI__ ? window.__TAURI__.core.invoke : null;
 
   if (invoke) {
-    // Android Native (ExoPlayer for MKV/AVI/TS)
-    if (isAndroid && ['mkv', 'avi', 'ts'].includes(extension)) {
-      console.log('[PLAYBACK] Launching Native ExoPlayer for:', extension);
-      if (window.PlayerBridge && window.PlayerBridge.openExoPlayer) {
-          window.PlayerBridge.openExoPlayer(cleanTitle, streamUrl);
-          console.log('[PLAYBACK] Native ExoPlayer triggered via Bridge');
-          ui.playerOverlay.classList.remove('active');
-          return;
-      }
-    }
-
     // Desktop Native (MPV for Video)
     if (isDesktop && !isAudio) {
       console.log('[PLAYBACK] Launching Native MPV for:', cleanTitle);
@@ -1071,7 +1073,10 @@ function setupRemoteNavigation() {
     }
     
     // Handle Back/Escape
-    if (key === 'Escape' || key === 'Backspace' || key === 'BrowserBack' || key === 'GoBack' || key === 'XF86Back' || key === 'Back' || e.keyCode === 4 || e.keyCode === 27) {
+    const backKeys = ['Escape', 'Backspace', 'BrowserBack', 'GoBack', 'XF86Back', 'Back'];
+    const isBackKey = backKeys.includes(key) || e.keyCode === 4 || e.keyCode === 27;
+
+    if (isBackKey) {
         const playerOverlay = ui.playerOverlay || document.getElementById('player-overlay');
         const isPlayerActive = playerOverlay && (playerOverlay.classList.contains('active') || playerOverlay.style.display === 'block' || window.getComputedStyle(playerOverlay).display !== 'none');
         
@@ -1079,7 +1084,6 @@ function setupRemoteNavigation() {
         
         if (isPlayerActive) {
             console.log('[REMOTE] Back on player - Closing player');
-            // alert('Back pressed - Closing Player'); // Debug
             e.preventDefault();
             e.stopPropagation();
             
@@ -1109,6 +1113,12 @@ function setupRemoteNavigation() {
             state.pathStack.pop();
             state.currentPath = state.pathStack[state.pathStack.length - 1] || '';
             loadLibrary();
+            return;
+        } else if (state.currentView !== 'library') {
+            console.log('[REMOTE] Back on non-library view - Returning to library');
+            e.preventDefault();
+            e.stopPropagation();
+            switchView('library');
             return;
         }
     }

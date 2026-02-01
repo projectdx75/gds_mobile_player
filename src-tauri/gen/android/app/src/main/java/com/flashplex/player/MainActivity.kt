@@ -35,4 +35,20 @@ class MainActivity : TauriActivity() {
       }
     }, "PlayerBridge")
   }
+
+  override fun onKeyDown(keyCode: Int, event: android.view.KeyEvent?): Boolean {
+    if (keyCode == android.view.KeyEvent.KEYCODE_BACK) {
+      // Intercept back button to prevent app exit. 
+      // JavaScript will handle the back event via setupRemoteNavigation.
+      return true
+    }
+    return super.onKeyDown(keyCode, event)
+  }
+
+  // Also override onBackPressed for modern Android versions
+  @Deprecated("Deprecated in Java")
+  override fun onBackPressed() {
+    // Do nothing - let JS handle navigation
+    // This prevents the system from finishing the activity
+  }
 }
