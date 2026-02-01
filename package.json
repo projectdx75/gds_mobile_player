@@ -1,12 +1,13 @@
 {
-  "name": "gds-mobile-player",
+  "name": "flashplex",
   "private": true,
-  "version": "0.1.0",
+  "version": "0.2.0",
   "type": "module",
   "scripts": {
     "tauri": "tauri",
     "version:bump": "bash scripts/version-bump.sh",
-    "android:build": "bash scripts/version-bump.sh && npm run tauri android build -- --target aarch64"
+    "android:build": "npm run tauri android build -- --target aarch64",
+    "android:shield": "npm run tauri android build -- --target aarch64"
   },
   "devDependencies": {
     "@tauri-apps/cli": "^2"

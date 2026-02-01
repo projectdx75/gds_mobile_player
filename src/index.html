@@ -1,9 +1,10 @@
 <!doctype html>
-<html lang="en">
+<html lang="en" style="background-color: #050505;">
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
-    <title>GDS Mobile Player</title>
+    <title>FlashPlex</title>
+    <style>html, body { background-color: #050505 !important; }</style>
     <link rel="stylesheet" href="styles.css" />
     <link rel="preconnect" href="https://fonts.googleapis.com">
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
@@ -12,12 +13,13 @@
     <script type="module" src="/main.js" defer></script>
   </head>
 
-  <body>
-    <header class="glass-header">
-      <div class="header-content">
-        <h1>GDS <span>MOBILE</span></h1>
-        <div class="header-actions">
-           <button id="btn-refresh" class="icon-btn"><i data-lucide="rotate-cw"></i></button>
+  <body style="background-color: #050505;">
+    <div id="stable-drag-bar" data-tauri-drag-region></div>
+    <header class="glass-header" data-tauri-drag-region>
+      <div class="header-content" data-tauri-drag-region>
+        <h1 data-tauri-drag-region>GDS <span data-tauri-drag-region>MOBILE</span> <small style="font-size: 0.5rem; opacity: 0.5;">v0.2.0</small></h1>
+        <div class="header-actions" data-tauri-drag-region>
+           <button id="btn-refresh" class="icon-btn" tabindex="0"><i data-lucide="rotate-cw"></i></button>
            <div id="status-indicator" class="status-dot"></div>
         </div>
       </div>
@@ -26,13 +28,28 @@
     <main class="content-container">
       <!-- Library View -->
       <section id="view-library" class="view active">
-        <div class="view-header">
+        <!-- Hero Section -->
+        <div class="hero-section">
+          <div class="hero-card">
+            <img src="hero.png" class="hero-img" alt="Featured">
+            <div class="hero-content">
+              <div class="hero-tag">새로 업데이트</div>
+              <div class="hero-title">에반게리온 다카포</div>
+            </div>
+          </div>
+        </div>
+
+        <div class="view-header" data-tauri-drag-region>
           <div class="category-tabs">
-            <button class="tab active" data-category="video">Movies</button>
-            <button class="tab" data-category="animation">Animation</button>
-            <button class="tab" data-category="music_video">M/V</button>
-            <button class="tab" data-category="audio">Music</button>
-            <button class="tab" data-category="">All</button>
+            <button class="tab" data-category="tv_show" tabindex="0">TV/Show</button>
+            <button class="tab" data-category="movie" tabindex="0">Movies</button>
+            <button class="tab" data-category="animation" tabindex="0">Animation</button>
+            <button class="tab" data-category="music_video" tabindex="0">M/V</button>
+            <button class="tab" data-category="audio" tabindex="0">Music</button>
+            <button class="tab" data-category="" tabindex="0">All</button>
+          </div>
+          <div id="sub-category-chips" class="sub-category-bar" style="display: none;">
+            <!-- Dynamic sub-category chips -->
           </div>
         </div>
         <div id="library-grid" class="grid">
@@ -61,67 +78,157 @@
 
       <!-- Settings View -->
       <section id="view-settings" class="view">
-        <div class="settings-card glass">
-          <h3>Connection Setup</h3>
-          <div class="settings-group">
-            <label>Server URL</label>
-            <input type="url" id="server-url" placeholder="http://192.168.0.10:9099" />
+        <div class="settings-tabs">
+          <button class="s-tab active" data-stab="connection">Connection</button>
+          <button class="s-tab" data-stab="category">Categories</button>
+          <button class="s-tab" data-stab="about">About</button>
+        </div>
+
+        <div id="stab-connection" class="stab-content active">
+          <div class="settings-card glass">
+            <h3>Connection Setup</h3>
+            <div class="settings-group">
+              <label>Server URL</label>
+              <input type="url" id="server-url" placeholder="http://192.168.0.10:9099" />
+            </div>
+            <div class="settings-group">
+              <label>API Key</label>
+              <input type="password" id="api-key" placeholder="Enter your GDS API Key" />
+            </div>
+            <div class="settings-actions" style="display: flex; gap: 10px;">
+              <button id="btn-test-connection" class="btn btn-secondary">
+                <i data-lucide="zap"></i> Test
+              </button>
+              <button id="save-settings" class="btn btn-primary">
+                <i data-lucide="check-circle"></i> Save
+              </button>
+            </div>
           </div>
-          <div class="settings-group">
-            <label>API Key</label>
-            <input type="password" id="api-key" placeholder="Enter your GDS API Key" />
-          </div>
-          <div class="settings-actions" style="display: flex; gap: 10px;">
-            <button id="btn-test-connection" class="btn btn-secondary">
-              <i data-lucide="zap"></i> Test
-            </button>
-            <button id="save-settings" class="btn btn-primary">
-              <i data-lucide="check-circle"></i> Save Settings
+        </div>
+
+        <div id="stab-category" class="stab-content">
+          <div class="settings-card glass">
+            <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 15px;">
+              <h3>Category Mapping</h3>
+              <button id="btn-reset-categories" class="icon-btn" title="Reset to Defaults"><i data-lucide="rotate-ccw"></i></button>
+            </div>
+            <p style="font-size: 0.8rem; color: var(--text-secondary); margin-bottom: 15px;">상단 경로에 포함될 키워드를 추가하여 카테고리를 분류합니다. (쉼표로 구분)</p>
+            <div id="category-mapping-list">
+              <!-- Dynamic category inputs -->
+            </div>
+            <button id="save-categories" class="btn btn-primary" style="margin-top: 15px;">
+              <i data-lucide="save"></i> Save Mapping
             </button>
           </div>
         </div>
         
-        <div class="app-info">
-          <p>GDS Mobile Player v1.0.0</p>
-          <p>Powered by Tauri v2</p>
+        <div id="stab-about" class="stab-content">
+          <div class="settings-card glass">
+            <h3>App Information</h3>
+            <div class="app-info">
+              <p>GDS Mobile Player v0.2.0</p>
+              <p>Powered by Tauri v2</p>
+              <p style="margin-top: 10px; font-size: 0.8rem; color: var(--text-secondary);">Continuous Development Engine v2.0</p>
+            </div>
+          </div>
         </div>
       </section>
     </main>
 
     <!-- Bottom Navigation -->
     <nav class="bottom-nav">
-      <div class="nav-item active" data-view="library">
+      <div class="nav-item active" data-view="library" tabindex="0">
         <i data-lucide="home"></i>
         <span>Home</span>
       </div>
-      <div class="nav-item" data-view="search">
+      <div class="nav-item" data-view="search" tabindex="0">
         <i data-lucide="search"></i>
         <span>Search</span>
       </div>
-      <div class="nav-item" data-view="settings">
+      <div class="nav-item" data-view="settings" tabindex="0">
         <i data-lucide="settings"></i>
         <span>Settings</span>
       </div>
     </nav>
 
-    <!-- Player Overlay -->
-    <div id="player-overlay">
+    <!-- Custom Player Overlay (Artplayer Style) -->
+    <div id="player-overlay" class="premium-player">
       <div id="player-bg"></div>
+      
+      <!-- Top Bar: Title & Back -->
       <div class="player-header">
-        <button id="btn-close-player" class="icon-btn"><i data-lucide="chevron-down"></i></button>
-        <span id="player-title">Now Playing</span>
-        <button class="icon-btn" style="opacity: 0"><i data-lucide="more-vertical"></i></button>
+        <button id="btn-close-player" class="ctrl-btn" tabindex="0">
+          <i data-lucide="chevron-left"></i>
+        </button>
+        <div class="player-title-info">
+          <h2 id="player-video-title">Title</h2>
+        </div>
+        <div class="player-actions">
+           <!-- Info icon removed per user request -->
+        </div>
       </div>
+
       <div class="video-container">
-        <div id="audio-visual">
-          <img id="audio-poster" src="" alt="Album Art">
+        <!-- Audio Poster View -->
+        <div id="audio-visual" style="display: none;">
+          <div class="audio-poster-container">
+            <img id="audio-poster" src="" alt="Album Art">
+            <!-- Glassmorphic Visualizer Overlay -->
+            <div class="visualizer-overlay">
+              <div class="vbc bar1"></div>
+              <div class="vbc bar2"></div>
+              <div class="vbc bar3"></div>
+              <div class="vbc bar4"></div>
+              <div class="vbc bar5"></div>
+            </div>
+          </div>
           <div class="audio-info">
              <h2 id="audio-title">Song Title</h2>
              <p id="audio-artist">Artist Name</p>
           </div>
         </div>
-        <video id="main-player" controls playsinline></video>
+        
+        <!-- Video -->
+        <video id="main-player" playsinline></video>
+
+        <!-- Custom Controls Overlay -->
+        <div id="custom-controls" class="controls-overlay">
+          <div class="controls-gradient"></div>
+          
+          <!-- Large Center Play/Pause -->
+          <div class="center-controls">
+             <button id="btn-center-play" class="premium-play-btn"><i data-lucide="play"></i></button>
+          </div>
+
+          <!-- Bottom Bar -->
+          <div class="controls-bottom">
+            <!-- Progress Bar -->
+            <div class="progress-container">
+              <div id="progress-bar-bg" class="progress-bar-rail">
+                <div id="progress-bar-fill" class="progress-bar-fill"></div>
+              </div>
+              <input type="range" id="progress-slider" min="0" max="100" value="0" step="0.1" tabindex="0">
+            </div>
+
+            <!-- Controls Row -->
+            <div class="controls-row">
+              <div class="controls-left">
+                <button id="btn-play-pause" class="ctrl-btn" tabindex="0"><i data-lucide="play"></i></button>
+                <div class="time-display">
+                  <span id="current-time">00:00</span> / <span id="total-time">00:00</span>
+                </div>
+              </div>
+              
+              <div class="controls-right">
+                <button id="btn-vol" class="ctrl-btn" tabindex="0"><i data-lucide="volume-2"></i></button>
+                <button id="btn-settings" class="ctrl-btn" tabindex="0"><i data-lucide="settings"></i></button>
+                <button id="btn-fullscreen" class="ctrl-btn" tabindex="0"><i data-lucide="maximize"></i></button>
+              </div>
+            </div>
+          </div>
+        </div>
       </div>
     </div>
+    <button id="btn-exit-native">종료</button>
   </body>
 </html>

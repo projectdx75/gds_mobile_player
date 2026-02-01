@@ -1,0 +1,64 @@
+
+> flashplex@0.1.48 android:shield
+> npm run tauri android build -- --target aarch64
+
+
+> flashplex@0.1.48 tauri
+> tauri android build --target aarch64
+
+        Info Using installed NDK: /Volumes/WD/Users/yommi/Library/Android/sdk/ndk/28.2.13676358
+        Info Looking up installed tauri packages to check mismatched versions...
+[1m[92m   Compiling[0m flashplex v0.1.48 (/Volumes/WD/Users/yommi/Work/tauri_projects/gds_mobile_player/src-tauri)
+[1m[33mwarning[0m[1m: unused import: `tauri::RuntimeHandle`[0m
+ [1m[94m--> [0msrc/lib.rs:7:5
+  [1m[94m|[0m
+[1m[94m7[0m [1m[94m|[0m use tauri::RuntimeHandle;
+  [1m[94m|[0m     [1m[33m^^^^^^^^^^^^^^^^^^^^[0m
+  [1m[94m|[0m
+  [1m[94m= [0m[1mnote[0m: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+[1m[91merror[E0599][0m[1m: no method named `handle` found for struct `AppHandle<R>` in the current scope[0m
+   [1m[94m--> [0msrc/lib.rs:132:27
+    [1m[94m|[0m
+[1m[94m132[0m [1m[94m|[0m [1m[94m...[0mle = _app.handle();
+    [1m[94m|[0m              [1m[91m^^^^^^[0m
+    [1m[94m|[0m
+[1m[96mhelp[0m: there is a method `and` with a similar name, but with different arguments
+   [1m[94m--> [0m/Users/yommi/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/tower-http-0.6.8/src/follow_redirect/policy/mod.rs:141:5
+    [1m[94m|[0m
+[1m[94m141[0m [1m[94m|[0m [1m[96m/[0m     fn and<P, B, E>(self, o[1m[94m...[0m
+[1m[94m142[0m [1m[94m|[0m [1m[96m|[0m     where
+[1m[94m143[0m [1m[94m|[0m [1m[96m|[0m         Self: Policy<B, E> [1m[94m...[0m
+[1m[94m144[0m [1m[94m|[0m [1m[96m|[0m         P: Policy<B, E>;
+    [1m[94m|[0m [1m[96m|________________________^[0m
+
+[1m[91merror[E0282][0m[1m: type annotations needed[0m
+   [1m[94m--> [0msrc/lib.rs:133:41
+    [1m[94m|[0m
+[1m[94m133[0m [1m[94m|[0m [1m[94m...[0m_on_main_thread(move |app_handle| {
+    [1m[94m|[0m                          [1m[91m^^^^^^^^^^[0m
+[1m[94m134[0m [1m[94m|[0m [1m[94m...[0m = app_handle.android_app().vm();
+    [1m[94m|[0m       [1m[94m----------[0m [1m[94mtype must be known at this point[0m
+    [1m[94m|[0m
+[1m[96mhelp[0m: consider giving this closure parameter an explicit type
+    [1m[94m|[0m
+[1m[94m133[0m [1m[94m| [0m        handle.run_on_main_thread(move |app_handle[92m: /* Type */[0m| {
+    [1m[94m|[0m                                                   [92m++++++++++++[0m
+
+[1m[91merror[E0282][0m[1m: type annotations needed[0m
+   [1m[94m--> [0msrc/lib.rs:176:21
+    [1m[94m|[0m
+[1m[94m176[0m [1m[94m|[0m [1m[94m...[0mmap_err(|e| e.to_string())?;
+    [1m[94m|[0m             [1m[91m^[0m  [1m[94m-[0m [1m[94mtype must be known at this point[0m
+    [1m[94m|[0m
+[1m[96mhelp[0m: consider giving this closure parameter an explicit type
+    [1m[94m|[0m
+[1m[94m176[0m [1m[94m| [0m        }).map_err(|e[92m: /* Type */[0m| e.to_string())?;
+    [1m[94m|[0m                      [92m++++++++++++[0m
+
+[1mSome errors have detailed explanations: E0282, E0599.[0m
+[1mFor more information about an error, try `rustc --explain E0282`.[0m
+[1m[33mwarning[0m: `flashplex` (lib) generated 1 warning
+[1m[91merror[0m: could not compile `flashplex` (lib) due to 3 previous errors; 1 warning emitted
+failed to build Android app: `Failed to run `cargo build`: command ["cargo", "build", "--package", "flashplex", "--manifest-path", "/Volumes/WD/Users/yommi/Work/tauri_projects/gds_mobile_player/src-tauri/Cargo.toml", "--target", "aarch64-linux-android", "--features", "tauri/custom-protocol", "--lib", "--release"] exited with code 101
+       Error failed to build Android app: `Failed to run `cargo build`: command ["cargo", "build", "--package", "flashplex", "--manifest-path", "/Volumes/WD/Users/yommi/Work/tauri_projects/gds_mobile_player/src-tauri/Cargo.toml", "--target", "aarch64-linux-android", "--features", "tauri/custom-protocol", "--lib", "--release"] exited with code 101

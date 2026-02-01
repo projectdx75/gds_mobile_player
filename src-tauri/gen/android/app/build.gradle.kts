@@ -15,14 +15,20 @@ val tauriProperties = Properties().apply {
 
 android {
     compileSdk = 36
-    namespace = "com.gds.mobile.player"
+    namespace = "com.flashplex.player"
     defaultConfig {
         manifestPlaceholders["usesCleartextTraffic"] = "false"
-        applicationId = "com.gds.mobile.player"
+        applicationId = "com.flashplex.player"
         minSdk = 24
         targetSdk = 36
         versionCode = tauriProperties.getProperty("tauri.android.versionCode", "1").toInt()
         versionName = tauriProperties.getProperty("tauri.android.versionName", "1.0")
+        
+        // [OPTIMIZATION] Limit architectures for faster build (Shield TV)
+        ndk {
+            abiFilters.add("arm64-v8a")
+            abiFilters.add("armeabi-v7a")
+        }
     }
     
     // Debug signing for release builds (enables installation without Play Store)
@@ -61,7 +67,7 @@ android {
         val variant = this
         outputs.all {
             val output = this as com.android.build.gradle.internal.api.BaseVariantOutputImpl
-            output.outputFileName = "GDS-Mobile-Player-v${variant.versionName}-${variant.buildType.name}.apk"
+            output.outputFileName = "FlashPlex-v${variant.versionName}-${variant.buildType.name}.apk"
         }
     }
     
@@ -86,6 +92,12 @@ dependencies {
     testImplementation("junit:junit:4.13.2")
     androidTestImplementation("androidx.test.ext:junit:1.1.4")
     androidTestImplementation("androidx.test.espresso:espresso-core:3.5.0")
+
+    // ExoPlayer (Media3) for MKV Support
+    val media3Version = "1.5.1"
+    implementation("androidx.media3:media3-exoplayer:$media3Version")
+    implementation("androidx.media3:media3-ui:$media3Version")
+    implementation("androidx.media3:media3-common:$media3Version")
 }
 
 apply(from = "tauri.build.gradle.kts")
