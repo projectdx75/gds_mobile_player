@@ -22,3 +22,20 @@ dist-ssr
 *.njsproj
 *.sln
 *.sw?
+
+# Tauri / Rust
+src-tauri/target
+src-tauri/gen/schemas
+
+# Mobile / Android
+*.apk
+*.aar
+src-tauri/gen/android/.gradle
+src-tauri/gen/android/build
+src-tauri/gen/android/app/build
+src-tauri/gen/android/app/src/main/jniLibs
+src-tauri/gen/android/tauri.properties
+
+# Build Artifacts
+build_log*.txt
+*''
