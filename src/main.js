@@ -13,6 +13,11 @@ const state = {
   categoryMapping: {}
 };
 
+// Platform Detection
+const isAndroid = /Android/i.test(navigator.userAgent);
+const isIOS = /iPhone|iPad|iPod/i.test(navigator.userAgent);
+const isDesktop = !isAndroid && !isIOS;
+
 // DOM Elements (Cached on load)
 let ui = {};
 
@@ -882,7 +887,6 @@ function playVideo(item) {
     streamUrl += `${separator}apikey=${state.apiKey}`;
   }
 
-  const isAndroid = /Android/i.test(navigator.userAgent);
   // Improved extension parser (ignores query params)
   const extension = (streamUrlRaw.split('?')[0] || '').split('.').pop().toLowerCase();
   
@@ -890,7 +894,6 @@ function playVideo(item) {
 
   // 4. [HYBRID] Native Playback Routing
   const isAudio = item.category === 'audio' || ['flac', 'mp3', 'm4a'].includes(extension);
-  const isDesktop = !isAndroid && !/iPhone|iPad|iPod/i.test(navigator.userAgent);
   
   // Use Tauri v2 invoke if available
   const invoke = window.__TAURI__ ? window.__TAURI__.core.invoke : null;
