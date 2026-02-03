@@ -118,7 +118,6 @@ window.addEventListener("DOMContentLoaded", () => {
     setupPlayer();
     setupButtons();
     setupSettings();
-    setupDragging();
     setupRemoteNavigation();
   } catch (err) {
     console.error("[STARTUP] Setup error:", err);
@@ -1038,23 +1037,16 @@ function closePlayer() {
 }
 
 // [NEW] Native Mode transparency helper
-// [NEW] Native Mode transparency helper
 function updateNativeTransparency(active) {
+  console.log(`[UI] updateNativeTransparency: ${active}`);
   if (active) {
-    document.body.classList.add("player-active");
+    document.body.classList.add("native-player-active");
     if (ui.videoContainer)
       ui.videoContainer.style.backgroundColor = "transparent";
-    if (ui.mainPlayer) {
-      ui.mainPlayer.style.display = "none"; // Force hide
-      ui.mainPlayer.style.opacity = "0";
-    }
+    // Do NOT hide headers or tabs here
   } else {
-    document.body.classList.remove("player-active");
+    document.body.classList.remove("native-player-active");
     if (ui.videoContainer) ui.videoContainer.style.backgroundColor = "#000";
-    if (ui.mainPlayer) {
-      ui.mainPlayer.style.display = "block"; // Restore
-      ui.mainPlayer.style.opacity = "1";
-    }
   }
 }
 
@@ -1194,66 +1186,34 @@ function playVideo(item) {
       const subtitleUrl = `${state.serverUrl}/gds_dviewer/normal/explorer/external_subtitle?path=${encodeURIComponent(item.path)}&source_id=${item.source_id || 0}&apikey=${state.apiKey}`;
 
       // Add player-active class for transparency
-      document.body.classList.add("player-active");
+      document.body.classList.add("native-player-active");
 
-      // Try both snake_case and camelCase for Tauri v2 compatibility
-      const cmd = "open_native_player";
-      const fallbackCmd = "openNativePlayer";
+      const cmd = "launch_mpv_player";
 
       console.log(`[PLAYBACK] Attempting ${cmd}...`);
       invoke(cmd, {
         title: cleanTitle,
         url: streamUrl,
-        subtitle_url: subtitleUrl,
+        subtitleUrl: subtitleUrl,
       })
         .then(() => {
           console.log(`[PLAYBACK] ${cmd} Success`);
-          // Open the player overlay in the frontend to provide the "shell"
           ui.playerOverlay.classList.add("active");
           updateNativeTransparency(true);
           ui.playerTitle.textContent = cleanTitle;
           state.isNativeActive = true;
 
-          // Hide Web Player Container to avoid ghosting
           if (ui.videoContainer) {
-            ui.videoContainer.style.opacity = "0"; // Use opacity to keep layout but hide content
+            ui.videoContainer.style.opacity = "0";
           }
           if (ui.mainPlayer) {
             ui.mainPlayer.pause();
           }
         })
         .catch((err) => {
-          console.warn(
-            `[PLAYBACK] ${cmd} failed, trying ${fallbackCmd}. Error:`,
-            err,
-          );
-          return invoke(fallbackCmd, {
-            title: cleanTitle,
-            url: streamUrl,
-            subtitleUrl: subtitleUrl, // camelCase for params too
-          });
-        })
-        .then((r) => {
-          if (r !== undefined) {
-            console.log(`[PLAYBACK] ${fallbackCmd} Success`);
-            ui.playerOverlay.classList.add("active");
-            updateNativeTransparency(true);
-            ui.playerTitle.textContent = cleanTitle;
-            state.isNativeActive = true;
-
-            // Hide Web Player Container explicitly
-            if (ui.videoContainer) {
-              ui.videoContainer.style.opacity = "0";
-            }
-            if (ui.mainPlayer) {
-              ui.mainPlayer.pause();
-            }
-          }
-        })
-        .catch((finalErr) => {
-          console.error("[PLAYBACK] All native attempts failed:", finalErr);
-          document.body.classList.remove("player-active");
-          if (ui.videoContainer) ui.videoContainer.style.opacity = "1"; // Restore visibility
+          console.error(`[PLAYBACK] All native attempts failed:`, err);
+          document.body.classList.remove("native-player-active");
+          if (ui.videoContainer) ui.videoContainer.style.opacity = "1";
           if (ui.mainPlayer) ui.mainPlayer.style.display = "block";
           startWebPlayback(item, streamUrl, isAudio);
         });
@@ -1325,6 +1285,8 @@ function setupScrollHeader() {
   let lastScrollTop = 0;
   const hideThreshold = 50; // Minimum scroll to trigger hide
 
+  // Scroll listener disabled to prevent header hiding and draggability issues
+  /*
   container.addEventListener(
     "scroll",
     () => {
@@ -1337,10 +1299,6 @@ function setupScrollHeader() {
         return;
       }
 
-      // Scroll Down -> Hide (Disabled)
-      if (scrollTop > lastScrollTop && scrollTop > hideThreshold) {
-        // Logic removed
-      }
       // Scroll Up -> Show
       else if (scrollTop < lastScrollTop) {
         if (mainHeader) mainHeader.classList.remove("header-hidden");
@@ -1351,53 +1309,10 @@ function setupScrollHeader() {
     },
     { passive: true },
   );
+  */
 }
 
-// [NEW] Programmatic Dragging Fallback for Tauri v2 Mac Overlay
-function setupDragging() {
-  const stableBar = document.getElementById("stable-drag-bar");
-  const mainHeader = document.querySelector(".glass-header");
-  const tabsHeader = document.querySelector(".view-header");
-
-  const handleDrag = async (e) => {
-    console.log("[DRAG] mousedown on header", e.target);
-    // Ignore interactive elements
-    if (e.target.closest("button, input, .tab, .icon-btn, #status-indicator"))
-      return;
-
-    try {
-      // Tauri v2 Global API structure check
-      const tauri = window.__TAURI__;
-      if (tauri) {
-        let appWindow = null;
-        if (tauri.window && tauri.window.getCurrentWindow) {
-          appWindow = tauri.window.getCurrentWindow();
-        } else if (
-          tauri.webviewWindow &&
-          tauri.webviewWindow.getCurrentWebviewWindow
-        ) {
-          appWindow = tauri.webviewWindow.getCurrentWebviewWindow();
-        } else if (
-          tauri.window &&
-          tauri.window.Window &&
-          tauri.window.Window.getCurrent
-        ) {
-          appWindow = tauri.window.Window.getCurrent();
-        }
-
-        if (appWindow && appWindow.startDragging) {
-          await appWindow.startDragging();
-        }
-      }
-    } catch (err) {
-      console.error("[DRAG_ERROR]", err);
-    }
-  };
-
-  if (stableBar) stableBar.addEventListener("mousedown", handleDrag);
-  if (mainHeader) mainHeader.addEventListener("mousedown", handleDrag);
-  if (tabsHeader) tabsHeader.addEventListener("mousedown", handleDrag);
-}
+// [REMOVED] Manual Dragging Fallback - Relying on CSS -webkit-app-region: drag
 
 // Global handler for Android back button (called from MainActivity.kt)
 window.handleAndroidBack = function () {

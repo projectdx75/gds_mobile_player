@@ -1,7 +1,7 @@
 :root {
   --bg-color: #050505;
   --card-bg: rgba(30, 30, 30, 0.4);
-  --glass-bg: rgba(15, 15, 15, 0.75);
+  --header-bg: rgba(45, 45, 50, 0.9); /* Baseline Grayish */
   --primary-accent: #3a86ff;
   --secondary-accent: #8338ec;
   --accent-gradient: linear-gradient(135deg, #3a86ff, #8338ec);
@@ -16,7 +16,7 @@
   --safe-area-inset-bottom: env(safe-area-inset-bottom, 0px);
   --border-radius-lg: 18px;
   --border-radius-md: 12px;
-  --titlebar-height: 28px;
+  --titlebar-height: 32px;
 }
 
 * {
@@ -40,52 +40,31 @@ body {
   overflow: hidden;
   display: flex;
   flex-direction: column;
+  transition: background 0.3s ease;
 }
 
-body.player-active, 
-body.player-active #stable-drag-bar,
-body.player-active .content-container,
-body.player-active .view {
+body.native-player-active {
   background: transparent !important;
   background-image: none !important;
 }
 
-#stable-drag-bar {
-  position: fixed;
-  top: 0;
-  left: 0;
-  right: 0;
-  height: var(--titlebar-height, 28px);
-  z-index: 1100;
-  -webkit-app-region: drag;
-  pointer-events: auto;
-  user-select: none;
-}
+/* [REMOVED] stable-drag-bar styles - Returning to native header drag */
 
 /* Header */
 .glass-header {
   padding: calc(var(--safe-area-inset-top) + 10px) 20px 10px;
-  background: var(--glass-bg);
-  backdrop-filter: blur(30px);
-  -webkit-backdrop-filter: blur(30px);
-  border-bottom: 1px solid rgba(255, 255, 255, 0.08);
+  background: var(--header-bg);
+  backdrop-filter: blur(20px);
+  -webkit-backdrop-filter: blur(20px);
+  border-bottom: 1px solid rgba(255, 255, 255, 0.1);
   z-index: 1000;
-  transition: transform 0.4s cubic-bezier(0.23, 1, 0.32, 1), opacity 0.4s ease;
-  opacity: 1;
-  position: relative; /* Changed from sticky to relative for stability */
+  position: sticky;
+  top: 0;
   -webkit-app-region: drag;
   pointer-events: auto;
   user-select: none;
-}
-
-.icon-btn, .tab, .s-tab, .btn, #search-input {
-  -webkit-app-region: no-drag;
-}
-
-.glass-header.header-hidden {
-  transform: translateY(0) !important;
-  opacity: 1 !important;
-  pointer-events: auto !important;
+  -webkit-user-select: none;
+  cursor: default;
 }
 
 .header-content {
@@ -94,12 +73,17 @@ body.player-active .view {
   align-items: center;
   max-width: 1200px;
   margin: 0 auto;
+  user-select: none;
+  -webkit-user-select: none;
+  pointer-events: none; /* Let clicks pass through to header drag region, except buttons */
 }
 
 .header-actions {
   display: flex;
   align-items: center;
   gap: 12px;
+  -webkit-app-region: no-drag;
+  pointer-events: auto; /* Re-enable clicks for buttons */
 }
 
 .status-dot {
@@ -121,6 +105,9 @@ body.player-active .view {
   display: flex;
   align-items: center;
   gap: 8px;
+  user-select: none;
+  -webkit-user-select: none;
+  cursor: default;
 }
 
 /* Hero Section */
@@ -214,17 +201,11 @@ body.player-active .view {
 .view-header {
   padding: 10px 20px;
   margin-bottom: 5px;
-  position: relative; /* Changed from sticky to relative to avoid overlap */
-  z-index: 10;
-  background: linear-gradient(var(--bg-color), transparent);
-  transition: transform 0.4s cubic-bezier(0.23, 1, 0.32, 1), opacity 0.4s ease;
-  opacity: 1;
+  position: sticky;
+  top: 60px;
+  z-index: 900;
+  background: var(--bg-color);
   -webkit-app-region: drag;
-}
-
-.view-header.header-hidden {
-  transform: translateY(0) !important;
-  opacity: 1 !important;
 }
 
 .category-tabs {
@@ -729,16 +710,23 @@ body.player-active .view {
 
 #player-overlay.active {
   display: block !important;
-  z-index: 2000; /* Ensure it's above everything */
+  z-index: 2000;
+  background: transparent !important;
 }
 
-/* Force hide headers when player is active */
-body:has(#player-overlay.active) .glass-header,
-body:has(#player-overlay.active) .view-header,
-body:has(#player-overlay.active) #stable-drag-bar {
-  display: none !important;
-  visibility: hidden !important;
-  opacity: 0 !important;
+/* Reverted native player overrides for headers to default */
+
+#stable-drag-bar {
+  position: fixed;
+  top: 0;
+  left: 0;
+  right: 0;
+  height: var(--titlebar-height, 32px);
+  z-index: 9999;
+  -webkit-app-region: drag;
+  pointer-events: auto;
+  user-select: none;
+  background: transparent;
 }
 
 .video-container {
@@ -748,14 +736,27 @@ body:has(#player-overlay.active) #stable-drag-bar {
   display: flex;
   align-items: center;
   justify-content: center;
-  background: transparent;
+  background: #000;
+  transition: opacity 0.3s ease;
+}
+
+/* When native player is active, hide the web player container */
+body.native-player-active .video-container {
+  opacity: 0 !important;
+  pointer-events: none !important;
+}
+
+body.native-player-active #player-overlay {
+  display: block !important;
+  z-index: 2000;
+  background: transparent !important;
 }
 
 #main-player {
   width: 100%;
   height: 100%;
   object-fit: contain;
-  background: #000;
+  background: transparent !important;
 }
 
 /* Glassmorphism Header */
@@ -1167,13 +1168,20 @@ body.native-player-active {
   background-image: none !important;
 }
 
-body.native-player-active .content-container,
-body.native-player-active .glass-header,
-body.native-player-active .view-header,
+/* Hide only the content, keep the headers/tabs */
+body.native-player-active .hero-section,
+body.native-player-active #library-grid,
 body.native-player-active .bottom-nav {
   opacity: 0;
   pointer-events: none;
   transition: opacity 0.5s ease;
+}
+
+/* Ensure content-container itself is transparent but visible to show child headers */
+body.native-player-active .content-container {
+  background: transparent !important;
+  opacity: 1 !important;
+  pointer-events: auto !important;
 }
 
 #btn-exit-native {

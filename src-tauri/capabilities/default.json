@@ -16,7 +16,11 @@
     "core:resources:default",
     "core:menu:default",
     "core:image:default",
-    "allow-custom-commands",
+    "core:event:default",
+    "allow-launch-mpv-player",
+    "allow-close-native-player",
+    "allow-search-gds",
+    "allow-ping",
     "http:default"
   ]
 }
