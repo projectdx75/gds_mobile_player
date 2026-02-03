@@ -740,8 +740,12 @@ body.native-player-active {
   transition: opacity 0.3s ease;
 }
 
-/* When native player is active, hide the web player container */
+/* When native player is active, hide the web VIDEO ELEMENT ONLY, keep container/controls visible */
 body.native-player-active .video-container {
+  background: transparent !important;
+}
+
+body.native-player-active #main-player {
   opacity: 0 !important;
   pointer-events: none !important;
 }
@@ -771,7 +775,12 @@ body.native-player-active #player-overlay {
   align-items: center;
   background: linear-gradient(rgba(0,0,0,0.9), transparent);
   z-index: 100;
+  -webkit-app-region: drag;
   transition: opacity 0.4s cubic-bezier(0.4, 0, 0.2, 1), transform 0.4s ease;
+}
+
+.player-header .ctrl-btn {
+  -webkit-app-region: no-drag;
 }
 
 .player-header.hidden {
@@ -1169,6 +1178,8 @@ body.native-player-active {
 }
 
 /* Hide only the content, keep the headers/tabs */
+body.native-player-active .glass-header,
+body.native-player-active .view-header,
 body.native-player-active .hero-section,
 body.native-player-active #library-grid,
 body.native-player-active .bottom-nav {
@@ -1198,6 +1209,12 @@ body.native-player-active .content-container {
   backdrop-filter: blur(10px);
   font-weight: 700;
   cursor: pointer;
+  transition: opacity 0.4s ease;
+}
+
+#btn-exit-native.hidden {
+  opacity: 0;
+  pointer-events: none;
 }
 
 body.native-player-active #btn-exit-native {

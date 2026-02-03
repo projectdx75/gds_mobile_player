@@ -61,6 +61,7 @@ function initElements() {
       btnCenterPlay: document.getElementById("btn-center-play"),
       btnPlayPause: document.getElementById("btn-play-pause"),
       playerHeader: document.querySelector(".player-header"),
+      btnExitNative: document.getElementById("btn-exit-native"),
     };
     console.log("[INIT] UI Elements initialized safely.");
   } catch (err) {
@@ -920,13 +921,16 @@ function setupPlayer() {
   const showUI = () => {
     if (ui.customControls) ui.customControls.classList.remove("hidden");
     if (ui.playerHeader) ui.playerHeader.classList.remove("hidden");
+    if (ui.btnExitNative) ui.btnExitNative.classList.remove("hidden");
     document.body.style.cursor = "default";
 
     clearTimeout(hideTimeout);
     hideTimeout = setTimeout(() => {
-      if (!player.paused) {
+      // Auto-hide if video is playing OR if native player is active
+      if (!player.paused || state.isNativeActive) {
         if (ui.customControls) ui.customControls.classList.add("hidden");
         if (ui.playerHeader) ui.playerHeader.classList.add("hidden");
+        if (ui.btnExitNative) ui.btnExitNative.classList.add("hidden");
         document.body.style.cursor = "none";
       }
     }, 3000);
@@ -1190,6 +1194,8 @@ function playVideo(item) {
 
       const cmd = "launch_mpv_player";
 
+      state.isNativeActive = true; 
+      
       console.log(`[PLAYBACK] Attempting ${cmd}...`);
       invoke(cmd, {
         title: cleanTitle,
