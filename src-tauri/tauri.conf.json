@@ -39,7 +39,9 @@
       "icons/icon.ico"
     ],
     "macOS": {
-      "frameworks": ["src-tauri/lib/libmpv.dylib"],
+      "frameworks": [
+        "lib/Libmpv.xcframework/macos-arm64_x86_64/Libmpv.framework"
+      ],
       "minimumSystemVersion": "10.13",
       "entitlements": null,
       "exceptionDomain": "",

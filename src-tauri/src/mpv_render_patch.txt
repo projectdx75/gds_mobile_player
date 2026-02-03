@@ -1,0 +1,21 @@
+// Add these imports at the top
+use std::ptr;
+
+// After MPV initialization, add render context setup:
+unsafe {
+    // Create render context for Metal
+    let render_context = mpv_sys::mpv_render_context_create(mpv, std::ptr::null_mut());
+    if render_context.is_null() {
+        println!("[MPV] Failed to create render context");
+    } else {
+        // Set advanced control flag
+        let adv_name = CString::new("advanced-control").unwrap();
+        let adv_val = CString::new("yes").unwrap();
+        let _ = mpv_sys::mpv_render_context_set_option_string(render_context, adv_name.as_ptr(), adv_val.as_ptr());
+        
+        // Set the metal layer
+        let _ = mpv_sys::mpv_render_context_set_parameter(render_context, mpv_sys::mpv_render_param_type_MPV_RENDER_PARAM_METAL_LAYER, metal_layer);
+        
+        println!("[MPV] Render context created: {:?}", render_context);
+    }
+}
