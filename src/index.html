@@ -10,15 +10,15 @@
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
     <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700&display=swap" rel="stylesheet">
     <script src="https://unpkg.com/lucide@latest"></script>
-    <script type="module" src="/main.js" defer></script>
+    <script src="main.js"></script>
   </head>
 
   <body style="background-color: #050505;">
     <div id="stable-drag-bar" data-tauri-drag-region></div>
     <header class="glass-header" data-tauri-drag-region>
-      <div class="header-content" data-tauri-drag-region>
-        <h1 data-tauri-drag-region>GDS <span data-tauri-drag-region>MOBILE</span> <small style="font-size: 0.5rem; opacity: 0.5;">v0.2.0</small></h1>
-        <div class="header-actions" data-tauri-drag-region>
+      <div class="header-content">
+        <h1>GDS <span>MOBILE</span> <small style="font-size: 0.5rem; opacity: 0.5;">v0.3.6</small></h1>
+        <div class="header-actions">
            <button id="btn-refresh" class="icon-btn" tabindex="0"><i data-lucide="rotate-cw"></i></button>
            <div id="status-indicator" class="status-dot"></div>
         </div>
@@ -80,6 +80,7 @@
       <section id="view-settings" class="view">
         <div class="settings-tabs">
           <button class="s-tab active" data-stab="connection">Connection</button>
+          <button class="s-tab" data-stab="player">Player</button>
           <button class="s-tab" data-stab="category">Categories</button>
           <button class="s-tab" data-stab="about">About</button>
         </div>
@@ -102,6 +103,26 @@
               <button id="save-settings" class="btn btn-primary">
                 <i data-lucide="check-circle"></i> Save
               </button>
+            </div>
+          </div>
+        </div>
+
+        <div id="stab-player" class="stab-content">
+          <div class="settings-card glass">
+            <h3>Player Preferences</h3>
+            <div class="settings-group">
+              <div style="display: flex; justify-content: space-between;">
+                <label>Subtitle Font Scale</label>
+                <span id="subtitle-size-val" style="font-size: 0.8rem; color: var(--primary-accent);">1.0x</span>
+              </div>
+              <input type="range" id="subtitle-size" min="0.5" max="2.0" step="0.1" value="1.0" style="width:100%;" />
+            </div>
+            <div class="settings-group">
+              <div style="display: flex; justify-content: space-between;">
+                <label>Subtitle V-Offset (Bottom)</label>
+                <span id="subtitle-pos-val" style="font-size: 0.8rem; color: var(--primary-accent);">0px</span>
+              </div>
+              <input type="range" id="subtitle-pos" min="-100" max="300" step="5" value="0" style="width:100%;" />
             </div>
           </div>
         </div>
@@ -197,7 +218,7 @@
           
           <!-- Large Center Play/Pause -->
           <div class="center-controls">
-             <button id="btn-center-play" class="premium-play-btn"><i data-lucide="play"></i></button>
+             <button id="btn-center-play" class="premium-play-btn" tabindex="0"><i data-lucide="play"></i></button>
           </div>
 
           <!-- Bottom Bar -->

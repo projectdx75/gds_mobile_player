@@ -1,24 +1,28 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
   "productName": "FlashPlex",
-  "version": "0.2.4",
+  "version": "0.3.11",
   "identifier": "com.flashplex.player",
   "build": {
-    "frontendDist": "../src"
+    "frontendDist": "../src",
+    "beforeBundleCommand": ""
   },
   "app": {
     "withGlobalTauri": true,
+    "macOSPrivateApi": true,
     "windows": [
       {
+        "label": "main",
         "title": "FlashPlex",
         "width": 1280,
         "height": 720,
-        "backgroundColor": "#050505",
+        "transparent": true,
+        "backgroundColor": "#00000000",
         "titleBarStyle": "Overlay",
-        "hiddenTitle": true
+        "hiddenTitle": true,
+        "devtools": true
       }
     ],
-
     "security": {
       "csp": null
     }
@@ -26,15 +30,21 @@
   "bundle": {
     "active": true,
     "targets": "all",
-    "resources": [
-      "resources/*"
-    ],
+    "resources": ["resources/*", "lib/**/*"],
     "icon": [
       "icons/32x32.png",
       "icons/128x128.png",
       "icons/128x128@2x.png",
       "icons/icon.icns",
       "icons/icon.ico"
-    ]
+    ],
+    "macOS": {
+      "frameworks": ["src-tauri/lib/libmpv.dylib"],
+      "minimumSystemVersion": "10.13",
+      "entitlements": null,
+      "exceptionDomain": "",
+      "providerShortName": null,
+      "signingIdentity": null
+    }
   }
 }

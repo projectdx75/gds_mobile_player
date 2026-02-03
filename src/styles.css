@@ -42,6 +42,14 @@ body {
   flex-direction: column;
 }
 
+body.player-active, 
+body.player-active #stable-drag-bar,
+body.player-active .content-container,
+body.player-active .view {
+  background: transparent !important;
+  background-image: none !important;
+}
+
 #stable-drag-bar {
   position: fixed;
   top: 0;
@@ -66,6 +74,7 @@ body {
   opacity: 1;
   position: relative; /* Changed from sticky to relative for stability */
   -webkit-app-region: drag;
+  pointer-events: auto;
   user-select: none;
 }
 
@@ -322,6 +331,12 @@ body {
   }
 }
 
+.grid.folder-view {
+  grid-template-columns: repeat(2, 1fr);
+  gap: 16px;
+  padding: 0 16px;
+}
+
 .card {
   background: var(--card-bg);
   border-radius: var(--border-radius-md);
@@ -364,15 +379,79 @@ body {
 }
 
 .card-title {
-  font-size: 0.95rem;
+  font-size: 0.9rem;
   font-weight: 700;
   color: var(--text-primary);
-  margin-bottom: 2px;
+  margin-bottom: 4px;
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  line-clamp: 2;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+  line-height: 1.25;
+  min-height: 2.5em;
 }
 
 .card-subtitle {
-  font-size: 0.8rem;
+  font-size: 0.75rem;
   color: var(--text-secondary);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+/* Glass Placeholder for no-poster */
+.no-poster-placeholder {
+  width: 100%;
+  aspect-ratio: 2 / 3;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  background: linear-gradient(145deg, rgba(255,255,255,0.05), rgba(255,255,255,0.01));
+  gap: 10px;
+  color: rgba(255,255,255,0.2);
+}
+
+.no-poster-placeholder i {
+  width: 40px;
+  height: 40px;
+  stroke-width: 1.5;
+}
+
+.no-poster-placeholder span {
+  font-size: 0.65rem;
+  font-weight: 800;
+  text-transform: uppercase;
+  letter-spacing: 1px;
+}
+
+/* Back Card Styling */
+.back-card {
+  height: 80px;
+  background: rgba(58, 134, 255, 0.1) !important;
+  border: 1px dashed var(--primary-accent) !important;
+  justify-content: center;
+  flex-direction: row !important;
+  align-items: center !important;
+  padding: 0 15px;
+  gap: 15px;
+}
+
+.back-icon {
+  font-size: 1.5rem;
+  color: var(--primary-accent);
+}
+
+.back-card .card-info {
+  background: none;
+  padding: 0;
+  flex: 1;
+}
+
+.back-card .card-title {
+  min-height: 0;
+  margin-bottom: 0;
 }
 
 /* Skeleton */
@@ -641,7 +720,7 @@ body {
 #player-overlay {
   position: fixed;
   inset: 0;
-  background: #000;
+  background: transparent;
   z-index: 500;
   display: none;
   overflow: hidden;
@@ -650,6 +729,16 @@ body {
 
 #player-overlay.active {
   display: block !important;
+  z-index: 2000; /* Ensure it's above everything */
+}
+
+/* Force hide headers when player is active */
+body:has(#player-overlay.active) .glass-header,
+body:has(#player-overlay.active) .view-header,
+body:has(#player-overlay.active) #stable-drag-bar {
+  display: none !important;
+  visibility: hidden !important;
+  opacity: 0 !important;
 }
 
 .video-container {
@@ -659,7 +748,7 @@ body {
   display: flex;
   align-items: center;
   justify-content: center;
-  background: #000;
+  background: transparent;
 }
 
 #main-player {

@@ -1,0 +1,140 @@
+<?xml version="1.0" encoding="utf-8"?>
+<LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    android:layout_width="match_parent"
+    android:layout_height="wrap_content"
+    android:orientation="vertical"
+    android:background="#DD121212"
+    android:padding="24dp">
+
+    <TextView
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:text="자막 설정"
+        android:textSize="20sp"
+        android:textStyle="bold"
+        android:textColor="#FFFFFF"
+        android:layout_marginBottom="24dp" />
+
+    <!-- Style Section -->
+    <TextView
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:text="스타일"
+        android:textSize="14sp"
+        android:textColor="#88FFFFFF"
+        android:layout_marginBottom="12dp" />
+
+    <RadioGroup
+        android:id="@+id/rg_subtitle_style"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:orientation="horizontal"
+        android:layout_marginBottom="24dp">
+
+        <RadioButton
+            android:id="@+id/rb_style_box"
+            android:layout_width="0dp"
+            android:layout_height="wrap_content"
+            android:layout_weight="1"
+            android:text="기본 (박스)"
+            android:textColor="#FFFFFF"
+            android:buttonTint="#3a86ff" />
+
+        <RadioButton
+            android:id="@+id/rb_style_shadow"
+            android:layout_width="0dp"
+            android:layout_height="wrap_content"
+            android:layout_weight="1"
+            android:text="그림자"
+            android:textColor="#FFFFFF"
+            android:buttonTint="#3a86ff" />
+
+        <RadioButton
+            android:id="@+id/rb_style_outline"
+            android:layout_width="0dp"
+            android:layout_height="wrap_content"
+            android:layout_weight="1"
+            android:text="외곽선"
+            android:textColor="#FFFFFF"
+            android:buttonTint="#3a86ff" />
+    </RadioGroup>
+
+    <!-- Size Section -->
+    <LinearLayout
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:orientation="horizontal"
+        android:gravity="center_vertical"
+        android:layout_marginBottom="8dp">
+
+        <TextView
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:text="크기"
+            android:textSize="14sp"
+            android:textColor="#88FFFFFF"
+            android:layout_weight="1" />
+
+        <TextView
+            android:id="@+id/tv_size_value"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:text="1.0x"
+            android:textSize="14sp"
+            android:textColor="#FFFFFF" />
+    </LinearLayout>
+
+    <SeekBar
+        android:id="@+id/sb_subtitle_size"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:max="150"
+        android:progress="50"
+        android:progressTint="#3a86ff"
+        android:thumbTint="#3a86ff"
+        android:layout_marginBottom="24dp" />
+
+    <!-- Position Section -->
+    <LinearLayout
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:orientation="horizontal"
+        android:gravity="center_vertical"
+        android:layout_marginBottom="8dp">
+
+        <TextView
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:text="위치 (상하)"
+            android:textSize="14sp"
+            android:textColor="#88FFFFFF"
+            android:layout_weight="1" />
+
+        <TextView
+            android:id="@+id/tv_pos_value"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:text="0%"
+            android:textSize="14sp"
+            android:textColor="#FFFFFF" />
+    </LinearLayout>
+
+    <SeekBar
+        android:id="@+id/sb_subtitle_pos"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:max="100"
+        android:progress="0"
+        android:progressTint="#3a86ff"
+        android:thumbTint="#3a86ff"
+        android:layout_marginBottom="16dp" />
+
+    <Button
+        android:id="@+id/btn_close_settings"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:text="닫기"
+        android:backgroundTint="#33FFFFFF"
+        android:textColor="#FFFFFF" />
+
+</LinearLayout>

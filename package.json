@@ -1,18 +1,20 @@
 {
   "name": "flashplex",
   "private": true,
-  "version": "0.2.4",
+  "version": "0.3.11",
   "type": "module",
   "scripts": {
     "tauri": "tauri",
     "version:bump": "bash scripts/version-bump.sh",
     "android:build": "npm run tauri android build -- --target aarch64",
-    "android:shield": "npm run tauri android build -- --target aarch64"
+    "android:shield": "npm run tauri android build -- --target aarch64",
+    "build": "npm run tauri build && bash src-tauri/scripts/embed_libmpv.sh src-tauri/target/release/bundle/macos/FlashPlex.app"
   },
   "devDependencies": {
     "@tauri-apps/cli": "^2"
   },
   "dependencies": {
-    "@tauri-apps/plugin-http": "^2.5.6"
+    "@tauri-apps/plugin-http": "^2.5.6",
+    "tauri-plugin-libmpv-api": "^0.3.2"
   }
 }
