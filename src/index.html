@@ -10,31 +10,72 @@
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
     <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700&display=swap" rel="stylesheet">
     <script src="https://unpkg.com/lucide@latest"></script>
+    <script src="https://unpkg.com/lucide@latest"></script>
+    <script type="module">
+      import { invoke } from 'https://esm.sh/@tauri-apps/api@2.2.0/core';
+      import { listen } from 'https://esm.sh/@tauri-apps/api@2.2.0/event';
+      window.__TAURI_CDN_INVOKE__ = invoke;
+      window.__TAURI_CDN_LISTEN__ = listen;
+      console.log("[CDN] Tauri API loaded via ESM");
+    </script>
     <script src="main.js"></script>
   </head>
 
   
-    <header class="glass-header" data-tauri-drag-region>
+    <header class="glass-header">
       <div class="header-content">
-        <h1>GDS <span>MOBILE</span> <small style="font-size: 0.5rem; opacity: 0.5;">v0.4.0</small></h1>
         <div class="header-actions">
-           <button id="btn-refresh" class="icon-btn" tabindex="0"><i data-lucide="rotate-cw"></i></button>
-           <div id="status-indicator" class="status-dot"></div>
+            <!-- Status Dot -->
+            <div id="status-indicator" class="status-dot"></div>
+            
+            <!-- [PHASE 4] Sort Button -->
+            <button class="icon-btn" id="btn-sort">
+                <i data-lucide="list-filter"></i>
+            </button>
+            <button class="icon-btn" id="btn-search">
+                <i data-lucide="search"></i>
+            </button>
         </div>
       </div>
     </header>
+
+    <!-- [PHASE 4] Sort Menu Overlay -->
+    <div id="sort-menu-overlay" class="sort-overlay hidden">
+        <div class="sort-menu">
+            <div class="sort-header">
+                <span>Sort By</span>
+                <button id="btn-close-sort" class="icon-btn-sm"><i data-lucide="x"></i></button>
+            </div>
+            <div class="sort-options">
+                <button class="sort-option active" data-sort="date" data-order="desc">
+                    <span>Date (Newest)</span>
+                    <i data-lucide="check" class="check-icon"></i>
+                </button>
+                <button class="sort-option" data-sort="date" data-order="asc">
+                    <span>Date (Oldest)</span>
+                    <i data-lucide="check" class="check-icon"></i>
+                </button>
+                <button class="sort-option" data-sort="name" data-order="asc">
+                    <span>Name (A-Z)</span>
+                    <i data-lucide="check" class="check-icon"></i>
+                </button>
+            </div>
+        </div>
+    </div>
 
     <main class="content-container">
       <!-- Library View -->
       <section id="view-library" class="view active">
         <!-- Hero Section -->
         <div class="hero-section">
-          <div class="hero-card">
-            <img src="hero.png" class="hero-img" alt="Featured">
-            <div class="hero-content">
-              <div class="hero-tag">새로 업데이트</div>
-              <div class="hero-title">에반게리온 다카포</div>
-            </div>
+          <!-- [PHASE 4] Dynamic Hero Carousel -->
+          <div id="hero-carousel" class="hero-carousel">
+             <!-- Slides will be injected here by main.js -->
+             <div class="hero-slide active placeholder">
+                <div class="hero-content">
+                  <div class="hero-tag">Loading...</div>
+                </div>
+             </div>
           </div>
         </div>
 
@@ -248,7 +289,69 @@
           </div>
         </div>
       </div>
+
+      <!-- Premium OSC Integration -->
+      <div id="premium-osc" class="premium-osc hidden">
+        <div class="osc-gradient-top"></div>
+        <div class="osc-gradient-bottom"></div>
+
+        <div class="osc-top-bar" data-tauri-drag-region>
+          <button id="btn-osc-back" class="osc-ctrl-btn" title="Back">
+            <i data-lucide="arrow-left"></i>
+          </button>
+          <div class="osc-title-wrapper" data-tauri-drag-region>
+            <h2 id="osc-title">Video Title</h2>
+            <span id="osc-subtitle">00:00 / 00:00</span>
+          </div>
+          <div class="osc-header-actions">
+            <div id="osc-hw-badge" class="hw-badge">SW</div>
+            <div id="osc-clock" class="osc-clock">12:00 PM</div>
+          </div>
+        </div>
+
+        <div class="osc-center-controls">
+          <button id="btn-osc-center-play" class="osc-main-play-btn"><i data-lucide="play"></i></button>
+        </div>
+
+        <div class="osc-bottom-controls">
+          <div class="osc-timeline-area">
+            <span id="osc-current-time" class="osc-time-label">00:00</span>
+            <div class="osc-progress-container">
+              <div class="osc-progress-rail">
+                <div id="osc-progress-fill" class="osc-progress-fill"></div>
+              </div>
+              <input type="range" id="osc-progress-slider" min="0" max="100" value="0" step="0.1">
+            </div>
+            <span id="osc-total-time" class="osc-time-label">00:00</span>
+          </div>
+
+          <div class="osc-controls-row">
+            <div class="osc-controls-group">
+              <div class="osc-volume-wrapper">
+                <button id="btn-osc-volume" class="osc-ctrl-btn small"><i data-lucide="volume-2"></i></button>
+                <div class="osc-volume-slider-container">
+                  <input type="range" id="osc-volume-slider" min="0" max="100" value="100">
+                </div>
+              </div>
+            </div>
+
+            <div class="osc-controls-group center">
+              <button id="btn-osc-prev" class="osc-ctrl-btn small"><i data-lucide="rotate-ccw"></i></button>
+              <button id="btn-osc-play-pause" class="osc-ctrl-btn"><i data-lucide="play"></i></button>
+              <button id="btn-osc-next" class="osc-ctrl-btn small"><i data-lucide="rotate-cw"></i></button>
+            </div>
+
+            <div class="osc-controls-group right">
+              <button id="btn-osc-subtitles" class="osc-ctrl-btn small"><i data-lucide="subtitles"></i></button>
+              <button id="osc-btn-settings" class="osc-ctrl-btn small"><i data-lucide="settings"></i></button>
+              <button id="btn-osc-fullscreen" class="osc-ctrl-btn small"><i data-lucide="maximize"></i></button>
+            </div>
+          </div>
+        </div>
+      </div>
     </div>
     <button id="btn-exit-native">종료</button>
+    
+
   </body>
 </html>

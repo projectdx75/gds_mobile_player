@@ -1,0 +1,246 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no" />
+  <title>GDS Mobile Player</title>
+  <link rel="stylesheet" href="styles.css" />
+  <!-- Google Fonts: Inter & Outfit -->
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link
+    href="https://fonts.googleapis.com/css2?family=Inter:wght@400;600;800&family=Outfit:wght@500;700;900&display=swap"
+    rel="stylesheet">
+  <!-- Lucide Icons -->
+  <script src="https://unpkg.com/lucide@latest"></script>
+</head>
+
+<body class="dark-theme">
+  <!-- Background Aura -->
+  <div class="glow-bg"></div>
+
+  <!-- Main Header -->
+  <header class="glass-header" data-tauri-drag-region>
+    <div class="header-content" data-tauri-drag-region>
+      <div class="logo-area" data-tauri-drag-region>
+        <span class="logo-badge">PRO</span>
+        <h1 class="app-title">GDS <span class="accent">MOBILE</span></h1>
+      </div>
+      <div class="header-actions">
+        <div id="status-indicator" class="status-dot"></div>
+        <button id="btn-refresh" class="icon-btn" title="Refresh">
+          <i data-lucide="rotate-cw"></i>
+        </button>
+      </div>
+    </div>
+
+    <!-- Category Tabs -->
+    <div class="category-tabs">
+      <button class="tab active" data-category="tv_show">
+        <i data-lucide="tv"></i> TV Show
+      </button>
+      <button class="tab" data-category="movie">
+        <i data-lucide="film"></i> Movies
+      </button>
+    </div>
+  </header>
+
+  <main class="content-container">
+    <!-- View: Library -->
+    <section id="view-library" class="view active">
+      <div id="library-grid" class="grid">
+        <!-- Cards will be injected here -->
+      </div>
+    </section>
+
+    <!-- View: Search -->
+    <section id="view-search" class="view">
+      <div class="search-bar-container">
+        <div class="search-input-wrapper glass">
+          <i data-lucide="search" class="search-icon"></i>
+          <input type="text" id="search-input" placeholder="Search for movies, series..." autofocus />
+        </div>
+      </div>
+      <div id="search-results" class="grid">
+        <div class="placeholder">
+          <i data-lucide="search" style="width: 48px; height: 48px; opacity: 0.2;"></i>
+          <p>Search results will appear here</p>
+        </div>
+      </div>
+    </section>
+
+    <!-- View: Settings -->
+    <section id="view-settings" class="view">
+      <div class="view-header">
+        <h2>App Settings</h2>
+      </div>
+
+      <div class="settings-tabs">
+        <button class="s-tab active" data-stab="general">General</button>
+        <button class="s-tab" data-stab="categories">Categories</button>
+        <button class="s-tab" data-stab="about">About</button>
+      </div>
+
+      <div id="stab-general" class="stab-content active">
+        <div class="settings-card glass">
+          <div class="settings-group">
+            <label>Server Address</label>
+            <input type="text" id="server-url" placeholder="https://example.com" />
+          </div>
+          <div class="settings-group">
+            <label>API Key</label>
+            <input type="password" id="api-key" placeholder="Enter API Key" />
+          </div>
+          <div class="settings-group">
+            <label>Subtitle Font Size</label>
+            <input type="range" id="sub-size-slider" min="0.5" max="2.0" step="0.1" value="1.0">
+            <div class="range-labels"><span>Small</span><span id="sub-size-val">100%</span><span>Large</span></div>
+          </div>
+          <button id="btn-save-settings" class="btn btn-primary">
+            <i data-lucide="save"></i> Save Configuration
+          </button>
+        </div>
+      </div>
+
+      <div id="stab-categories" class="stab-content">
+        <div class="settings-card glass">
+          <h3>Category Mapping</h3>
+          <p class="hint">Map remote category names to localized labels.</p>
+          <div id="category-mapping-list">
+            <!-- Dynamic category inputs -->
+          </div>
+          <button id="save-categories" class="btn btn-primary" style="margin-top: 15px;">
+            <i data-lucide="save"></i> Save Mapping
+          </button>
+        </div>
+      </div>
+
+      <div id="stab-about" class="stab-content">
+        <div class="settings-card glass">
+          <h3>App Information</h3>
+          <div class="app-info">
+            <p>GDS Mobile Player v0.2.0</p>
+            <p>Powered by Tauri v2</p>
+            <p style="margin-top: 10px; font-size: 0.8rem; color: var(--text-secondary);">Continuous Development Engine
+              v2.0</p>
+          </div>
+        </div>
+      </div>
+    </section>
+  </main>
+
+  <!-- Bottom Navigation -->
+  <nav class="bottom-nav">
+    <div class="nav-item active" data-view="library" tabindex="0">
+      <i data-lucide="home"></i>
+      <span>Home</span>
+    </div>
+    <div class="nav-item" data-view="search" tabindex="0">
+      <i data-lucide="search"></i>
+      <span>Search</span>
+    </div>
+    <div class="nav-item" data-view="settings" tabindex="0">
+      <i data-lucide="settings"></i>
+      <span>Settings</span>
+    </div>
+  </nav>
+
+  <!-- Custom Player Overlay (Artplayer Style) -->
+  <div id="player-overlay" class="premium-player">
+    <div id="player-bg"></div>
+
+    <div class="player-header" data-tauri-drag-region>
+      <button id="btn-close-player" class="ctrl-btn" tabindex="0">
+        <i data-lucide="chevron-left"></i>
+      </button>
+      <div class="player-title-info" data-tauri-drag-region>
+        <h2 id="player-video-title" data-tauri-drag-region>Title</h2>
+      </div>
+    </div>
+
+    <div class="video-container">
+      <!-- Audio Poster View -->
+      <div id="audio-visual" style="display: none;">
+        <div class="audio-poster-container">
+          <img id="audio-poster" src="" alt="Album Art">
+          <div class="visualizer-overlay">
+            <div class="vbc bar1"></div>
+            <div class="vbc bar2"></div>
+            <div class="vbc bar3"></div>
+            <div class="vbc bar4"></div>
+            <div class="vbc bar5"></div>
+          </div>
+        </div>
+        <div class="audio-info">
+          <h2 id="audio-title">Song Title</h2>
+          <p id="audio-artist">Artist Name</p>
+        </div>
+      </div>
+      <video id="main-player" playsinline></video>
+    </div>
+
+    <!-- Premium OSC Integration -->
+    <div id="premium-osc" class="premium-osc hidden">
+      <div class="osc-gradient-top"></div>
+      <div class="osc-gradient-bottom"></div>
+
+      <div class="osc-top-bar" data-tauri-drag-region>
+        <button id="btn-osc-back" class="osc-ctrl-btn" title="Back">
+          <i data-lucide="arrow-left"></i>
+        </button>
+        <div class="osc-title-wrapper" data-tauri-drag-region>
+          <h2 id="osc-title">Video Title</h2>
+          <span id="osc-subtitle">00:00 / 00:00</span>
+        </div>
+        <div class="osc-header-actions">
+          <div id="osc-clock" class="osc-clock">12:00 PM</div>
+        </div>
+      </div>
+
+      <div class="osc-center-controls">
+        <button id="btn-osc-center-play" class="osc-main-play-btn"><i data-lucide="play"></i></button>
+      </div>
+
+      <div class="osc-bottom-controls">
+        <div class="osc-timeline-area">
+          <span id="osc-current-time" class="osc-time-label">00:00</span>
+          <div class="osc-progress-container">
+            <div class="osc-progress-rail">
+              <div id="osc-progress-fill" class="osc-progress-fill"></div>
+            </div>
+            <input type="range" id="osc-progress-slider" min="0" max="100" value="0" step="0.1">
+          </div>
+          <span id="osc-total-time" class="osc-time-label">00:00</span>
+        </div>
+
+        <div class="osc-controls-row">
+          <div class="osc-controls-group">
+            <div class="osc-volume-wrapper">
+              <button id="btn-osc-volume" class="osc-ctrl-btn small"><i data-lucide="volume-2"></i></button>
+              <div class="osc-volume-slider-container">
+                <input type="range" id="osc-volume-slider" min="0" max="100" value="100">
+              </div>
+            </div>
+          </div>
+
+          <div class="osc-controls-group center">
+            <button id="btn-osc-prev" class="osc-ctrl-btn small"><i data-lucide="skip-back"></i></button>
+            <button id="btn-osc-play-pause" class="osc-ctrl-btn"><i data-lucide="play"></i></button>
+            <button id="btn-osc-next" class="osc-ctrl-btn small"><i data-lucide="skip-forward"></i></button>
+          </div>
+
+          <div class="osc-controls-group right">
+            <button id="btn-osc-subtitles" class="osc-ctrl-btn small"><i data-lucide="subtitles"></i></button>
+            <button id="osc-btn-settings" class="osc-ctrl-btn small"><i data-lucide="settings"></i></button>
+            <button id="btn-osc-fullscreen" class="osc-ctrl-btn small"><i data-lucide="maximize"></i></button>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+  <button id="btn-exit-native">종료</button>
+  <script src="main.js"></script>
+</body>
+
+</html>

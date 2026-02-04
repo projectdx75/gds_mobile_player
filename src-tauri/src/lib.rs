@@ -2,6 +2,7 @@ use std::ptr;
 use std::sync::{Arc, Mutex};
 use libmpv2::Mpv;
 use cocoa::base::id;
+use tauri::Emitter;
 // use cocoa::foundation::NSRect; // Removed unused
 use objc::{msg_send, sel, sel_impl, class};
 use serde_json;
@@ -168,18 +169,23 @@ async fn launch_mpv_player(
 
         println!("[INVOKE] MPV initialized (MacVK/Metal).");
         *lock = Some(MpvInstance { mpv });
-    }
+
+    } // End Init Block
 
         if let Some(ref mut instance) = *lock {
-             if let Some(ref sub) = subtitle_url {
-                let args: &[&str] = &[sub.as_str(), "select"];
-                let _ = Mpv::command(&instance.mpv, "sub-add", args);
-                println!("[EMBEDDED] Added subtitle: {}", sub);
-            }
-            
+            // 1. Load File First (Reset playlist)
             let args: &[&str] = &[url.as_str(), "replace"];
             let _ = Mpv::command(&instance.mpv, "loadfile", args);
-            println!("[EMBEDDED] Playing: {} -> {}", title, url);
+            // println!("[EMBEDDED] Playing: {} -> {}", title, url);
+
+            // 2. Add Subtitle After loading
+             if let Some(ref sub) = subtitle_url {
+                // Determine if it was loaded. Ideally we wait for 'start-file' event, 
+                // but strictly sending commands sequentially usually works if MPV buffers commands.
+                let args: &[&str] = &[sub.as_str(), "select"];
+                let _ = Mpv::command(&instance.mpv, "sub-add", args);
+                println!("[LIB] Added subtitle: {}", sub);
+            }
         }
     }
     
@@ -242,6 +248,47 @@ async fn search_gds(query: String, server_url: String, api_key: String, category
 }
 
 #[tauri::command(rename_all = "snake_case")]
+fn get_mpv_state(state: tauri::State<'_, MpvState>) -> Result<serde_json::Value, String> {
+    let lock = state.0.lock().map_err(|e| e.to_string())?;
+    if let Some(ref inst) = *lock {
+        let pos = inst.mpv.get_property::<f64>("time-pos").unwrap_or(0.0);
+        let dur = inst.mpv.get_property::<f64>("duration").unwrap_or(0.0);
+        let pause = inst.mpv.get_property::<bool>("pause").unwrap_or(false);
+        let hwdec: String = inst.mpv.get_property("hwdec-current").unwrap_or("no".to_string());
+        Ok(serde_json::json!({ "position": pos, "duration": dur, "pause": pause, "hwdec": hwdec }))
+    } else {
+        Ok(serde_json::json!({ "position": 0.0, "duration": 0.0, "pause": true, "hwdec": "no" })) 
+    }
+}
+
+#[tauri::command(rename_all = "snake_case")]
+fn native_play_pause(state: tauri::State<'_, MpvState>, pause: bool) -> Result<(), String> {
+    let lock = state.0.lock().map_err(|e| e.to_string())?;
+    if let Some(ref instance) = *lock {
+        instance.mpv.set_property("pause", pause).map_err(|e| e.to_string())?;
+    }
+    Ok(())
+}
+
+#[tauri::command(rename_all = "snake_case")]
+fn native_seek(state: tauri::State<'_, MpvState>, seconds: f64) -> Result<(), String> {
+    let lock = state.0.lock().map_err(|e| e.to_string())?;
+    if let Some(ref instance) = *lock {
+        let _ = Mpv::command(&instance.mpv, "seek", &[&seconds.to_string(), "absolute"]);
+    }
+    Ok(())
+}
+
+#[tauri::command(rename_all = "snake_case")]
+fn native_set_volume(state: tauri::State<'_, MpvState>, volume: i64) -> Result<(), String> {
+    let lock = state.0.lock().map_err(|e| e.to_string())?;
+    if let Some(ref instance) = *lock {
+        instance.mpv.set_property("volume", volume).map_err(|e| e.to_string())?;
+    }
+    Ok(())
+}
+
+#[tauri::command(rename_all = "snake_case")]
 fn ping() -> String {
     "pong".to_string()
 }
@@ -256,8 +303,12 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             launch_mpv_player,
             close_native_player,
+            native_play_pause,
+            native_seek,
+            native_set_volume,
             search_gds,
-            ping
+            ping,
+            get_mpv_state
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

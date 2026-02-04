@@ -5,6 +5,7 @@
     "open_native_player",
     "close_native_player",
     "search_gds",
-    "ping"
+    "ping",
+    "get_mpv_state"
   ]
 }
