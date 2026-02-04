@@ -89,7 +89,7 @@ function initElements() {
       btnOscBack: document.getElementById("btn-osc-back"),
       oscVolumeSlider: document.getElementById("osc-volume-slider"),
       btnOscFullscreen: document.getElementById("btn-osc-fullscreen"),
-      btnOscSubtitles: document.getElementById("btn-osc-subtitles"),
+      btnOscSubtitles: document.getElementById("btn-osc-subtitles"), // [FIX] ID Plural
       btnOscSettings: document.getElementById("osc-btn-settings"),
       oscCenterControls: document.querySelector(".osc-center-controls"),
     };
@@ -1322,10 +1322,16 @@ function updateNativeTransparency(active) {
     document.body.classList.add("native-player-active");
     if (ui.videoContainer)
       ui.videoContainer.style.backgroundColor = "transparent";
-    // Do NOT hide headers or tabs here
+    // Do NOT hide headers or tabs here, css handles opacity
   } else {
     document.body.classList.remove("native-player-active");
-    if (ui.videoContainer) ui.videoContainer.style.backgroundColor = "#000";
+    if (ui.videoContainer) {
+        ui.videoContainer.style.backgroundColor = "#000";
+        // Force repaint
+        ui.videoContainer.style.display = "none";
+        ui.videoContainer.offsetHeight; // trigger reflow
+        ui.videoContainer.style.display = "flex";
+    }
   }
 }
 
@@ -1418,15 +1424,7 @@ function playVideo(item) {
   const isAudio =
     item.category === "audio" || ["flac", "mp3", "m4a"].includes(extension);
 
-      );
-      ui.playerOverlay.classList.remove("active");
-      return;
-    } else {
-      console.warn(
-        "[PLAYBACK] PlayerBridge not available, falling back to web.",
-      );
-    }
-  }
+
 
   // Tauri v2 invoke access detection
   const invoke =
@@ -2223,6 +2221,28 @@ function setupPremiumOSC() {
     seekTo(Math.min(total, current + 10));
   });
 
+  // [FIX] Force select button to ensure binding
+  const btnSub = document.getElementById("btn-osc-subtitles");
+  if (btnSub) {
+      console.log("[INIT] Force binding Subtitle Button");
+      btnSub.onclick = (e) => {
+          e.stopPropagation();
+          console.log("[DEBUG] Subtitle Button CLICKED (Direct Bind)");
+          // alert("Subtitle Button Clicked"); // User feedback
+          showSubtitleMenu();
+      };
+  } else {
+      console.error("[INIT] Subtitle Button NOT FOUND in DOM");
+  }
+
+  /*
+  bind(ui.btnOscSubtitles, "Subtitles", (e) => {
+    e.stopPropagation();
+    console.log("[DEBUG] Subtitle Button CLICKED");
+    showSubtitleMenu();
+  });
+  */
+
   bind(ui.btnOscFullscreen, "Fullscreen", (e) => {
     e.stopPropagation();
     if (!document.fullscreenElement) document.documentElement.requestFullscreen().catch(console.error);
@@ -2244,6 +2264,129 @@ function setupPremiumOSC() {
   });
 
   // Global overlay click (ensure it's not a button/input)
+  // [PHASE 5.5] Subtitle Menu Logic
+  async function showSubtitleMenu() {
+    try {
+      const tracks = await invoke("get_subtitle_tracks");
+      console.log("[SUB] Tracks:", tracks);
+      renderSubtitleMenu(tracks);
+    } catch (e) {
+      console.error("[SUB] Failed to load tracks:", e);
+      alert("Failed to load subtitle tracks");
+    }
+  }
+
+  function renderSubtitleMenu(tracks) {
+      // Remove existing menu if any
+      const existing = document.getElementById("subtitle-menu-overlay");
+      if (existing) existing.remove();
+
+      const overlay = document.createElement("div");
+      overlay.id = "subtitle-menu-overlay";
+      overlay.className = "item-options-overlay active"; // Reuse existing overlay style
+      
+      // Content
+      let html = `
+        <div class="options-content" style="max-height: 60vh; display:flex; flex-direction:column;">
+            <div class="options-header">
+                <h3>Subtitles</h3>
+                <button class="close-options-btn"><i data-lucide="x"></i></button>
+            </div>
+            <div class="subtitle-track-list" style="overflow-y:auto; flex:1; margin-bottom:15px;">
+      `;
+
+      if (!tracks || tracks.length === 0) {
+          html += `<div style="padding:15px; text-align:center; color:#888;">No subtitles found</div>`;
+      } else {
+          tracks.forEach(t => {
+              const label = t.title || t.lang || `Track ${t.id}`;
+              const isSelected = t.selected;
+              const icon = isSelected ? '<i data-lucide="check" style="width:16px;"></i>' : '';
+              const badge = t.external ? '<span style="font-size:10px; background:#333; padding:2px 4px; border-radius:4px; margin-left:5px;">EXT</span>' : '';
+              
+              html += `
+                <div class="sort-option ${isSelected ? 'active' : ''}" data-sid="${t.id}">
+                    <span style="flex:1;">${label} ${badge}</span>
+                    ${icon}
+                </div>
+              `;
+          });
+          // Add 'Off' option
+           html += `
+                <div class="sort-option" data-sid="-1">
+                    <span style="flex:1;">Off (끄기)</span>
+                </div>
+              `;
+      }
+
+      html += `</div>
+            <div class="subtitle-settings" style="border-top:1px solid rgba(255,255,255,0.1); padding-top:10px;">
+                <div style="font-size:0.9rem; margin-bottom:8px; color:#ccc;">Settings</div>
+                <div style="display:flex; gap:10px; align-items:center;">
+                    <span style="font-size:0.8rem; width:50px;">Size</span>
+                    <button class="icon-btn-sm" id="sub-size-down"><i data-lucide="minus"></i></button>
+                    <button class="icon-btn-sm" id="sub-size-up"><i data-lucide="plus"></i></button>
+                    <span style="flex:1;"></span>
+                    <span style="font-size:0.8rem; width:50px;">Pos</span>
+                     <button class="icon-btn-sm" id="sub-pos-up"><i data-lucide="arrow-up"></i></button>
+                    <button class="icon-btn-sm" id="sub-pos-down"><i data-lucide="arrow-down"></i></button>
+                </div>
+            </div>
+        </div>
+      `;
+
+      overlay.innerHTML = html;
+      document.body.appendChild(overlay);
+      if (window.lucide) lucide.createIcons();
+
+      // Close handler
+      overlay.querySelector(".close-options-btn").addEventListener("click", () => overlay.remove());
+      overlay.addEventListener("click", (e) => {
+          if (e.target === overlay) overlay.remove();
+      });
+
+      // Track selection
+      overlay.querySelectorAll(".sort-option").forEach(el => {
+          el.addEventListener("click", async () => {
+              const sid = parseInt(el.dataset.sid);
+              console.log("[SUB] Selecting sid:", sid);
+              await invoke("set_subtitle_track", { sid: sid });
+              overlay.remove();
+              // Optional: Toast message?
+          });
+      });
+
+      // Settings handlers (Current state management needed? For now just inc/dec)
+      // We don't verify current scale, just send absolute or relative commands?
+      // Backend expects 'scale' (f64). Let's assume current is in state or start at 1.0
+      // Ideally we read from get_mpv_state but it's not there.
+      // Let's use local state for now or send relative steps if backend supported it.
+      // Backend: set_subtitle_style(scale: Option<f64>, pos: ...) sets absolute.
+      // We will increment local state `state.subtitleScale` (default 1.0)
+      
+      const updateStyle = () => {
+          invoke("set_subtitle_style", { scale: state.subtitleScale, pos: state.subtitlePos });
+          // console.log(`[SUB] Style: Scale ${state.subtitleScale}, Pos ${state.subtitlePos}`);
+      };
+
+      document.getElementById("sub-size-up").addEventListener("click", () => {
+          state.subtitleScale = Math.min(3.0, (state.subtitleScale || 1.0) + 0.1);
+          updateStyle();
+      });
+      document.getElementById("sub-size-down").addEventListener("click", () => {
+          state.subtitleScale = Math.max(0.5, (state.subtitleScale || 1.0) - 0.1);
+          updateStyle();
+      });
+       document.getElementById("sub-pos-up").addEventListener("click", () => {
+          state.subtitlePos = Math.max(0, (state.subtitlePos || 100) - 5);
+          updateStyle();
+      });
+      document.getElementById("sub-pos-down").addEventListener("click", () => {
+          state.subtitlePos = Math.min(150, (state.subtitlePos || 100) + 5);
+          updateStyle();
+      });
+  }
+
   if (ui.playerOverlay) {
     ui.playerOverlay.addEventListener('click', (e) => {
       if (e.target.closest('.osc-ctrl-btn') || e.target.closest('input')) return;

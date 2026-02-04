@@ -279,6 +279,87 @@ fn native_seek(state: tauri::State<'_, MpvState>, seconds: f64) -> Result<(), St
     Ok(())
 }
 
+
+
+#[tauri::command(rename_all = "snake_case")]
+fn get_subtitle_tracks(state: tauri::State<'_, MpvState>) -> Result<serde_json::Value, String> {
+    let lock = state.0.lock().map_err(|e| e.to_string())?;
+    if let Some(ref instance) = *lock {
+        let count = instance.mpv.get_property::<i64>("track-list/count").unwrap_or(0);
+        let mut tracks = Vec::new();
+
+        for i in 0..count {
+            let type_prop = format!("track-list/{}/type", i);
+            let track_type = instance.mpv.get_property::<String>(&type_prop).unwrap_or_default();
+
+            if track_type == "sub" {
+                let id_prop = format!("track-list/{}/id", i);
+                let id = instance.mpv.get_property::<i64>(&id_prop).unwrap_or(0);
+
+                let lang_prop = format!("track-list/{}/lang", i);
+                let lang = instance.mpv.get_property::<String>(&lang_prop).unwrap_or("".to_string());
+
+                let title_prop = format!("track-list/{}/title", i);
+                let title = instance.mpv.get_property::<String>(&title_prop).unwrap_or("".to_string());
+                
+                let selected_prop = format!("track-list/{}/selected", i);
+                let selected = instance.mpv.get_property::<bool>(&selected_prop).unwrap_or(false);
+
+                let external_prop = format!("track-list/{}/external", i);
+                let external = instance.mpv.get_property::<bool>(&external_prop).unwrap_or(false);
+
+                tracks.push(serde_json::json!({
+                    "id": id,
+                    "lang": lang,
+                    "title": title,
+                    "selected": selected,
+                    "external": external,
+                    "index": i // useful for debug
+                }));
+            }
+        }
+        Ok(serde_json::json!(tracks))
+    } else {
+        Ok(serde_json::json!([]))
+    }
+}
+
+#[tauri::command(rename_all = "snake_case")]
+fn set_subtitle_track(state: tauri::State<'_, MpvState>, sid: i64) -> Result<(), String> {
+    let lock = state.0.lock().map_err(|e| e.to_string())?;
+    if let Some(ref instance) = *lock {
+        // sid=0 usually means disabled in some contexts, but MPV uses specific IDs.
+        // If sid is passed as 0 and we want to disable, we might send "no".
+        // But assuming the frontend passes the correct info.
+        // Usually MPV IDs start at 1. 
+        // If frontend passes -1 for 'off', handle it.
+        /* 
+           NOTE: MPV 'sid' property:
+           Input: integer ID (1-based usually), or 'no', 'auto'.
+        */
+        if sid < 0 {
+             let _ = instance.mpv.set_property("sid", "no");
+        } else {
+             let _ = instance.mpv.set_property("sid", sid);
+        }
+    }
+    Ok(())
+}
+
+#[tauri::command(rename_all = "snake_case")]
+fn set_subtitle_style(state: tauri::State<'_, MpvState>, scale: Option<f64>, pos: Option<i64>) -> Result<(), String> {
+    let lock = state.0.lock().map_err(|e| e.to_string())?;
+    if let Some(ref instance) = *lock {
+        if let Some(s) = scale {
+            let _ = instance.mpv.set_property("sub-scale", s);
+        }
+        if let Some(p) = pos {
+            let _ = instance.mpv.set_property("sub-pos", p);
+        }
+    }
+    Ok(())
+}
+
 #[tauri::command(rename_all = "snake_case")]
 fn native_set_volume(state: tauri::State<'_, MpvState>, volume: i64) -> Result<(), String> {
     let lock = state.0.lock().map_err(|e| e.to_string())?;
@@ -306,6 +387,10 @@ pub fn run() {
             native_play_pause,
             native_seek,
             native_set_volume,
+            // [NEW] Subtitle Commands
+            get_subtitle_tracks,
+            set_subtitle_track,
+            set_subtitle_style,
             search_gds,
             ping,
             get_mpv_state
