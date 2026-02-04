@@ -6,30 +6,16 @@ fn main() {
     {
         let manifest_dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap());
         
-        // Target specific architecture inside xcframework
-        // Adjust this path if you are on x86_64, but typically macos-arm64_x86_64 covers both.
-        let framework_path = manifest_dir.join("lib/Libmpv.xcframework/macos-arm64_x86_64");
-        
-        if framework_path.exists() {
-            println!("cargo:warning=Forcing Local Libmpv Framework from: {}", framework_path.display());
-            println!("cargo:rustc-link-search=framework={}", framework_path.display());
-            println!("cargo:rustc-link-lib=framework=Libmpv");
-            
-            // ALSO add native search path for the 'lib' dir where libmpv.dylib might be, to satisfy -lmpv
-            let lib_dir = manifest_dir.join("lib");
-            if lib_dir.join("libmpv.dylib").exists() {
-                 println!("cargo:warning=Found libmpv.dylib in lib dir, adding to native search path to satisfy -lmpv");
-                 println!("cargo:rustc-link-search=native={}", lib_dir.display());
-            }
+        let lib_dir = manifest_dir.join("lib");
+        let static_lib = lib_dir.join("libmpv.a");
 
-            // Allow @rpath to find it at runtime
-            println!("cargo:rustc-link-arg=-Wl,-rpath,@loader_path/../Frameworks");
-             // Also add the build dir to rpath so cargo run works
-            println!("cargo:rustc-link-arg=-Wl,-rpath,{}", framework_path.display());
-
+        if static_lib.exists() {
+            println!("cargo:warning=Forcing Local Static Libmpv from: {}", lib_dir.display());
+            println!("cargo:rustc-link-search=native={}", lib_dir.display());
+            println!("cargo:rustc-link-lib=static=mpv");
         } else {
-             println!("cargo:warning=LOCAL FRAMEWORK NOT FOUND AT: {}", framework_path.display());
-             panic!("Local Libmpv.xcframework is missing! Cannot proceed with embedding fix.");
+             println!("cargo:warning=LOCAL LIBMPV.A NOT FOUND AT: {}", lib_dir.display());
+             panic!("Local libmpv.a is missing! Cannot proceed with embedding fix.");
         }
         
         // Link system frameworks required by libmpv
@@ -47,7 +33,8 @@ fn main() {
         println!("cargo:rustc-link-lib=c++");
         
         // Resolve Undefined Vulkan Symbols (MoltenVK from Homebrew)
-        println!("cargo:rustc-link-search=native=/opt/homebrew/lib");
+        // Resolve Undefined Vulkan Symbols (MoltenVK from Homebrew - Intel Mac path)
+        println!("cargo:rustc-link-search=native=/usr/local/lib");
         println!("cargo:rustc-link-lib=dylib=MoltenVK"); 
         
         // Resolve other dependencies referenced by Libmpv (Homebrew)
@@ -74,15 +61,23 @@ fn main() {
         println!("cargo:rustc-link-lib=dylib=harfbuzz");
         println!("cargo:rustc-link-lib=dylib=freetype");
         println!("cargo:rustc-link-lib=dylib=bluray");
-        println!("cargo:rustc-link-lib=dylib=jpeg");
-        
         println!("cargo:rustc-link-lib=dylib=z");
         println!("cargo:rustc-link-lib=dylib=iconv");
         println!("cargo:rustc-link-lib=dylib=bz2");
-        
-        // Resolve Swift Runtime (required by Libmpv if built with Swift)
+
+        // Explicitly link Foundation for os.Logger and others
+        println!("cargo:rustc-link-lib=framework=Foundation");
+
+        // Resolve Swift Runtime
         println!("cargo:rustc-link-search=native=/usr/lib/swift");
-        // Add custom Xcode toolchain path for static compatibility libs
-        println!("cargo:rustc-link-search=native=/Volumes/WD/Users/Applications/Xcode-26.2.0.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/lib/swift/macosx");
+        // Only use Xcode toolchain for linker search if absolutely necessary, but DO NOT add it to RPATH to avoid runtime crash
+        println!("cargo:rustc-link-search=native=/Applications/Xcode.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/lib/swift-5.0/macosx");
+        
+        // Add rpath so the binary can find libswiftCore.dylib at runtime
+        // ONLY use system path for runtime to avoid "requires an OS version prior to 10.14.4" error
+        println!("cargo:rustc-link-arg=-Wl,-rpath,/usr/lib/swift");
+        
+        // Add custom Xcode toolchain path for static compatibility libs if needed
+        println!("cargo:rustc-link-search=native=/Applications/Xcode.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/lib/swift/macosx");
     }
 }

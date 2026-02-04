@@ -27,3 +27,5 @@ tauri-plugin-libmpv = { git = "https://github.com/nini22P/tauri-plugin-libmpv", 
 objc = "0.2"
 cocoa = "0.24"
 libc = "0.2"
+dispatch = "0.2"
+block = "0.1"

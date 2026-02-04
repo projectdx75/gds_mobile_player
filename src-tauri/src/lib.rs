@@ -2,7 +2,7 @@ use std::ptr;
 use std::sync::{Arc, Mutex};
 use libmpv2::Mpv;
 use cocoa::base::id;
-// use cocoa::foundation::NSRect; // Removed unused
+use cocoa::foundation::NSRect; // Imported for frame bounds
 use objc::{msg_send, sel, sel_impl, class};
 use serde_json;
 use tauri_plugin_http::reqwest;
@@ -44,113 +44,141 @@ async fn launch_mpv_player(
             let (tx_wid, rx_wid) = std::sync::mpsc::channel::<Result<usize, String>>();
             let app_handle_for_wid = app.clone();
             
-            // 1. Get WID/NSView on main thread
-            app.run_on_main_thread(move || {
-                let res: Result<usize, String> = (|| {
-                    use tauri::Manager;
-                    let window = app_handle_for_wid.get_webview_window("main").ok_or_else(|| "Main window not found".to_string())?;
-                    let ns_window = window.ns_window().map_err(|e| e.to_string())? as id;
-                    
-                    // Set window background to BLACK
-                    unsafe {
-                        let _: () = msg_send![ns_window, setOpaque: 1i8]; 
-                        let black_color: id = msg_send![class!(NSColor), blackColor];
-                        let _: () = msg_send![ns_window, setBackgroundColor: black_color];
-                    }
-                    
-                    // Main content view
-                    let content_view: id = unsafe { msg_send![ns_window, contentView] };
-                    
-                    // Create CAMetalLayer (Plezy Strategy)
-                    let metal_layer_ptr: usize = unsafe {
-                        // Ensure parent has a layer backing
-                        let _: () = msg_send![content_view, setWantsLayer: 1i8];
-                        let _: () = msg_send![content_view, layer]; // Ensure root layer exists
+            // 1. Get WID/NSView on main thread using Native GCD (to avoid Tauri deadlock on Intel)
+            log_to_file("[INVOKE] Dispatching task to Main Queue via GCD...");
+            let res: Result<usize, String> = (|| {
+                let (tx, rx) = std::sync::mpsc::channel::<Result<usize, String>>();
+                
+                // Use dispatch crate to execute on Main Queue synchronously
+                // This bypasses Tauri's scheduler which might be deadlocked
+                let app_handle = app_handle_for_wid.clone();
+                
+                dispatch::Queue::main().exec_async(move || {
+                     let res: Result<usize, String> = (|| {
+                        use tauri::Manager;
+                        log_to_file("[DEBUG] Running on Main Thread (GCD)");
+                        let window = app_handle.get_webview_window("main").ok_or_else(|| "Main window not found".to_string())?;
+                        let ns_window = window.ns_window().map_err(|e| e.to_string())? as id;
                         
-                        // Create Metal Layer
-                        let layer: id = msg_send![class!(CAMetalLayer), layer];
+                        // Set window background to BLACK and allow transparency
+                        unsafe {
+                            let _: () = msg_send![ns_window, setOpaque: 0i8]; 
+                            let black_color: id = msg_send![class!(NSColor), blackColor];
+                            let _: () = msg_send![ns_window, setBackgroundColor: black_color];
+                        }
                         
+                        // Main content view
+                        let content_view: id = unsafe { msg_send![ns_window, contentView] };
+                        
+                        // FORCE Subviews (WebView) to be transparent
+                        unsafe {
+                            let subviews: id = msg_send![content_view, subviews];
+                            let count: usize = msg_send![subviews, count];
+                            log_to_file(&format!("[DEBUG] Found {} subviews in content view", count));
+                            
+                            for i in 0..count {
+                                let view: id = msg_send![subviews, objectAtIndex: i];
+                                // Try setting drawsBackground to NO (works for WKWebView/NSScrollView)
+                                // We use setValue:forKey: to handle different view types safely
+                                let no_obj: id = msg_send![class!(NSNumber), numberWithBool: 0i8];
+                                let key: id = msg_send![class!(NSString), stringWithUTF8String: "drawsBackground\0".as_ptr()];
+                                
+                                // Best effort: try checking if it responds to setDrawsBackground:
+                                let sel = sel!(setDrawsBackground:);
+                                if msg_send![view, respondsToSelector: sel] {
+                                    let _: () = msg_send![view, setDrawsBackground: 0i8];
+                                    log_to_file(&format!("[DEBUG] Forced transparency on subview {}", i));
+                                } else {
+                                     // Try KVC as fallback (e.g. for WKWebView internals)
+                                     // Note: WKWebView itself might not, but its scrollview might.
+                                     // This is a "Hail Mary" to ensure transparency.
+                                     let _: () = msg_send![view, setValue: no_obj forKey: key];
+                                     log_to_file(&format!("[DEBUG] Key-Value forced transparency on subview {}", i));
+                                }
+                            }
+                        }
+
                         // Create a container view for MPV
-                        let mpv_container: id = msg_send![class!(NSView), alloc];
-                        let mpv_container: id = msg_send![mpv_container, init];
-                        
-                        // Enable Layer-Hosting View
-                        let _: () = msg_send![mpv_container, setWantsLayer: 1i8];
-                        let _: () = msg_send![mpv_container, setLayer: layer];
-                        
-                        // Add container to window content view
-                        // Position BELOW everything (at the bottom) to allow WebView (on top) to capture drag events
-                        let _: () = msg_send![content_view, addSubview: mpv_container positioned: -1isize relativeTo: std::ptr::null_mut::<std::ffi::c_void>()];
-                        
-                        // Disable Autoresizing Mask Translation for Auto Layout
-                        let _: () = msg_send![mpv_container, setTranslatesAutoresizingMaskIntoConstraints: 0i8];
-                        
-                        // Apply Constraints to Pin to Edges
-                        let top_anchor: id = msg_send![mpv_container, topAnchor];
-                        let parent_top: id = msg_send![content_view, topAnchor];
-                        let constraint: id = msg_send![top_anchor, constraintEqualToAnchor: parent_top];
-                        let _: () = msg_send![constraint, setActive: 1i8];
-                        
-                        let bottom_anchor: id = msg_send![mpv_container, bottomAnchor];
-                        let parent_bottom: id = msg_send![content_view, bottomAnchor];
-                        let constraint: id = msg_send![bottom_anchor, constraintEqualToAnchor: parent_bottom];
-                        let _: () = msg_send![constraint, setActive: 1i8];
-                        
-                        let left_anchor: id = msg_send![mpv_container, leadingAnchor];
-                        let parent_left: id = msg_send![content_view, leadingAnchor];
-                        let constraint: id = msg_send![left_anchor, constraintEqualToAnchor: parent_left];
-                        let _: () = msg_send![constraint, setActive: 1i8];
-                        
-                        let right_anchor: id = msg_send![mpv_container, trailingAnchor];
-                        let parent_right: id = msg_send![content_view, trailingAnchor];
-                        let constraint: id = msg_send![right_anchor, constraintEqualToAnchor: parent_right];
-                        let _: () = msg_send![constraint, setActive: 1i8];
+                        let mpv_container_ptr: usize = unsafe {
+                            let mpv_container: id = msg_send![class!(NSView), alloc];
+                            
+                            // Initialize with Frame of parent
+                            let frame: NSRect = msg_send![content_view, bounds];
+                            let mpv_container: id = msg_send![mpv_container, initWithFrame: frame];
+                            // Create a CAMetalLayer explicitly for vo=gpu-next
+                            let metal_layer: id = msg_send![class!(CAMetalLayer), new];
+                            let _: () = msg_send![mpv_container, setLayer: metal_layer];
+                            let _: () = msg_send![mpv_container, setWantsLayer: 1i8]; 
 
-                        // Get the layer POINTER from the container (should be same as `layer`)
-                        let backing_layer: id = msg_send![mpv_container, layer];
+                            // Insert MPV container at index -1 (Bottom / WindowBelow)
+                            // This puts MPV BEHIND the Webview.
+                            let _: () = msg_send![content_view, addSubview: mpv_container positioned: -1isize relativeTo: std::ptr::null_mut::<std::ffi::c_void>()];
+                            
+                            let _: () = msg_send![mpv_container, setTranslatesAutoresizingMaskIntoConstraints: 0i8];
+                            
+                            let top_anchor: id = msg_send![mpv_container, topAnchor];
+                            let parent_top: id = msg_send![content_view, topAnchor];
+                            let constraint: id = msg_send![top_anchor, constraintEqualToAnchor: parent_top];
+                            let _: () = msg_send![constraint, setActive: 1i8];
+                            
+                            let bottom_anchor: id = msg_send![mpv_container, bottomAnchor];
+                            let parent_bottom: id = msg_send![content_view, bottomAnchor];
+                            let constraint: id = msg_send![bottom_anchor, constraintEqualToAnchor: parent_bottom];
+                            let _: () = msg_send![constraint, setActive: 1i8];
+                            
+                            let left_anchor: id = msg_send![mpv_container, leadingAnchor];
+                            let parent_left: id = msg_send![content_view, leadingAnchor];
+                            let constraint: id = msg_send![left_anchor, constraintEqualToAnchor: parent_left];
+                            let _: () = msg_send![constraint, setActive: 1i8];
+                            
+                            let right_anchor: id = msg_send![mpv_container, trailingAnchor];
+                            let parent_right: id = msg_send![content_view, trailingAnchor];
+                            let constraint: id = msg_send![right_anchor, constraintEqualToAnchor: parent_right];
+                            let _: () = msg_send![constraint, setActive: 1i8];
+
+                            log_to_file(&format!("[DEBUG] NSView created (Metal Layer-Backed). Returning LAYER Pointer: {:p}", metal_layer));
+                            
+                            metal_layer as usize
+                        };
                         
-                        // Visual properties (moved from original layer setup)
-                        let ns_black: id = msg_send![class!(NSColor), blackColor];
-                        let black_cg: id = msg_send![ns_black, CGColor];
-                        let _: () = msg_send![layer, setBackgroundColor: black_cg];
+                        Ok(mpv_container_ptr)
+                    })();
+                    let _ = tx.send(res);
+                });
+                
+                // Wait for the block to execute
+                rx.recv().map_err(|_| "Failed to receive WID from GCD block".to_string())?
+            })();
 
-                        println!("[DEBUG] CAMetalLayer created and attached via NSView container. Returning LAYER Pointer: {:p}", backing_layer);
-                        
-                        backing_layer as usize // Return LAYER pointer as WID (Plezy usage)
-                    };
-                    
-                    Ok(metal_layer_ptr)
-                })();
-            let _ = tx_wid.send(res);
-        }).map_err(|e| e.to_string())?;
-
-        println!("[INVOKE] Waiting for WID (Layer Pointer)...");
-        let mpv_wid_raw = rx_wid.recv().map_err(|_| "Failed to receive WID")??;
-        
-        let mpv_wid_str = mpv_wid_raw.to_string();
-        println!("[INVOKE] Initializing MPV with Layer WID: {}", mpv_wid_str);
-
-        // Initialize MPV
-        // Force Vulkan Loader to use MoltenVK ICD found in Homebrew
-        std::env::set_var("VK_ICD_FILENAMES", "/Volumes/WD/Users/yommi/Work/tauri_projects/gds_mobile_player/src-tauri/moltenvk_icd.json");
-        
-        let mpv = Mpv::with_initializer(|init| {
-            // 0. Disable Config
-            let _ = init.set_option("config", "no");
-            let _ = init.set_option("load-scripts", "no");
-
-            // 1. Set WID (Layer Pointer)
-            if let Err(e) = init.set_option("wid", mpv_wid_str.as_str()) { 
-                println!("[ERROR] Init wid: {}", e); 
-                return Err(e); 
-            }
+            log_to_file("[INVOKE] Waiting for WID (Layer Pointer)...");
+            let mpv_wid_raw = res?;
             
-            // 2. Set VO and Context (Plezy Config)
-            if let Err(e) = init.set_option("vo", "gpu-next") { println!("[ERROR] Init vo: {}", e); }
-            if let Err(e) = init.set_option("gpu-api", "vulkan") { println!("[ERROR] Init gpu-api: {}", e); }
-            if let Err(e) = init.set_option("gpu-context", "moltenvk") { println!("[ERROR] Init gpu-context: {}", e); } // Plezy uses 'moltenvk'
-            // Enable HWDEC (Plezy uses videotoolbox)
-            if let Err(e) = init.set_option("hwdec", "videotoolbox") { println!("[ERROR] Init hwdec: {}", e); } 
+            // Format WID as Hexadecimal. Some libmpv versions on macOS prefer "0x..." strings.
+            let mpv_wid_str = format!("0x{:x}", mpv_wid_raw);
+            log_to_file(&format!("[INVOKE] Initializing MPV with Hex Layer WID: {}", mpv_wid_str));
+
+            // Initialize MPV
+            // Force Vulkan Loader to use the Intel-compatible MoltenVK ICD
+            std::env::set_var("VK_ICD_FILENAMES", "/Users/A/Work/tauri_projects/gds_mobile_player/src-tauri/moltenvk_icd.json");
+            
+            let mpv = Mpv::with_initializer(|init| {
+                // 0. Disable Config
+                let _ = init.set_option("config", "no");
+                let _ = init.set_option("load-scripts", "no");
+
+                // 1. Set WID (Layer Pointer)
+                if let Err(e) = init.set_option("wid", mpv_wid_str.as_str()) { 
+                    log_to_file(&format!("[ERROR] Init wid: {}", e)); 
+                    return Err(e); 
+                }
+                
+                // 2. Set VO and Context (Metal/MoltenVK Path)
+                if let Err(e) = init.set_option("vo", "gpu-next") { println!("[ERROR] Init vo: {}", e); }
+                if let Err(e) = init.set_option("gpu-api", "vulkan") { println!("[ERROR] Init gpu-api: {}", e); }
+                if let Err(e) = init.set_option("gpu-context", "moltenvk") { println!("[ERROR] Init gpu-context: {}", e); }
+                
+                // Enable HWDEC
+                if let Err(e) = init.set_option("hwdec", "auto") { println!("[ERROR] Init hwdec: {}", e); } 
             
             // 3. Behavioral Options
             let _ = init.set_option("keepaspect-window", "no");
@@ -158,7 +186,7 @@ async fn launch_mpv_player(
             let _ = init.set_option("input-vo-keyboard", "no");
             let _ = init.set_option("osc", "no");
             let _ = init.set_option("terminal", "yes");
-            // let _ = init.set_option("msg-level", "all=debug"); // Verbose logging
+            let _ = init.set_option("msg-level", "all=debug"); // Verbose logging
 
             Ok(())
         }).map_err(|e| {

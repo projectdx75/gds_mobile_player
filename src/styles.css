@@ -43,6 +43,7 @@ body {
   transition: background 0.3s ease;
 }
 
+html.native-player-active,
 body.native-player-active {
   background: transparent !important;
   background-image: none !important;

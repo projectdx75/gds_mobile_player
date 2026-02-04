@@ -8,7 +8,7 @@
     "version:bump": "bash scripts/version-bump.sh",
     "android:build": "npm run tauri android build -- --target aarch64",
     "android:shield": "npm run tauri android build -- --target aarch64",
-    "build": "npm run tauri build && bash src-tauri/scripts/embed_libmpv.sh src-tauri/target/release/bundle/macos/FlashPlex.app"
+    "build": "export PATH=\"$HOME/.cargo/bin:$PATH\"; npm run tauri build && bash src-tauri/scripts/embed_libmpv.sh src-tauri/target/release/bundle/macos/FlashPlex.app"
   },
   "devDependencies": {
     "@tauri-apps/cli": "^2"

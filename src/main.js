@@ -1045,11 +1045,13 @@ function updateNativeTransparency(active) {
   console.log(`[UI] updateNativeTransparency: ${active}`);
   if (active) {
     document.body.classList.add("native-player-active");
+    document.documentElement.classList.add("native-player-active");
     if (ui.videoContainer)
       ui.videoContainer.style.backgroundColor = "transparent";
     // Do NOT hide headers or tabs here
   } else {
     document.body.classList.remove("native-player-active");
+    document.documentElement.classList.remove("native-player-active");
     if (ui.videoContainer) ui.videoContainer.style.backgroundColor = "#000";
   }
 }
