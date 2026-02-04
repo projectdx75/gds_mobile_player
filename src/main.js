@@ -18,6 +18,17 @@ const state = {
   subtitleSize: 1.0, // Default font scale
   subtitlePos: 0.0, // Default vertical offset
   isDraggingOscSlider: false,
+  nativePaused: false,
+  nativePos: 0,
+  nativeDuration: 0,
+};
+
+const getTauriInvoke = () => {
+  if (window.__TAURI__) {
+    if (window.__TAURI__.core && window.__TAURI__.core.invoke) return window.__TAURI__.core.invoke;
+    if (window.__TAURI__.invoke) return window.__TAURI__.invoke;
+  }
+  return null;
 };
 
 // Platform Detection
@@ -59,8 +70,8 @@ function initElements() {
       currentTime: document.getElementById("current-time"),
       totalTime: document.getElementById("total-time"),
       customControls: document.getElementById("custom-controls"),
-      btnCenterPlay: document.getElementById("btn-center-play"),
-      btnPlayPause: document.getElementById("btn-play-pause"),
+      btnCenterPlay: document.getElementById("btn-osc-center-play") || document.getElementById("btn-center-play"),
+      btnPlayPause: document.getElementById("btn-osc-play-pause") || document.getElementById("btn-play-pause"),
       playerHeader: document.querySelector(".player-header"),
       btnExitNative: document.getElementById("btn-exit-native"),
 
@@ -82,7 +93,15 @@ function initElements() {
       btnOscFullscreen: document.getElementById("btn-osc-fullscreen"),
       btnOscSubtitles: document.getElementById("btn-osc-subtitles"),
       btnOscSettings: document.getElementById("osc-btn-settings"),
+      oscCenterControls: document.querySelector(".osc-center-controls"),
     };
+
+    // Validate key elements
+    const criticalKeys = ['premiumOsc', 'btnOscPlayPause', 'oscProgressSlider'];
+    criticalKeys.forEach(key => {
+      console.log(`[INIT] UI.${key}:`, ui[key] ? "FOUND" : "MISSING");
+    });
+
     console.log("[INIT] UI Elements initialized safely.");
   } catch (err) {
     console.error("[INIT] Failed to initialize elements:", err);
@@ -95,13 +114,7 @@ window.addEventListener("DOMContentLoaded", () => {
 
   // Connectivity Test
   try {
-    const invoke =
-      window.__TAURI__ && window.__TAURI__.core
-        ? window.__TAURI__.core.invoke
-        : window.__TAURI__
-          ? window.__TAURI__.invoke
-          : null;
-
+    const invoke = getTauriInvoke();
     if (invoke) {
       invoke("ping")
         .then((r) => {
@@ -119,31 +132,38 @@ window.addEventListener("DOMContentLoaded", () => {
 
   initElements();
 
-  // Register robust global listeners
-  document.addEventListener("click", (e) => {
-    const navItem = e.target.closest(".nav-item");
-    if (navItem && navItem.dataset.view) {
-      switchView(navItem.dataset.view);
-    }
-  });
+  // [DIAGNOSTIC] Global click listener to identify blocking layers
+  window.addEventListener("click", (e) => {
+    // Standardize className for SVG support
+    const className = typeof e.target.className === 'string'
+      ? e.target.className
+      : (e.target.className.baseVal || "complex-class");
+
+    console.log("[DEBUG-CLICK] Target:", e.target.tagName, "ID:", e.target.id || "no-id", "Classes:", className);
+  }, true);
 
   setupNavigation();
   setupTabs();
 
-  // Setup other modules with safety
-  try {
-    const defaultTab = document.querySelector('.tab[data-category="tv_show"]');
-    if (defaultTab) defaultTab.classList.add("active");
+  // Setup modules with isolation
+  const runSetup = (name, fn) => {
+    try {
+      console.log(`[STARTUP] Setting up: ${name}...`);
+      fn();
+    } catch (err) {
+      console.error(`[STARTUP] ${name} failed:`, err);
+    }
+  };
 
-    setupSearch();
-    setupPlayer();
-    setupButtons();
-    setupSettings();
-    setupRemoteNavigation();
-    setupPremiumOSC(); // [NEW] OSC Setup
-  } catch (err) {
-    console.error("[STARTUP] Setup error:", err);
-  }
+  runSetup("Search", setupSearch);
+  runSetup("Player", setupPlayer);
+  runSetup("Buttons", setupButtons);
+  runSetup("Settings", setupSettings);
+  runSetup("Remote Navigation", setupRemoteNavigation);
+  runSetup("Premium OSC", setupPremiumOSC);
+  runSetup("Legacy Controls", setupPlayerControls);
+
+  if (window.lucide) lucide.createIcons();
 
   // Initial data load
   if (state.serverUrl && state.apiKey) {
@@ -661,7 +681,7 @@ function formatTime(seconds) {
 function setupSettings() {
   const serverUrlInput = document.getElementById("server-url");
   const apiKeyInput = document.getElementById("api-key");
-  const btnSave = document.getElementById("save-settings");
+  const btnSave = document.getElementById("btn-save-settings"); // Fixed ID
   const btnTestConnection = document.getElementById("btn-test-connection");
   const btnSaveCategories = document.getElementById("save-categories");
   const btnResetCategories = document.getElementById("btn-reset-categories");
@@ -810,31 +830,35 @@ function setupSettings() {
     }
   }
 
-  btnResetCategories.addEventListener("click", () => {
-    if (confirm("Reset categories to defaults?")) {
-      const defaults = {
-        audio: ["MUSIC", "가수", "곡", "ARTIST", "ALBUM"],
-        animation: ["ANIMATION", "애니", "라프텔", "laftel", "극장판 애니"],
-        movie: ["MOVIE", "영화", "극장판", "film", "cinema", "시네마"],
-        tv_show: [
-          "TV",
-          "DRAMA",
-          "드라마",
-          "예능",
-          "TV-SHOW",
-          "SHOW",
-          "미드",
-          "series",
-          "시리즈",
-        ],
-        video: ["VIDEO", "영상", "녹화"],
-        music_video: ["MV", "뮤직비디오", "직캠", "M/V"],
-      };
-      renderCategoryMappingRows(defaults);
-    }
-  });
+  if (btnResetCategories) {
+    btnResetCategories.addEventListener("click", () => {
+      if (confirm("Reset categories to defaults?")) {
+        const defaults = {
+          audio: ["MUSIC", "가수", "곡", "ARTIST", "ALBUM"],
+          animation: ["ANIMATION", "애니", "라프텔", "laftel", "극장판 애니"],
+          movie: ["MOVIE", "영화", "극장판", "film", "cinema", "시네마"],
+          tv_show: [
+            "TV",
+            "DRAMA",
+            "드라마",
+            "예능",
+            "TV-SHOW",
+            "SHOW",
+            "미드",
+            "series",
+            "시리즈",
+          ],
+          video: ["VIDEO", "영상", "녹화"],
+          music_video: ["MV", "뮤직비디오", "직캠", "M/V"],
+        };
+        renderCategoryMappingRows(defaults);
+      }
+    });
+  }
 
-  btnSaveCategories.addEventListener("click", saveCategoryMapping);
+  if (btnSaveCategories) {
+    btnSaveCategories.addEventListener("click", saveCategoryMapping);
+  }
 
   async function testConnection() {
     const url = serverUrlInput.value.trim();
@@ -890,8 +914,8 @@ function setupSettings() {
     switchView("library");
   }
 
-  btnSave.addEventListener("click", saveSettings);
-  btnTestConnection.addEventListener("click", testConnection);
+  if (btnSave) btnSave.addEventListener("click", saveSettings);
+  if (btnTestConnection) btnTestConnection.addEventListener("click", testConnection);
 }
 
 // Global Buttons
@@ -935,28 +959,133 @@ function setupButtons() {
 // [NEW] Premium OSC Logic
 function setupPremiumOSC() {
   const osc = ui.premiumOsc;
-  if (!osc) return;
+  if (!osc) {
+    console.warn("[OSC] Premium OSC element not found, skipping setup.");
+    return;
+  }
 
   let oscHideTimeout;
 
   const showOSC = () => {
     if (osc) {
-      osc.classList.remove("hidden");
-      if (window.lucide) lucide.createIcons();
+      if (osc.classList.contains("hidden")) {
+        console.log("[OSC] Showing OSC UI");
+        osc.classList.remove("hidden");
+        if (window.lucide) lucide.createIcons();
+      }
     }
     document.body.style.cursor = "default";
     clearTimeout(oscHideTimeout);
     oscHideTimeout = setTimeout(() => {
-      // Auto-hide ONLY if something is actually playing
       const isWebPlaying = ui.mainPlayer && !ui.mainPlayer.paused;
       const isActuallyActive = isWebPlaying || (state.isNativeActive && !state.nativePaused);
 
       if (isActuallyActive) {
-        if (osc) osc.classList.add("hidden");
+        if (osc) {
+          console.log("[OSC] Auto-hiding OSC UI");
+          osc.classList.add("hidden");
+        }
         document.body.style.cursor = "none";
       }
     }, 4000);
   };
+
+  const seekTo = (seconds) => {
+    const targetTime = Math.max(0, seconds);
+    console.log("[PLAYER-ACTION] seekTo requested:", targetTime);
+    if (state.isNativeActive) {
+      const invoke = getTauriInvoke();
+      if (invoke) {
+        invoke("native_seek", { seconds: targetTime })
+          .catch(err => console.error("[PLAYER-ERROR] native_seek failed:", err));
+      }
+    } else if (ui.mainPlayer) {
+      ui.mainPlayer.currentTime = targetTime;
+    }
+  };
+
+  const togglePlay = (e) => {
+    if (e) e.stopPropagation();
+    console.log("[PLAYER-ACTION] togglePlay. NativeActive:", state.isNativeActive, "NativePaused:", state.nativePaused);
+
+    if (state.isNativeActive) {
+      const nextPause = !state.nativePaused;
+      const invoke = getTauriInvoke();
+      if (invoke) {
+        invoke("native_play_pause", { pause: nextPause })
+          .then(() => {
+            console.log("[PLAYER-SUCCESS] native_play_pause success");
+            state.nativePaused = nextPause;
+          })
+          .catch(err => console.error("[PLAYER-ERROR] native_play_pause failed:", err));
+      }
+    } else if (ui.mainPlayer) {
+      if (ui.mainPlayer.paused) ui.mainPlayer.play();
+      else ui.mainPlayer.pause();
+    }
+    showOSC();
+  };
+
+  // Bind Buttons
+  const bind = (el, name, fn) => {
+    if (el) {
+      console.log(`[INIT] Binding OSC button: ${name}`);
+      el.addEventListener("click", (e) => {
+        console.log(`[OSC-CLICK] ${name} clicked`);
+        fn(e);
+      });
+    } else {
+      console.warn(`[INIT] OSC button not found: ${name}`);
+    }
+  };
+
+  bind(ui.btnOscPlayPause, "Play/Pause", togglePlay);
+  bind(ui.btnOscCenterPlay, "Center Play", togglePlay);
+  bind(ui.oscCenterControls, "Center Overlay", togglePlay);
+
+  bind(ui.btnOscBack, "Back", (e) => { e.stopPropagation(); closePlayer(); });
+
+  bind(ui.btnOscPrev, "Prev/SkipBack", (e) => {
+    e.stopPropagation();
+    const current = state.isNativeActive ? state.nativePos : (ui.mainPlayer ? ui.mainPlayer.currentTime : 0);
+    seekTo(current - 10);
+  });
+
+  bind(ui.btnOscNext, "Next/SkipForward", (e) => {
+    e.stopPropagation();
+    const current = state.isNativeActive ? state.nativePos : (ui.mainPlayer ? ui.mainPlayer.currentTime : 0);
+    const total = state.isNativeActive ? state.nativeDuration : (ui.mainPlayer ? ui.mainPlayer.duration : Infinity);
+    seekTo(Math.min(total, current + 10));
+  });
+
+  bind(ui.btnOscFullscreen, "Fullscreen", (e) => {
+    e.stopPropagation();
+    if (!document.fullscreenElement) document.documentElement.requestFullscreen().catch(console.error);
+    else document.exitFullscreen();
+  });
+
+  bind(ui.btnOscSubtitles, "Subtitles", (e) => {
+    e.stopPropagation();
+    if (!state.isNativeActive && ui.mainPlayer) {
+      const tracks = ui.mainPlayer.textTracks;
+      if (tracks.length > 0) tracks[0].mode = (tracks[0].mode === "showing" ? "hidden" : "showing");
+    }
+    showOSC();
+  });
+
+  bind(ui.btnOscSettings, "Settings", (e) => {
+    e.stopPropagation();
+    showOSC();
+  });
+
+  // Global overlay click (ensure it's not a button/input)
+  if (ui.playerOverlay) {
+    ui.playerOverlay.addEventListener('click', (e) => {
+      if (e.target.closest('.osc-ctrl-btn') || e.target.closest('input')) return;
+      console.log("[OSC-EVENT] Overlay background click -> togglePlay");
+      togglePlay(e);
+    });
+  }
 
   // Activity listeners
   document.addEventListener("mousemove", showOSC);
@@ -973,143 +1102,77 @@ function setupPremiumOSC() {
   setInterval(updateClock, 10000);
   updateClock();
 
-  // Control Event Listeners
-  const invoke = window.__TAURI__ ? window.__TAURI__.core.invoke : null;
-
-  const togglePlay = () => {
-    if (state.isNativeActive) {
-      if (invoke) invoke("native_play_pause", { pause: !state.nativePaused }).catch(console.error);
-    } else {
-      if (ui.mainPlayer.paused) ui.mainPlayer.play();
-      else ui.mainPlayer.pause();
-    }
-    showOSC();
-  };
-
-  if (ui.btnOscPlayPause) ui.btnOscPlayPause.onclick = togglePlay;
-  if (ui.btnOscCenterPlay) ui.btnOscCenterPlay.onclick = togglePlay;
-
-  if (ui.btnOscBack) {
-    ui.btnOscBack.onclick = () => {
-      closePlayer();
-    };
-  }
-
+  // Progress Slider
   if (ui.oscProgressSlider) {
-    ui.oscProgressSlider.onmousedown = () => { state.isDraggingOscSlider = true; };
-    ui.oscProgressSlider.onmouseup = () => { state.isDraggingOscSlider = false; };
-    ui.oscProgressSlider.ontouchstart = () => { state.isDraggingOscSlider = true; };
-    ui.oscProgressSlider.ontouchend = () => { state.isDraggingOscSlider = false; };
-
-    ui.oscProgressSlider.oninput = (e) => {
+    ui.oscProgressSlider.addEventListener("mousedown", () => {
+      console.log("[OSC-DRAG] Progress slider drag START");
+      state.isDraggingOscSlider = true;
+    });
+    ui.oscProgressSlider.addEventListener("mouseup", () => {
+      console.log("[OSC-DRAG] Progress slider drag END");
+      state.isDraggingOscSlider = false;
+    });
+    ui.oscProgressSlider.addEventListener("input", (e) => {
       const val = parseFloat(e.target.value);
       if (ui.oscProgressFill) ui.oscProgressFill.style.width = val + "%";
-
       if (state.isNativeActive) {
         if (state.nativeDuration > 0) {
           const seekTime = (val / 100) * state.nativeDuration;
-          if (invoke) invoke("native_seek", { seconds: seekTime }).catch(console.error);
+          seekTo(seekTime);
         }
-      } else {
-        if (ui.mainPlayer.duration > 0) {
-          ui.mainPlayer.currentTime = (val / 100) * ui.mainPlayer.duration;
-        }
+      } else if (ui.mainPlayer && ui.mainPlayer.duration) {
+        ui.mainPlayer.currentTime = (val / 100) * ui.mainPlayer.duration;
       }
-    };
+    });
   }
 
+  // Volume Slider
   if (ui.oscVolumeSlider) {
-    ui.oscVolumeSlider.oninput = (e) => {
+    ui.oscVolumeSlider.addEventListener("input", (e) => {
       const vol = parseInt(e.target.value);
+      console.log("[OSC-DRAG] Volume change:", vol);
       if (state.isNativeActive) {
+        const invoke = getTauriInvoke();
         if (invoke) invoke("native_set_volume", { volume: vol }).catch(console.error);
-      } else {
+      } else if (ui.mainPlayer) {
         ui.mainPlayer.volume = vol / 100;
       }
-    };
+    });
   }
 
-  // Fullscreen
-  if (ui.btnOscFullscreen) {
-    ui.btnOscFullscreen.onclick = () => {
-      if (!document.fullscreenElement) {
-        document.documentElement.requestFullscreen().catch(console.error);
-      } else {
-        document.exitFullscreen();
+  // [TAURI BRIDGE] Event Listener Setup
+  const getTauriListen = () => {
+    if (!window.__TAURI__) return null;
+    if (window.__TAURI__.event && window.__TAURI__.event.listen) return window.__TAURI__.event.listen;
+    return null;
+  };
+
+  const listen = getTauriListen();
+  if (listen) {
+    console.log("[PLAYER] Subscribing to native mpv-state events...");
+    listen("mpv-state", (event) => {
+      // payload is sometimes wrapped in another object or stringified twice
+      let data = event.payload;
+      if (typeof data === 'string') {
+        try { data = JSON.parse(data); } catch (e) { console.warn("Failed to parse payload", e); }
       }
-    };
-  }
 
-  // Prev/Next (Placeholder for now, or seek 10s)
-  if (ui.btnOscPrev) {
-    ui.btnOscPrev.onclick = () => {
-      if (state.isNativeActive) {
-        if (invoke) invoke("native_seek", { seconds: state.nativePos - 10 }).catch(console.error);
-      } else {
-        ui.mainPlayer.currentTime -= 10;
-      }
-    };
-  }
-  if (ui.btnOscNext) {
-    ui.btnOscNext.onclick = () => {
-      if (state.isNativeActive) {
-        if (invoke) invoke("native_seek", { seconds: state.nativePos + 10 }).catch(console.error);
-      } else {
-        ui.mainPlayer.currentTime += 10;
-      }
-    };
-  }
+      console.log("[NATIVE-SYNC] Recv:", data);
 
-  // Subtitles Toggle
-  if (ui.btnOscSubtitles) {
-    ui.btnOscSubtitles.onclick = () => {
-      if (state.isNativeActive) {
-        // Placeholder for native subtitle toggle if command exists
-        console.log("[NATIVE] Subtitle toggle requested");
-      } else {
-        const tracks = ui.mainPlayer.textTracks;
-        if (tracks.length > 0) {
-          tracks[0].mode = tracks[0].mode === "showing" ? "hidden" : "showing";
-        }
-      }
-      showOSC();
-    };
-  }
+      if (data) {
+        state.nativePos = typeof data.position === 'number' ? data.position : 0;
+        state.nativeDuration = typeof data.duration === 'number' ? data.duration : 0;
+        state.nativePaused = !!data.pause;
 
-  // Settings Toggle
-  if (ui.btnOscSettings) {
-    ui.btnOscSettings.onclick = () => {
-      // Toggle settings view or a mini-popup
-      console.log("[UI] Settings clicked");
-      showOSC();
-    };
-  }
-
-  // [TAURI BRIDGE] Listen for Native Events
-  if (window.__TAURI__) {
-    const { listen } = window.__TAURI__.event || {};
-    if (listen) {
-      console.log("[PLAYER] Subscribing to mpv-state events...");
-      listen("mpv-state", (event) => {
-        const payload = event.payload;
-        state.nativePos = payload.position || 0;
-        state.nativeDuration = payload.duration || 0;
-        state.nativePaused = payload.pause || false;
-
-        console.log("[NATIVE-SYNC] pos:", state.nativePos, "dur:", state.nativeDuration);
-
-        // Update UI
+        // UI Update
         if (ui.oscCurrentTime) ui.oscCurrentTime.textContent = formatTime(state.nativePos);
         if (ui.oscTotalTime) ui.oscTotalTime.textContent = formatTime(state.nativeDuration);
-        if (ui.oscSubtitle) ui.oscSubtitle.textContent = `${formatTime(state.nativePos)} / ${formatTime(state.nativeDuration)}`;
 
-        const percent = (state.nativePos / (state.nativeDuration || 1)) * 100;
+        const percent = (state.nativeDuration > 0) ? (state.nativePos / state.nativeDuration) * 100 : 0;
         if (ui.oscProgressFill) ui.oscProgressFill.style.width = percent + "%";
-        if (ui.oscProgressSlider && !state.isDraggingOscSlider) {
-          ui.oscProgressSlider.value = percent;
-        }
+        if (ui.oscProgressSlider && !state.isDraggingOscSlider) ui.oscProgressSlider.value = percent;
 
-        // Update Play/Pause Icons
+        // Icons
         const icon = state.nativePaused ? "play" : "pause";
         if (ui.btnOscPlayPause) {
           ui.btnOscPlayPause.innerHTML = `<i data-lucide="${icon}"></i>`;
@@ -1120,9 +1183,13 @@ function setupPremiumOSC() {
           ui.btnOscCenterPlay.innerHTML = `<i data-lucide="${icon}"></i>`;
           if (window.lucide) lucide.createIcons();
         }
-      });
-    }
+      }
+    }).catch(err => console.error("[PLAYER-ERROR] Failed to listen:", err));
+  } else {
+    console.error("[CRITICAL] window.__TAURI__.event.listen NOT FOUND. Time sync will fail.");
   }
+
+  showOSC();
 }
 
 // Player Logic
@@ -1194,6 +1261,7 @@ function setupPlayer() {
 
   // Play/Pause Toggle
   const togglePlay = () => {
+    if (state.isNativeActive) return; // Prevent interference with native playback
     if (player.paused) player.play();
     else player.pause();
     showUI();
@@ -1536,20 +1604,20 @@ function setupScrollHeader() {
     "scroll",
     () => {
       const scrollTop = container.scrollTop;
-
+ 
       // Always show at the very top
       if (scrollTop < 10) {
         if (mainHeader) mainHeader.classList.remove("header-hidden");
         if (tabsHeader) tabsHeader.classList.remove("header-hidden");
         return;
       }
-
+ 
       // Scroll Up -> Show
       else if (scrollTop < lastScrollTop) {
         if (mainHeader) mainHeader.classList.remove("header-hidden");
         if (tabsHeader) tabsHeader.classList.remove("header-hidden");
       }
-
+ 
       lastScrollTop = scrollTop;
     },
     { passive: true },
@@ -1836,6 +1904,7 @@ function setupPlayerControls() {
   if (!video || !overlay) return;
 
   function togglePlay() {
+    if (state.isNativeActive) return; // Guard against native playback interference
     if (video.paused) {
       video.play();
       if (centerPlayBtn) centerPlayBtn.style.opacity = "0";
@@ -1897,8 +1966,4 @@ function setupPlayerControls() {
   }
 }
 
-// Ensure icons are created
-document.addEventListener("DOMContentLoaded", () => {
-  lucide.createIcons();
-  setupPlayerControls();
-});
+// End of main.js

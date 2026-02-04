@@ -1368,7 +1368,7 @@ input:focus {
   justify-content: space-between;
   opacity: 1;
   transition: opacity 0.4s cubic-bezier(0.4, 0, 0.2, 1);
-  pointer-events: none;
+  pointer-events: auto;
   font-family: 'Inter', sans-serif;
 }
 
@@ -1468,6 +1468,11 @@ input:focus {
   display: flex;
   align-items: center;
   justify-content: center;
+}
+
+.premium-osc svg,
+.premium-osc i {
+  pointer-events: none !important;
 }
 
 .osc-main-play-btn {

@@ -23,6 +23,7 @@ urlencoding = "2"
 jni = "0.21"
 libmpv2 = "5.0"
 libmpv2-sys = "4.0"
+chrono = "0.4"
 tauri-plugin-libmpv = { git = "https://github.com/nini22P/tauri-plugin-libmpv", branch = "main" }
 objc = "0.2"
 cocoa = "0.24"
