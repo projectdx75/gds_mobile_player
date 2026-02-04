@@ -6,6 +6,7 @@ use cocoa::foundation::NSRect; // Imported for frame bounds
 use objc::{msg_send, sel, sel_impl, class};
 use serde_json;
 use tauri_plugin_http::reqwest;
+use tauri::Emitter; // For event emission in v2
 
 // Helper struct to hold Mpv instance
 struct MpvInstance {
@@ -196,6 +197,45 @@ async fn launch_mpv_player(
 
         println!("[INVOKE] MPV initialized (MacVK/Metal).");
         *lock = Some(MpvInstance { mpv });
+
+        // 4. Start Event Bridge Thread
+        let app_handle_events = app.clone();
+        let state_events = state.0.clone();
+        std::thread::spawn(move || {
+            log_to_file("[EVENT] Pulse thread started.");
+            let mut last_pos = -1.0;
+            let mut last_dur = -1.0;
+            let mut last_pause = false;
+
+            loop {
+                std::thread::sleep(std::time::Duration::from_millis(500));
+                let lock = match state_events.lock() {
+                    Ok(l) => l,
+                    Err(_) => break,
+                };
+
+                if let Some(ref instance) = *lock {
+                    let pos: f64 = instance.mpv.get_property("time-pos").unwrap_or(0.0);
+                    let dur: f64 = instance.mpv.get_property("duration").unwrap_or(0.0);
+                    let pause: bool = instance.mpv.get_property("pause").unwrap_or(false);
+
+                    // Emit event if changed significantly
+                    if (pos - last_pos).abs() > 0.4 || (dur - last_dur).abs() > 0.1 || pause != last_pause {
+                        let _ = app_handle_events.emit("mpv-state", serde_json::json!({
+                            "position": pos,
+                            "duration": dur,
+                            "pause": pause
+                        }));
+                        last_pos = pos;
+                        last_dur = dur;
+                        last_pause = pause;
+                    }
+                } else {
+                    log_to_file("[EVENT] Player closed, stopping pulse thread.");
+                    break;
+                }
+            }
+        });
     }
 
         if let Some(ref mut instance) = *lock {
@@ -233,6 +273,34 @@ fn close_native_player(state: tauri::State<'_, MpvState>) -> Result<(), String> 
     #[cfg(not(target_os = "macos"))]
     {
         let _ = state;
+    }
+    Ok(())
+}
+
+#[tauri::command]
+fn native_play_pause(state: tauri::State<'_, MpvState>, pause: bool) -> Result<(), String> {
+    let lock = state.0.lock().map_err(|e| e.to_string())?;
+    if let Some(ref instance) = *lock {
+        instance.mpv.set_property("pause", pause).map_err(|e| e.to_string())?;
+    }
+    Ok(())
+}
+
+#[tauri::command]
+fn native_seek(state: tauri::State<'_, MpvState>, seconds: f64) -> Result<(), String> {
+    let lock = state.0.lock().map_err(|e| e.to_string())?;
+    if let Some(ref instance) = *lock {
+        let args: &[&str] = &[&seconds.to_string(), "absolute"];
+        Mpv::command(&instance.mpv, "seek", args).map_err(|e| e.to_string())?;
+    }
+    Ok(())
+}
+
+#[tauri::command]
+fn native_set_volume(state: tauri::State<'_, MpvState>, volume: i64) -> Result<(), String> {
+    let lock = state.0.lock().map_err(|e| e.to_string())?;
+    if let Some(ref instance) = *lock {
+        instance.mpv.set_property("volume", volume).map_err(|e| e.to_string())?;
     }
     Ok(())
 }
@@ -284,6 +352,9 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             launch_mpv_player,
             close_native_player,
+            native_play_pause,
+            native_seek,
+            native_set_volume,
             search_gds,
             ping
         ])
