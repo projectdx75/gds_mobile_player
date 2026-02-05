@@ -561,6 +561,11 @@ async function loadLibrary(forceRefresh = false, isAppend = false) {
         }
         // Filter out from grid
         displayItems = finalItems.filter(i => !(i.is_dir && i.name.length === 1));
+      } else if (state.category === 'tv_show' && !state.currentPath) {
+        // [MOD] TV Subcategories
+        if (!isAppend) {
+           renderSubCategoryChips(['드라마', '예능', '다큐', '시사', '애니', '뉴스']);
+        }
       } else if (!isFolderCategory && !state.currentPath && !isAppend) {
         renderSubCategoryChips(null);
       }
@@ -622,19 +627,41 @@ function renderSubCategoryChips(folders) {
 
   // Index Folders chips if passed
   if (!state.currentPath && folders && Array.isArray(folders)) {
-    const indexFolders = folders.filter(f => f.is_dir && f.name.length === 1);
-    if (indexFolders.length > 0) {
-      indexFolders.forEach(idxFolder => {
+    // [MOD] TV Show Subcategories (Keywords)
+    if (state.category === 'tv_show') {
+       folders.forEach(keyword => {
         const chip = document.createElement("div");
         chip.className = "chip";
-        chip.innerText = idxFolder.name;
+        if (state.query === keyword) chip.classList.add('active'); // Highlight if active
+        chip.innerText = keyword;
         chip.onclick = () => {
-          state.pathStack.push(idxFolder.path);
-          state.currentPath = idxFolder.path;
+          // Toggle Query
+          if (state.query === keyword) {
+            state.query = '';
+          } else {
+            state.query = keyword;
+          }
           loadLibrary();
         };
         chipContainer.appendChild(chip);
       });
+    } 
+    // Movie Index Folders
+    else {
+      const indexFolders = folders.filter(f => f.is_dir && f.name.length === 1);
+      if (indexFolders.length > 0) {
+        indexFolders.forEach(idxFolder => {
+          const chip = document.createElement("div");
+          chip.className = "chip";
+          chip.innerText = idxFolder.name;
+          chip.onclick = () => {
+            state.pathStack.push(idxFolder.path);
+            state.currentPath = idxFolder.path;
+            loadLibrary();
+          };
+          chipContainer.appendChild(chip);
+        });
+      }
     }
   }
 

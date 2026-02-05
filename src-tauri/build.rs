@@ -7,16 +7,20 @@ fn main() {
         let manifest_dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap());
         
         let lib_dir = manifest_dir.join("lib");
-        let static_lib = lib_dir.join("libmpv.a");
+        
+        // [FIX] Use Universal Framework (ARM64 + x86_64) instead of static lib
+        let framework_search_path = lib_dir.join("Libmpv.xcframework/macos-arm64_x86_64");
+        
+        // [FIX] Link Local Libmpv Framework FIRST
+        println!("cargo:warning=Linking against Universal Libmpv.framework at: {}", framework_search_path.display());
+        // Use -F to specify framework search path explicitly
+        println!("cargo:rustc-link-search=framework={}", framework_search_path.display());
+        println!("cargo:rustc-link-lib=framework=Libmpv");
+        
+        // Ensure runtime finding
+        println!("cargo:rustc-link-arg=-Wl,-rpath,@loader_path/../Frameworks");
+        println!("cargo:rustc-link-arg=-Wl,-rpath,{}", framework_search_path.display());
 
-        if static_lib.exists() {
-            println!("cargo:warning=Forcing Local Static Libmpv from: {}", lib_dir.display());
-            println!("cargo:rustc-link-search=native={}", lib_dir.display());
-            println!("cargo:rustc-link-lib=static=mpv");
-        } else {
-             println!("cargo:warning=LOCAL LIBMPV.A NOT FOUND AT: {}", lib_dir.display());
-             panic!("Local libmpv.a is missing! Cannot proceed with embedding fix.");
-        }
         
         // Link system frameworks required by libmpv
         println!("cargo:rustc-link-lib=framework=CoreVideo");
@@ -28,15 +32,17 @@ fn main() {
         println!("cargo:rustc-link-lib=framework=CoreGraphics");
         println!("cargo:rustc-link-lib=framework=CoreServices");
         println!("cargo:rustc-link-lib=framework=ApplicationServices");
-        println!("cargo:rustc-link-lib=framework=Metal"); // For Metal
-        println!("cargo:rustc-link-lib=framework=QuartzCore"); // For CAMetalLayer
+        println!("cargo:rustc-link-lib=framework=Metal");
+        println!("cargo:rustc-link-lib=framework=QuartzCore");
         println!("cargo:rustc-link-lib=c++");
         
-        // Resolve Undefined Vulkan Symbols (MoltenVK from Homebrew)
-        // Link both Intel (/usr/local/lib) and M1 (/opt/homebrew/lib) paths
-        println!("cargo:rustc-link-search=native=/usr/local/lib");
-        println!("cargo:rustc-link-search=native=/opt/homebrew/lib");
-        println!("cargo:rustc-link-lib=dylib=MoltenVK"); 
+        // Resolve Undefined Vulkan Symbols (MoltenVK) - LOCAL LINK ONLY
+        // [FIX] Removed system search paths (/opt/homebrew/lib) preventing system libmpv linkage
+        // [FIX] Added 'lib_deps' for selective linking of other Homebrew libs (ffmpeg, etc.) without exposing libmpv
+        let lib_deps_dir = manifest_dir.join("lib_deps");
+        println!("cargo:rustc-link-search=native={}", lib_deps_dir.display());
+        println!("cargo:rustc-link-search=native={}", lib_dir.display());
+        println!("cargo:rustc-link-lib=dylib=MoltenVK");
         
         // Resolve other dependencies referenced by Libmpv (Homebrew)
         println!("cargo:rustc-link-lib=dylib=uchardet");
@@ -80,5 +86,11 @@ fn main() {
         
         // Add custom Xcode toolchain path for static compatibility libs if needed
         println!("cargo:rustc-link-search=native=/Applications/Xcode.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/lib/swift/macosx");
+        // [FIX] Add CommandLineTools path found on user system
+        println!("cargo:rustc-link-search=native=/Library/Developer/CommandLineTools/usr/lib/swift/macosx");
+        
+        // [FIX] Explicitly link Swift Compatibility libraries required by Libmpv.framework
+        println!("cargo:rustc-link-lib=static=swiftCompatibility56");
+        println!("cargo:rustc-link-lib=static=swiftCompatibilityConcurrency");
     }
 }
