@@ -1469,6 +1469,12 @@ function playVideo(item) {
     streamUrl += `${separator}apikey=${state.apiKey}`;
   }
 
+  // [FIX] Ensure URL is properly encoded (handle spaces/Korean chars that server might send raw)
+  if (streamUrl.includes(" ") || /[^ -~]/.test(streamUrl)) {
+    console.log("[PLAY] Encoding unencoded URL parts");
+    streamUrl = encodeURI(streamUrl);
+  }
+
   // Improved extension parser: Prefer item.path, then fallback to URL without query params
   const extension = (item.path || streamUrlRaw.split("?")[0] || "")
     .split(".")
@@ -1559,11 +1565,14 @@ function playVideo(item) {
           setTimeout(() => {
             checkAndSelectSubtitles();
             // [NEW] Apply saved subtitle settings
-            invoke("set_subtitle_style", {
-              scale: state.subtitleSize,
-              pos: Math.round(state.subtitlePos)
-            }).catch(e => console.error("[SUB] Style apply failed:", e));
-          }, 1000); // 1s delay to ensure tracks loaded
+            const inv = getTauriInvoke();
+            if (inv) {
+              inv("set_subtitle_style", {
+                scale: state.subtitleSize,
+                pos: Math.round(state.subtitlePos)
+              }).catch(e => console.error("[SUB] Style apply failed:", e));
+            }
+          }, 1500); // 1.5s delay to ensure MPV is ready
 
           ui.playerTitle.textContent = cleanTitle;
           state.isNativeActive = true;

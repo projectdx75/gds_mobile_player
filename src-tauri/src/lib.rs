@@ -170,12 +170,17 @@ fn launch_mpv_player(
                 let mut last_d = -1.0;
                 let mut last_s: Option<bool> = None;
                 loop {
-                    std::thread::sleep(std::time::Duration::from_millis(500));
+                    std::thread::sleep(std::time::Duration::from_millis(1000));
                     let l = match state_events.lock() { Ok(i) => i, Err(_) => break };
                     if let Some(ref inst) = *l {
                         let pos = inst.mpv.get_property::<f64>("time-pos").unwrap_or(0.0);
                         let dur = inst.mpv.get_property::<f64>("duration").unwrap_or(0.0);
                         let pause = inst.mpv.get_property::<bool>("pause").unwrap_or(false);
+
+                        // [DEBUG] Log position heartbeat
+                        if pos > 0.0 && (pos as i64 % 5 == 0) && (pos - last_p).abs() > 0.8 {
+                            log_to_file(&format!("[EVENT] Playback Heartbeat: {:.1}/{:.1} (pause: {})", pos, dur, pause));
+                        }
 
                         if (pos - last_p).abs() > 0.4 || (dur - last_d).abs() > 0.1 || Some(pause) != last_s {
                             let _ = app_events.emit("mpv-state", serde_json::json!({
@@ -338,6 +343,7 @@ fn set_subtitle_track(state: tauri::State<'_, MpvState>, sid: i64) -> Result<(),
 
 #[tauri::command(rename_all = "snake_case")]
 fn set_subtitle_style(state: tauri::State<'_, MpvState>, scale: Option<f64>, pos: Option<i64>) -> Result<(), String> {
+    log_to_file(&format!("[CMD] set_subtitle_style: scale={:?}, pos={:?}", scale, pos));
     let lock = state.0.lock().map_err(|e| e.to_string())?;
     if let Some(ref instance) = *lock {
         if let Some(s) = scale {
