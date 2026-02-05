@@ -145,7 +145,22 @@ fn launch_mpv_player(
             
             if !is_x86 {
                 // M1/ARM64: Use Vulkan/MoltenVK for better performance
-                std::env::set_var("VK_ICD_FILENAMES", "/Users/A/Work/tauri_projects/gds_mobile_player/src-tauri/moltenvk_icd.json");
+                // Try to find the ICD file relative to the executable
+                let mut icd_found = false;
+                if let Ok(exe_path) = std::env::current_exe() {
+                    if let Some(exe_dir) = exe_path.parent() {
+                        let icd_path = exe_dir.join("moltenvk_icd.json");
+                        if icd_path.exists() {
+                            std::env::set_var("VK_ICD_FILENAMES", icd_path);
+                            icd_found = true;
+                        }
+                    }
+                }
+                
+                if !icd_found {
+                    // Fallback to development path
+                    std::env::set_var("VK_ICD_FILENAMES", "./src-tauri/moltenvk_icd.json");
+                }
             }
             
             let t1 = std::time::Instant::now();

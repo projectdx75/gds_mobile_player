@@ -33,8 +33,9 @@ fn main() {
         println!("cargo:rustc-link-lib=c++");
         
         // Resolve Undefined Vulkan Symbols (MoltenVK from Homebrew)
-        // Resolve Undefined Vulkan Symbols (MoltenVK from Homebrew - Intel Mac path)
+        // Link both Intel (/usr/local/lib) and M1 (/opt/homebrew/lib) paths
         println!("cargo:rustc-link-search=native=/usr/local/lib");
+        println!("cargo:rustc-link-search=native=/opt/homebrew/lib");
         println!("cargo:rustc-link-lib=dylib=MoltenVK"); 
         
         // Resolve other dependencies referenced by Libmpv (Homebrew)
