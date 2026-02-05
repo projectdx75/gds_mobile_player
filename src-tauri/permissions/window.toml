@@ -1,0 +1,6 @@
+[[permission]]
+identifier = "allow-window-dragging"
+description = "Allows window dragging"
+commands.allow = [
+    "start_dragging"
+]

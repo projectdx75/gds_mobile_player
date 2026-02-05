@@ -1,8 +1,6 @@
-use std::ptr;
 use std::sync::{Arc, Mutex};
 use libmpv2::Mpv;
 use cocoa::base::id;
-use tauri::Emitter;
 // use cocoa::foundation::NSRect; // Removed unused
 use objc::{msg_send, sel, sel_impl, class};
 use serde_json;
@@ -11,6 +9,7 @@ use tauri_plugin_http::reqwest;
 // Helper struct to hold Mpv instance
 struct MpvInstance {
     mpv: Mpv,
+    container_view: usize, // Store container to remove on close
 }
 
 unsafe impl Send for MpvInstance {}
@@ -42,12 +41,12 @@ async fn launch_mpv_player(
         let mut lock = state.0.lock().map_err(|e| e.to_string())?;
         if lock.is_none() {
             log_to_file("[INVOKE] Lock acquired, initializing MPV...");
-            let (tx_wid, rx_wid) = std::sync::mpsc::channel::<Result<usize, String>>();
+            let (tx_wid, rx_wid) = std::sync::mpsc::channel::<Result<(usize, usize), String>>();
             let app_handle_for_wid = app.clone();
             
             // 1. Get WID/NSView on main thread
             app.run_on_main_thread(move || {
-                let res: Result<usize, String> = (|| {
+                let res: Result<(usize, usize), String> = (|| {
                     use tauri::Manager;
                     let window = app_handle_for_wid.get_webview_window("main").ok_or_else(|| "Main window not found".to_string())?;
                     let ns_window = window.ns_window().map_err(|e| e.to_string())? as id;
@@ -63,7 +62,7 @@ async fn launch_mpv_player(
                     let content_view: id = unsafe { msg_send![ns_window, contentView] };
                     
                     // Create CAMetalLayer (Plezy Strategy)
-                    let metal_layer_ptr: usize = unsafe {
+                    let (metal_layer_ptr, mpv_container_ptr): (usize, usize) = unsafe {
                         // Ensure parent has a layer backing
                         let _: () = msg_send![content_view, setWantsLayer: 1i8];
                         let _: () = msg_send![content_view, layer]; // Ensure root layer exists
@@ -117,16 +116,16 @@ async fn launch_mpv_player(
 
                         println!("[DEBUG] CAMetalLayer created and attached via NSView container. Returning LAYER Pointer: {:p}", backing_layer);
                         
-                        backing_layer as usize // Return LAYER pointer as WID (Plezy usage)
+                        (backing_layer as usize, mpv_container as usize) // Return both
                     };
                     
-                    Ok(metal_layer_ptr)
+                    Ok((metal_layer_ptr, mpv_container_ptr))
                 })();
             let _ = tx_wid.send(res);
         }).map_err(|e| e.to_string())?;
 
         println!("[INVOKE] Waiting for WID (Layer Pointer)...");
-        let mpv_wid_raw = rx_wid.recv().map_err(|_| "Failed to receive WID")??;
+        let (mpv_wid_raw, container_view_ptr) = rx_wid.recv().map_err(|_| "Failed to receive WID")??;
         
         let mpv_wid_str = mpv_wid_raw.to_string();
         println!("[INVOKE] Initializing MPV with Layer WID: {}", mpv_wid_str);
@@ -199,7 +198,7 @@ async fn launch_mpv_player(
         })?;
 
         println!("[INVOKE] MPV initialized (MacVK/Metal).");
-        *lock = Some(MpvInstance { mpv });
+        *lock = Some(MpvInstance { mpv, container_view: container_view_ptr });
 
         } // End Init Block
 
@@ -210,21 +209,51 @@ async fn launch_mpv_player(
             // println!("[EMBEDDED] Playing: {} -> {}", title, url);
 
             // 2. Add Subtitle After loading
+            // 2. Add Subtitle After loading
              if let Some(ref sub) = subtitle_url {
-                // Determine if it was loaded. Ideally we wait for 'start-file' event, 
-                // but strictly sending commands sequentially usually works if MPV buffers commands.
-                let args: &[&str] = &[sub.as_str(), "select"];
-                let _ = Mpv::command(&instance.mpv, "sub-add", args);
-                println!("[LIB] Added subtitle: {}", sub);
+                if !sub.is_empty() {
+                    let args: &[&str] = &[sub.as_str(), "select"];
+                    let _ = Mpv::command(&instance.mpv, "sub-add", args);
+                    println!("[LIB] Added primary subtitle: {}", sub);
+                }
             }
         }
     }
     
     #[cfg(not(target_os = "macos"))]
     {
-        let _ = (state, app, title, url);
+        let _ = (state, app, title, url, subtitle_url);
     }
     Ok(())
+}
+
+#[tauri::command(rename_all = "snake_case")]
+fn native_sub_add(state: tauri::State<'_, MpvState>, url: String, title: Option<String>) -> Result<(), String> {
+    let lock = state.0.lock().map_err(|e| e.to_string())?;
+    if let Some(ref instance) = *lock {
+        let args: &[&str] = if let Some(ref t) = title {
+            &[url.as_str(), "auto", t.as_str()]
+        } else {
+            &[url.as_str(), "auto"]
+        };
+        let _ = Mpv::command(&instance.mpv, "sub-add", args);
+        println!("[LIB] Added track: {}", url);
+        Ok(())
+    } else {
+        Err("Player not active".to_string())
+    }
+}
+
+#[tauri::command(rename_all = "snake_case")]
+fn native_sub_reload(state: tauri::State<'_, MpvState>) -> Result<(), String> {
+    let lock = state.0.lock().map_err(|e| e.to_string())?;
+    if let Some(ref instance) = *lock {
+        // Re-scan tracks by toggling or just let frontend re-fetch
+        let _ = Mpv::command(&instance.mpv, "sub-reload", &[]);
+        Ok(())
+    } else {
+        Err("Player not active".to_string())
+    }
 }
 
 #[tauri::command(rename_all = "snake_case")]
@@ -233,10 +262,17 @@ fn close_native_player(state: tauri::State<'_, MpvState>) -> Result<(), String> 
     {
         let mut lock = state.0.lock().unwrap();
         if let Some(instance) = lock.take() {
-            // Explicitly quit to ensure that core shuts down
-            let _ = Mpv::command(&instance.mpv, "quit", &["0"]);
+            // 1. Explicitly quit to ensure that core shuts down
+            let _ = libmpv2::Mpv::command(&instance.mpv, "quit", &["0"]);
+            
+            // 2. Remove the container view from superview (Prevent layer leak)
+            let container_ptr = instance.container_view as id;
+            unsafe {
+                let _: () = msg_send![container_ptr, removeFromSuperview];
+            }
+            
             drop(instance);
-            println!("[EMBEDDED] Player closed");
+            println!("[EMBEDDED] Player closed and view removed");
         }
     }
     #[cfg(not(target_os = "macos"))]
@@ -405,6 +441,11 @@ fn ping() -> String {
     "pong".to_string()
 }
 
+#[tauri::command]
+fn native_log(msg: String) {
+    println!("[JS-LOG] {}", msg);
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -422,6 +463,9 @@ pub fn run() {
             get_subtitle_tracks,
             set_subtitle_track,
             set_subtitle_style,
+            native_sub_add,
+            native_sub_reload,
+            native_log,
             search_gds,
             ping,
             get_mpv_state

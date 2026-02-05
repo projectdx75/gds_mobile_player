@@ -11,34 +11,50 @@
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
   <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700&display=swap" rel="stylesheet">
   <script src="https://unpkg.com/lucide@latest"></script>
-  <script src="https://unpkg.com/lucide@latest"></script>
   <script type="module">
     import { invoke } from 'https://esm.sh/@tauri-apps/api@2.2.0/core';
     import { listen } from 'https://esm.sh/@tauri-apps/api@2.2.0/event';
+    import { getCurrentWindow } from 'https://esm.sh/@tauri-apps/api@2.2.0/window';
+    
     window.__TAURI_CDN_INVOKE__ = invoke;
     window.__TAURI_CDN_LISTEN__ = listen;
-    console.log("[CDN] Tauri API loaded via ESM");
+    
+    console.log("[CDN] Tauri API v2.2.0 loaded - Native Drag Regions Active");
   </script>
   <script src="main.js"></script>
 </head>
 
 
-<header class="glass-header">
-  <div class="header-content">
-    <div class="header-actions">
-      <!-- Status Dot -->
-      <div id="status-indicator" class="status-dot"></div>
+<header class="glass-header" data-tauri-drag-region>
+  <div class="header-content" data-tauri-drag-region>
+    <div class="header-nav-left" data-tauri-drag-region>
+      <div class="app-logo">FLASH PLEX</div>
+      <nav class="netflix-nav">
+        <button class="nav-link tab active" data-category="" tabindex="0">홈</button>
+        <button class="nav-link tab" data-category="tv_show" tabindex="0">시리즈</button>
+        <button class="nav-link tab" data-category="movie" tabindex="0">영화</button>
+        <button class="nav-link tab" data-category="animation" tabindex="0">애니메이션</button>
+        <button class="nav-link tab" data-category="favorites" tabindex="0">내가 찜한 리스트</button>
+      </nav>
+    </div>
 
-      <!-- [PHASE 4] Sort Button -->
-      <button class="icon-btn" id="btn-sort">
-        <i data-lucide="list-filter"></i>
+    <div class="header-actions">
+      <!-- Search Button (Icon only in Netflix style) -->
+      <button class="icon-btn" onclick="window.switchView('search')" data-tauri-no-drag>
+        <i data-lucide="search" data-tauri-no-drag></i>
       </button>
-      <button class="osc-ctrl-btn" id="btn-header-subtitles">
-        <i data-lucide="captions"></i>
+      
+      <!-- Sort Button -->
+      <button class="icon-btn" id="btn-sort" data-tauri-no-drag>
+        <i data-lucide="list-filter" data-tauri-no-drag></i>
       </button>
-      <button class="osc-ctrl-btn" id="btn-osc-settings">
-        <i data-lucide="settings"></i>
+
+      <button class="icon-btn" id="btn-osc-settings" onclick="window.switchView('settings')" data-tauri-no-drag>
+        <i data-lucide="settings" data-tauri-no-drag></i>
       </button>
+
+      <!-- Status Dot -->
+      <div id="status-indicator" class="status-dot" data-tauri-no-drag></div>
     </div>
   </div>
 </header>
@@ -72,37 +88,26 @@
   <section id="view-library" class="view active">
     <!-- Hero Section -->
     <div class="hero-section">
-      <!-- [PHASE 4] Dynamic Hero Carousel -->
       <div id="hero-carousel" class="hero-carousel">
-        <!-- Slides will be injected here by main.js -->
+        <!-- Netflix Style Hero Content injected here -->
         <div class="hero-slide active placeholder">
           <div class="hero-content">
-            <div class="hero-tag">Loading...</div>
+            <h1 class="hero-title">Loading...</h1>
           </div>
         </div>
       </div>
     </div>
 
-    <div class="view-header" data-tauri-drag-region>
-      <div class="category-tabs">
-        <button class="tab" data-category="tv_show" tabindex="0">TV/Show</button>
-        <button class="tab" data-category="movie" tabindex="0">Movies</button>
-        <button class="tab" data-category="animation" tabindex="0">Animation</button>
-        <button class="tab" data-category="music_video" tabindex="0">M/V</button>
-        <button class="tab" data-category="audio" tabindex="0">Music</button>
-        <button class="tab" data-category="" tabindex="0">All</button>
-      </div>
+    <div class="view-header">
       <div id="sub-category-chips" class="sub-category-bar" style="display: none;">
         <!-- Dynamic sub-category chips -->
       </div>
     </div>
     <div id="library-grid" class="grid">
-      <!-- Skeleton items by default -->
+      <!-- Skeleton items -->
       <div class="card skeleton"></div>
       <div class="card skeleton"></div>
-      <div class="card skeleton"></div>
-      <div class="card skeleton"></div>
-    </div>
+    </div> 
   </section>
 
   <!-- Search View -->
@@ -224,12 +229,12 @@
   <div id="player-bg"></div>
 
   <!-- Top Bar: Title & Back -->
-  <div class="player-header" data-tauri-drag-region>
+  <div class="player-header" >
     <button id="btn-close-player" class="ctrl-btn" tabindex="0">
       <i data-lucide="chevron-left"></i>
     </button>
-    <div class="player-title-info" data-tauri-drag-region>
-      <h2 id="player-video-title" data-tauri-drag-region>Title</h2>
+    <div class="player-title-info" >
+      <h2 id="player-video-title" >Title</h2>
     </div>
     <div class="player-actions">
       <!-- Info icon removed per user request -->
@@ -302,11 +307,11 @@
     <div class="osc-gradient-top"></div>
     <div class="osc-gradient-bottom"></div>
 
-    <div class="osc-top-bar" data-tauri-drag-region>
+    <div class="osc-top-bar">
       <button id="btn-osc-back" class="osc-ctrl-btn" title="Back">
         <i data-lucide="arrow-left"></i>
       </button>
-      <div class="osc-title-wrapper" data-tauri-drag-region>
+      <div class="osc-title-wrapper">
         <h2 id="osc-title">Video Title</h2>
         <span id="osc-subtitle">00:00 / 00:00</span>
       </div>

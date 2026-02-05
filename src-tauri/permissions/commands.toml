@@ -1,0 +1,16 @@
+[[permission]]
+identifier = "allow-custom-commands"
+description = "Allows custom commands defined in the main crate"
+commands.allow = [
+    "launch_mpv_player",
+    "close_native_player",
+    "native_play_pause",
+    "native_seek",
+    "native_set_volume",
+    "get_subtitle_tracks",
+    "set_subtitle_track",
+    "set_subtitle_style",
+    "search_gds",
+    "ping",
+    "get_mpv_state"
+]

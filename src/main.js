@@ -15,8 +15,9 @@ const state = {
   currentPath: "", // For folder navigation
   pathStack: [], // Navigation history
   categoryMapping: {},
-  subtitleSize: 1.0, // Default font scale
-  subtitlePos: 0.0, // Default vertical offset
+  subtitleSize: parseFloat(localStorage.getItem("flashplex_sub_size") || "1.1"), // Default font scale
+  subtitlePos: parseFloat(localStorage.getItem("flashplex_sub_pos") || "0.0"), // Default vertical offset
+  volume: parseInt(localStorage.getItem("flashplex_volume") || "100"),
 
   // [PHASE 4] Infinite Scroll State
   offset: 0,
@@ -27,6 +28,10 @@ const state = {
   // [PHASE 4] Sorting State
   sortBy: "date",
   sortOrder: "desc",
+
+  // [NEW] Global seen paths to prevent duplicates across appends
+  seenPaths: new Set(),
+  isFirstFreshLoadDone: false,
 };
 
 // Platform Detection
@@ -36,8 +41,14 @@ const isDesktop = !isAndroid && !isIOS;
 
 // Helper for cross-version Tauri invoke
 function getTauriInvoke() {
-  if (!window.__TAURI__) return null;
-  return (window.__TAURI__.core && window.__TAURI__.core.invoke) || window.__TAURI__.invoke;
+  const invoke = window.__TAURI_CDN_INVOKE__ || (window.__TAURI__ && window.__TAURI__.core ? window.__TAURI__.core.invoke : (window.__TAURI__ ? window.__TAURI__.invoke : null));
+  if (invoke && !window.tlog) {
+    window.tlog = (msg) => { 
+        invoke("native_log", { msg }).catch(() => {});
+        console.log("[NATIVE-LOG]", msg);
+    };
+  }
+  return invoke;
 }
 
 // [NEW] Shared logic for checking/selecting subs and updating badge with retry
@@ -47,7 +58,7 @@ async function checkAndSelectSubtitles(retries = 4) {
 
   try {
     let tracks = await invoke("get_subtitle_tracks");
-    // console.log(`[SUB] Checking subtitles (retries left: ${retries})...`);
+    console.log("[SUB] Tracks identified:", tracks.length, tracks);
 
     // Update Badge
     const hasSelection = tracks && tracks.some((t) => t.selected);
@@ -60,10 +71,11 @@ async function checkAndSelectSubtitles(retries = 4) {
         (t) =>
           t.lang === "ko" ||
           t.title?.toLowerCase().includes("korean") ||
-          t.title?.includes("한국어"),
+          t.title?.includes("한국어") ||
+          t.title?.toLowerCase().includes("ko."),
       );
       if (koTrack) {
-        console.log("[SUB] Auto-selecting Korean track:", koTrack.id);
+        console.log("[SUB] Auto-selecting Korean track:", koTrack.id, koTrack.title);
         await invoke("set_subtitle_track", { sid: koTrack.id });
         if (badge) badge.style.display = "block";
         return true; // We selected something
@@ -72,7 +84,7 @@ async function checkAndSelectSubtitles(retries = 4) {
 
     // Retry if no tracks found OR we haven't selected anything yet (maybe tracks load late)
     if (retries > 0 && !hasSelection) {
-      setTimeout(() => checkAndSelectSubtitles(retries - 1), 1500); // Retry every 1.5s
+      setTimeout(() => checkAndSelectSubtitles(retries - 1), 2000); // Retry every 2s
     }
     return hasSelection;
   } catch (e) {
@@ -138,6 +150,7 @@ function initElements() {
       btnOscFullscreen: document.getElementById("btn-osc-fullscreen"),
       btnOscSubtitles: document.getElementById("btn-osc-subtitles"), // [FIX] ID Plural
       btnOscSettings: document.getElementById("osc-btn-settings"),
+      btnHeaderSettings: document.getElementById("btn-osc-settings"),
       oscCenterControls: document.querySelector(".osc-center-controls"),
     };
     console.log("[INIT] UI Elements initialized safely.");
@@ -247,7 +260,6 @@ window.addEventListener("DOMContentLoaded", () => {
     setupPlayer();
     setupButtons();
     setupSettings();
-    setupSettings();
     setupRemoteNavigation();
     setupPremiumOSC();
   } catch (err) {
@@ -262,16 +274,22 @@ window.addEventListener("DOMContentLoaded", () => {
   } else {
     switchView("settings");
   }
-  setupScrollBehavior(); // [PHASE 4] Auto-hide Nav
+  // setupScrollBehavior(); // [PHASE 4] Auto-hide Nav (Disabled per user request)
   setupInfiniteScroll(); // [PHASE 4] Infinite Scroll
   setupSortUI(); // [PHASE 4] Sort UI
   initHeroCarousel(); // [FIX] Call Hero Init explicitly
 
+  // Header Scroll Effect
+  const container = document.querySelector(".content-container");
+  const header = document.querySelector(".glass-header");
+  if (container && header) {
+    container.addEventListener("scroll", () => {
+      header.classList.toggle("scrolled", container.scrollTop > 50);
+    });
+  }
 
-  // [CRITICAL] Re-init layout fixes
-  setTimeout(() => {
-    // Force re-calc of layout if needed
-  }, 500);
+  // Globally expose switchView for HTML onclick
+  window.switchView = switchView;
 });
 
 // Navigation Logic
@@ -298,20 +316,56 @@ function switchView(viewName) {
     item.classList.toggle("active", item.dataset.view === viewName);
   });
 
+  // [NEW] If switching view AND native player is active, kill it
+  if (state.isNativeActive && viewName !== "player") {
+    const invoke = window.__TAURI__ ? (window.__TAURI__.core ? window.__TAURI__.core.invoke : window.__TAURI__.invoke) : null;
+    if (invoke) {
+      invoke("close_native_player").catch(() => {});
+      state.isNativeActive = false;
+      document.body.classList.remove("native-player-active");
+      document.documentElement.classList.remove("native-player-active");
+    }
+  }
+
   state.currentView = viewName;
 }
 
 // Tabs Logic
 function setupTabs() {
-  if (!ui.categoryTabs) return;
-  ui.categoryTabs.forEach((tab) => {
+  // Select both .tab in index.html (header links)
+  const tabs = document.querySelectorAll(".tab");
+  if (!tabs) return;
+
+  tabs.forEach((tab) => {
     tab.addEventListener("click", () => {
-      ui.categoryTabs.forEach((t) => t.classList.remove("active"));
+      // Navigation highlight logic
+      tabs.forEach((t) => t.classList.remove("active"));
       tab.classList.add("active");
-      state.category = tab.dataset.category;
+
+      // Category filter logic
+      const cat = tab.dataset.category || "";
+      console.log("[NAV] Tab clicked, category:", cat);
+
+      state.category = cat;
       state.currentPath = "";
       state.pathStack = [];
-      loadLibrary();
+      state.offset = 0;
+      state.library = [];
+
+      // Special handling for Favorites
+      if (cat === "favorites") {
+        renderFavorites(); // We'll define this
+      } else {
+        // Reset hero visibility
+        const hero = document.querySelector(".hero-section");
+        if (hero) hero.style.display = "block";
+        
+        loadLibrary();
+      }
+
+      // Reset scroll position
+      const container = document.querySelector(".content-container");
+      if (container) container.scrollTop = 0;
     });
   });
 }
@@ -394,8 +448,10 @@ async function loadLibrary(forceRefresh = false, isAppend = false) {
     state.hasMore = true;
     state.isLoadingMore = false;
     state.library = []; // Clear current library state reference
+    state.seenPaths.clear(); // Reset deduplication set
+    state.isFirstFreshLoadDone = false;
   } else {
-    if (!state.hasMore || state.isLoadingMore) return;
+    if (!state.hasMore || state.isLoadingMore || !state.isFirstFreshLoadDone) return;
     state.isLoadingMore = true;
   }
 
@@ -460,12 +516,15 @@ async function loadLibrary(forceRefresh = false, isAppend = false) {
     let data;
 
     // Common Params
+    const actualOffset = isAppend ? state.offset : 0;
     const commonParams = {
       limit: state.limit.toString(),
-      offset: state.offset.toString(),
+      offset: actualOffset.toString(),
       sort_by: state.sortBy,
       sort_order: state.sortOrder
     };
+
+    console.log(`[LOAD] Fetching: isAppend=${isAppend}, offset=${actualOffset}, category=${state.category}`);
 
     // FETCH LOGIC
     let currentList = [];
@@ -481,11 +540,17 @@ async function loadLibrary(forceRefresh = false, isAppend = false) {
       data = await gdsFetch(`search?${params.toString()}`);
 
       const rawList = data.list || data.data || [];
-      currentList = rawList; // Use local var
+      
+      // [FIX] Filter chips to exclude non-video folders
+      const excludedRoots = ['READING', 'DATA', 'MUSIC', '책', '만화', 'YES24 북클럽'];
+      currentList = rawList.filter(i => {
+          const nameUpper = (i.name || "").toUpperCase();
+          return !excludedRoots.includes(nameUpper);
+      });
 
       if (!isAppend) {
         if (data.ret === "success" && state.category) {
-          renderSubCategoryChips(currentList); // Extract chips from first batch
+          renderSubCategoryChips(currentList); 
         } else {
           hideSubCategoryChips();
         }
@@ -537,32 +602,68 @@ async function loadLibrary(forceRefresh = false, isAppend = false) {
       }
 
       // [NEW] Filter out "Season" folders for TV Shows (Only at Root)
-      console.log(`[FILTER] Cat: ${state.category}, Path: '${state.currentPath}'`);
-
       if (state.category === 'tv_show' && !state.currentPath) {
-        console.log("[FILTER] Applying Season Filter...");
-        // Regex to match "Season 1", "S1", "시즌1", "Specials"
         const seasonRegex = /^(season|s|시즌)\s*\d+|specials/i;
-        const initialCount = finalItems.length;
         finalItems = finalItems.filter(i => {
           if (!i.is_dir) return true;
           return !seasonRegex.test(i.name);
         });
-        console.log(`[FILTER] Removed ${initialCount - finalItems.length} season folders`);
       }
 
-      // [MOD] Category Logic: Movie Index Folders
-      // ... (Filtering logic remains, filtering might affect page size slightly but acceptable)
-      let displayItems = finalItems;
+      // [NEW] Deduplicate items (Persistent across appends)
+      const uniqueItems = finalItems.filter(i => {
+        const isCatRoot = !state.currentPath;
+        const key = getDedupKey(i, isCatRoot);
+
+        if (state.seenPaths.has(key)) {
+            console.log(`[DEDUP] Grouping/Skipping duplicate: ${key} (Name: ${i.name})`);
+            return false;
+        }
+        state.seenPaths.add(key);
+        return true;
+      });
+
+      // [NEW] FILTER: Only Video Content and exclude READING/DATA/MUSIC unless inside VIDEO
+      // [NEW] FILTER: Video Content + Subtitles
+      const videoExtensions = ['.mp4', '.mkv', '.avi', '.mov', '.webm', '.ts', '.m4v', '.srt', '.smi', '.vtt', '.ass', '.ssa'];
+      const excludedRoots = ['READING', 'DATA', 'MUSIC', '책', '만화', 'YES24 북클럽'];
+      
+      let displayItems = uniqueItems.filter(i => {
+        const pathUpper = (i.path || "").toUpperCase();
+        const nameUpper = (i.name || "").toUpperCase();
+        
+        // 1. If it's a file, it MUST be a video
+        if (!i.is_dir) {
+          const ext = nameUpper.substring(nameUpper.lastIndexOf('.'));
+          if (!videoExtensions.includes(ext.toLowerCase())) return false;
+        }
+
+        // 2. Path restriction: If at root, only allow 'VIDEO' itself or items that have 'VIDEO/' in their path
+        if (!state.currentPath) {
+           // Allow 'VIDEO' folder to be seen, but skip others like READING
+           if (i.is_dir && excludedRoots.includes(nameUpper)) return false;
+        } else {
+           // If user enters a folder, but that folder is outside VIDEO (this shouldn't happen with above rule)
+           // we still allow it for flexibility unless explicitly excluded
+           if (excludedRoots.some(root => pathUpper.startsWith(root + "/") || nameUpper === root)) return false;
+        }
+
+        // 3. Category match (if category filter is active)
+        if (state.category && i.category && i.category !== state.category && !i.is_dir) {
+            // Special case: if we are in 'tv_show', only allow video files or directories
+            return i.is_dir;
+        }
+
+        return true;
+      });
+
       if (state.category === 'movie' && !state.currentPath) {
         if (!isAppend) {
-          const indexFolders = finalItems.filter(i => i.is_dir && i.name.length === 1);
+          const indexFolders = displayItems.filter(i => i.is_dir && i.name.length === 1);
           renderSubCategoryChips(indexFolders);
         }
-        // Filter out from grid
-        displayItems = finalItems.filter(i => !(i.is_dir && i.name.length === 1));
+        displayItems = displayItems.filter(i => !(i.is_dir && i.name.length === 1));
       } else if (state.category === 'tv_show' && !state.currentPath) {
-        // [MOD] TV Subcategories
         if (!isAppend) {
            renderSubCategoryChips(['드라마', '예능', '다큐', '시사', '애니', '뉴스']);
         }
@@ -572,17 +673,15 @@ async function loadLibrary(forceRefresh = false, isAppend = false) {
 
       // Final Render
       if (!isAppend) {
+        state.isFirstFreshLoadDone = true; // Mark as done now that fresh data arrived
         ui.statusDot.className = "status-dot success";
         if (heroSection) {
-          // [MOD] User requested to STOP slides but KEEP layout
-          // Show section and render static placeholder
           heroSection.style.display =
             state.currentView === "library" && !state.currentPath
               ? "block"
               : "none";
 
           if (state.currentView === "library" && !state.currentPath) {
-            // No carousel init, just placeholder
             renderHeroPlaceholder(heroSection);
           }
         }
@@ -759,8 +858,8 @@ function setupInfiniteScroll() {
     const { scrollTop, scrollHeight, clientHeight } = container;
     // Check if near bottom (300px threshold)
     if (scrollHeight - scrollTop <= clientHeight + 300) {
-      if (state.hasMore && !state.isLoadingMore) {
-        console.log("[SCROLL] Loading more items...");
+      if (state.hasMore && !state.isLoadingMore && state.isFirstFreshLoadDone) {
+        console.log(`[SCROLL] Loading more items... offset=${state.offset}`);
         loadLibrary(false, true); // forceRefresh=false, isAppend=true
       }
     }
@@ -811,9 +910,19 @@ function renderGrid(container, items, isFolderCategory = false, isAppend = false
   if (!items) return; // Nothing to append
 
   items.forEach((item, index) => {
-    // ... (Keep existing card generation) ...
+    // [NEW] Robust Deduplication check in the grid itself
+    // Key MUST match the logic in loadLibrary deduplication
+    const isCatRoot = !state.currentPath;
+    const itemKey = getDedupKey(item, isCatRoot);
+
+    const existing = container.querySelector(`[data-path="${CSS.escape(itemKey)}"]`);
+    if (existing && isAppend) {
+        console.warn("[GRID] skipping duplicate item:", itemKey);
+        return; 
+    }
+
     const card = document.createElement("div");
-    // ...
+    card.setAttribute("data-path", itemKey); // Store key for checking
     card.tabIndex = 0; // Make card focusable for remote navigation
     card.className = "card";
     card.style.animation = `fadeIn 0.6s cubic-bezier(0.23, 1, 0.32, 1) forwards ${index * 0.05}s`;
@@ -853,9 +962,15 @@ function renderGrid(container, items, isFolderCategory = false, isAppend = false
 
     if (!poster) usePlaceholder = true;
 
-    // Use meta_summary if available, otherwise format size
+    // [MOD] Cleaner Subtitle for Folders (No more "0 항목")
+    const getFolderSubtitle = (item) => {
+      if (item.children_count > 0) return `${item.children_count}개 항목`;
+      const catMap = { 'tv_show': '시리즈', 'movie': '영화', 'animation': '애니메이션', 'music_video': 'M/V', 'audio': '음악' };
+      return catMap[item.category] || "폴더";
+    };
+
     const subtitle = isFolder
-      ? `${item.children_count || 0} 항목`
+      ? getFolderSubtitle(item)
       : item.meta_summary || formatSize(item.size);
 
     if (usePlaceholder) {
@@ -981,6 +1096,54 @@ function formatTime(seconds) {
   const s_str = s.toString().padStart(2, "0");
   return h > 0 ? `${h}:${m_str}:${s_str}` : `${m_str}:${s_str}`;
 }
+
+// [NEW] Robust Deduplication Key Generator
+function getDedupKey(item, isCatRoot) {
+  if (!item.path) return (item.name || "") + (item.size || 0);
+  
+  const normPath = item.path.normalize('NFC');
+  if (!isCatRoot) return normPath;
+
+  // For Category Root (Movie/TV), be aggressive to catch duplicates in different folders
+  // Use title if available, fallback to name
+  const rawTitle = (item.title || item.name || "").normalize('NFC').toUpperCase();
+  
+  // Try to extract Season/Episode info to avoid merging episodes at root
+  const epMatch = rawTitle.match(/S\d{2}E\d{2}/i) || rawTitle.match(/E\d{2,3}/i);
+  const epSuffix = epMatch ? `_${epMatch[0].toUpperCase()}` : "";
+
+  // Clean aggressively: remove common release group tags, years, quality, etc.
+  const cleaned = rawTitle
+    .replace(/\.(mp4|mkv|avi|mov|ts|m4v|webm)$/i, "") // extension
+    .replace(/[\(\[\{]\d{4}[\)\}\]]/g, "") // Years in any bracket (2024), [2024], {2024}
+    .replace(/[\(\[\{].*?[\)\}\]]/g, "") // Any other brackets/tags [4K], [HDR], (Director's Cut)
+    .replace(/[._\-]/g, " ") // Replace separators with space
+    .replace(/[^가-힣A-Z0-9\s]/g, "") // Remove special characters entirely except KR/EN/Digits
+    .replace(/\s+/g, "") // Remove all whitespace for comparison
+    .trim();
+  
+  const ext = normPath.substring(normPath.lastIndexOf('.')).toUpperCase();
+  
+  return `name_${cleaned}${epSuffix}${ext}` || `path_${normPath}`;
+}
+
+// [NEW] URL-safe Base64 Helper for UTF-8 strings
+function toUrlSafeBase64(str) {
+  if (!str) return "";
+  try {
+    // 1. Convert UTF-8 to Latin1 (trick for btoa)
+    const latin1 = unescape(encodeURIComponent(str));
+    // 2. Standard Base64
+    const b64 = btoa(latin1);
+    // 3. Convert to URL-safe (+ to -, / to _) and remove padding
+    return b64.replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+  } catch (e) {
+    console.error("[B64] Encoding failed:", e);
+    return "";
+  }
+}
+
+
 
 // [Redundant startWebPlayer removed - Logic moved to playVideo]
 
@@ -1266,6 +1429,13 @@ function setupButtons() {
       });
     });
   }
+
+  if (ui.btnHeaderSettings) {
+    ui.btnHeaderSettings.addEventListener("click", () => {
+      console.log("[NAV] Header settings button clicked");
+      switchView("settings");
+    });
+  }
 }
 
 // Player Logic
@@ -1485,11 +1655,11 @@ function playVideo(item) {
     cleanPath = "/" + cleanPath;
   }
 
-  const bpath = encodeURIComponent(btoa(unescape(encodeURIComponent(cleanPath))));
+  const bpath = toUrlSafeBase64(cleanPath);
   const encodedPath = encodeURIComponent(cleanPath);
 
   let streamUrl = `${state.serverUrl}/gds_dviewer/normal/explorer/stream?path=${encodedPath}&source_id=${item.source_id || 0}&apikey=${state.apiKey}`;
-  const subtitleUrl = `${state.serverUrl}/gds_dviewer/normal/explorer/external_subtitle?bpath=${bpath}&source_id=${item.source_id || 0}&apikey=${state.apiKey}`;
+  const subtitleUrl = bpath ? `${state.serverUrl}/gds_dviewer/normal/explorer/external_subtitle?bpath=${bpath}&source_id=${item.source_id || 0}&apikey=${state.apiKey}` : null;
 
   const extension = (cleanPath || "").split(".").pop().toLowerCase();
   console.log("[PLAY] Extension Detected:", extension);
@@ -1503,12 +1673,7 @@ function playVideo(item) {
 
 
   // Tauri v2 invoke access detection
-  const invoke =
-    window.__TAURI__ && window.__TAURI__.core
-      ? window.__TAURI__.core.invoke
-      : window.__TAURI__
-        ? window.__TAURI__.invoke
-        : null;
+  const invoke = getTauriInvoke();
 
   console.log("[PLAYBACK] Routing Diagnostics:", {
     hasTauri: !!window.__TAURI__,
@@ -1528,21 +1693,18 @@ function playVideo(item) {
     if (isDesktop && !isAudio) {
       console.log("[PLAYBACK] Launching Native MPV for:", cleanTitle);
 
-
-      // (bpath construction moved to step 3)
-
-      // [NEW] Show Premium OSC / Hide Web Controls (Moved to success callback)
-      // if (ui.premiumOsc) ...
-      // if (ui.customControls) ...
+      // [FIX] Force UI Redraw / Transparency Refresh
+      document.body.classList.remove("native-player-active");
+      document.documentElement.classList.remove("native-player-active");
+      void document.body.offsetWidth; // Force Reflow
 
       // Add player-active class for transparency
       document.body.classList.add("native-player-active");
+      document.documentElement.classList.add("native-player-active");
 
       const cmd = "launch_mpv_player";
-
       state.isNativeActive = true;
 
-      console.log(`[PLAYBACK] Attempting ${cmd}...`);
       invoke(cmd, {
         title: cleanTitle,
         url: streamUrl,
@@ -1573,9 +1735,43 @@ function playVideo(item) {
           // [NEW] Check/Auto-select Subtitles after delay
           setTimeout(() => {
             checkAndSelectSubtitles();
-            // [NEW] Apply saved subtitle settings
+            
+            // [NEW] Use native_log for terminal visibility
+            const videoInfoUrl = `${state.serverUrl}/gds_dviewer/normal/get_video_info?bpath=${bpath}&source_id=${item.source_id || 0}&apikey=${state.apiKey}`;
+            if (window.tlog) window.tlog(`[SUB] Fetching video info: ${videoInfoUrl}`);
+            
+            fetch(videoInfoUrl)
+              .then(r => r.json())
+              .then(res => {
+                if (window.tlog) window.tlog(`[SUB] API Response: ${res.ret}, tracks: ${res.data?.subtitles?.length || 0}`);
+                if (res.ret === 'success' && res.data && res.data.subtitles) {
+                  const sidecars = res.data.subtitles.filter(s => s.type === 'sidecar');
+                  if (window.tlog) window.tlog(`[SUB] Sidecar match count: ${sidecars.length}`);
+                  
+                  const sidecarPromises = sidecars.map(s => {
+                    let fullUrl = s.url.startsWith('http') ? s.url : `${state.serverUrl}${s.url}&apikey=${state.apiKey}`;
+                    if (window.tlog) window.tlog(`[SUB] Injecting: ${s.title}`);
+                    return invoke("native_sub_add", { url: fullUrl, title: s.title }).catch(err => {
+                         console.warn("[SUB] native_sub_add failed:", err);
+                    });
+                  });
+
+                  // Once all sidecars are sent, wait a bit and re-run selection to pick the best one
+                  Promise.all(sidecarPromises).then(() => {
+                    setTimeout(() => {
+                        if (window.tlog) window.tlog("[SUB] Re-running selection after sidecar injection");
+                        checkAndSelectSubtitles(3); // Retry 3 times
+                    }, 1000);
+                  });
+                }
+              }).catch(e => {
+                  if (window.tlog) window.tlog(`[SUB] Fetch Error: ${e.message}`);
+              });
+
+            // [NEW] Apply saved settings (Volume & Subtitles)
             const inv = getTauriInvoke();
             if (inv) {
+              inv("native_set_volume", { volume: state.volume }).catch(e => console.error("[VOL] Init failed:", e));
               inv("set_subtitle_style", {
                 scale: state.subtitleSize,
                 pos: Math.round(state.subtitlePos)
@@ -1788,10 +1984,6 @@ function renderHeroSlides(items) {
     const slide = document.createElement("div");
     slide.className = `hero-slide ${index === 0 ? "active" : ""}`;
 
-    // Logic for Poster/Backdrop
-    // Use backdrop/fanart if available for hero, fall back to poster
-    // Since we don't have explicit fanart field in basic item, use poster for now or special API?
-    // Let's use the thumbnail API with a large width.
     const imgUrl = `${state.serverUrl}/gds_dviewer/normal/explorer/thumbnail?path=${encodeURIComponent(item.path)}&source_id=${item.source_id || 0}&w=1280&apikey=${state.apiKey}`;
 
     // Clean Title
@@ -1800,25 +1992,51 @@ function renderHeroSlides(items) {
       .replace(/[\. ](1080p|720p|2160p|4k|HEVC|H\.264|WEB-DL|DDP5\.1|Atmos|MA|BluRay|XviD|AC3|KOR|FHD|AMZN|NF|Obbe|H\.265|x265|10bit|HDR)/gi, " ")
       .trim();
 
+    const summary = item.summary || item.meta_summary || "FlashPlex에서 최고의 화질로 감상하세요.";
+
+    slide.style.backgroundImage = `url('${imgUrl}')`;
     slide.innerHTML = `
-      <img src="${imgUrl}" class="hero-img" alt="${displayTitle}">
-      <div class="hero-overlay"></div>
       <div class="hero-content">
-        <div class="hero-tag">새로 업데이트</div>
-        <div class="hero-title">${displayTitle}</div>
-        <div class="hero-meta">${formatSize(item.size)}</div>
+        <h1 class="hero-title">${displayTitle}</h1>
+        <p class="hero-summary">${summary}</p>
+        <div class="hero-btns">
+          <button class="btn-netflix btn-netflix-white hero-play-btn" tabindex="0">
+            <i data-lucide="play" style="fill: currentColor; width: 22px; height: 22px;"></i>
+            <span>재생</span>
+          </button>
+          <button class="btn-netflix btn-netflix-gray" tabindex="0">
+            <i data-lucide="info" style="width: 22px; height: 22px;"></i>
+            <span>상세 정보</span>
+          </button>
+        </div>
       </div>
     `;
 
-    // Click to Play
-    slide.onclick = () => {
-      playVideo(item, displayTitle);
-    };
+    // Click Play Button
+    const playBtn = slide.querySelector(".hero-play-btn");
+    if (playBtn) {
+      playBtn.onclick = (e) => {
+        e.stopPropagation();
+        playVideo(item, displayTitle);
+      };
+    }
 
     container.appendChild(slide);
   });
 
+  if (window.lucide) window.lucide.createIcons();
   startHeroTimer();
+}
+
+/**
+ * [NEW] Render My List (Favorites)
+ */
+function renderFavorites() {
+  const grid = document.getElementById("library-grid");
+  const hero = document.querySelector(".hero-section");
+  if (grid) grid.innerHTML = '<div style="grid-column:1/-1; padding:100px 0; text-align:center; color:var(--text-secondary);"><i data-lucide="heart" style="width:48px;height:48px;margin-bottom:15px; opacity:0.3;"></i><p>내가 찜한 리스트가 비어 있습니다.</p></div>';
+  if (hero) hero.style.display = "none"; // Hide hero in favorites view
+  if (window.lucide) window.lucide.createIcons();
 }
 
 function startHeroTimer() {
@@ -2466,33 +2684,81 @@ function setupPremiumOSC() {
     // We will increment local state `state.subtitleScale` (default 1.0)
 
     const updateStyle = () => {
-      invoke("set_subtitle_style", { scale: state.subtitleScale, pos: state.subtitlePos });
-      // console.log(`[SUB] Style: Scale ${state.subtitleScale}, Pos ${state.subtitlePos}`);
+      invoke("set_subtitle_style", { scale: state.subtitleSize, pos: state.subtitlePos });
+      localStorage.setItem("flashplex_sub_size", state.subtitleSize);
+      localStorage.setItem("flashplex_sub_pos", state.subtitlePos);
     };
 
     document.getElementById("sub-size-up").addEventListener("click", () => {
-      state.subtitleScale = Math.min(3.0, (state.subtitleScale || 1.0) + 0.1);
+      state.subtitleSize = Math.min(3.0, (state.subtitleSize || 1.1) + 0.1);
       updateStyle();
     });
     document.getElementById("sub-size-down").addEventListener("click", () => {
-      state.subtitleScale = Math.max(0.5, (state.subtitleScale || 1.0) - 0.1);
+      state.subtitleSize = Math.max(0.5, (state.subtitleSize || 1.1) - 0.1);
       updateStyle();
     });
     document.getElementById("sub-pos-up").addEventListener("click", () => {
-      state.subtitlePos = Math.max(0, (state.subtitlePos || 100) - 5);
+      state.subtitlePos = Math.max(0, (state.subtitlePos || 0) - 5);
       updateStyle();
     });
     document.getElementById("sub-pos-down").addEventListener("click", () => {
-      state.subtitlePos = Math.min(150, (state.subtitlePos || 100) + 5);
+      state.subtitlePos = Math.min(150, (state.subtitlePos || 0) + 5);
       updateStyle();
     });
   }
 
   if (ui.playerOverlay) {
+    let isDraggingSub = false;
+    let startY = 0;
+    let startSubPos = 0;
+
+    ui.playerOverlay.addEventListener('mousedown', (e) => {
+      // Only trigger if clicking in the lower 30% of the screen (where subtitles usually are)
+      // and NOT clicking on a specific button
+      if (e.target.closest('.osc-ctrl-btn') || e.target.closest('input')) return;
+      
+      const rect = ui.playerOverlay.getBoundingClientRect();
+      const clickY = e.clientY - rect.top;
+      
+      if (clickY > rect.height * 0.6) { // Bottom 40% area
+        isDraggingSub = true;
+        startY = e.clientY;
+        startSubPos = state.subtitlePos || 0;
+        console.log("[SUB-DRAG] Start dragging at Y:", startY, "Current Pos:", startSubPos);
+      }
+    });
+
+    window.addEventListener('mousemove', (e) => {
+      if (!isDraggingSub) return;
+      
+      const deltaY = e.clientY - startY;
+      // Invert or direct depending on MPV's 'sub-pos' behavior
+      // MPV sub-pos 100 is bottom, lower is higher? Actually sub-pos is 0-100.
+      // But we are using our backend 'pos' which is absolute px/units.
+      // Let's assume +deltaY means moving down -> increase subtitlePos.
+      let newPos = startSubPos + (deltaY * 0.5); // Sensitivity 0.5
+      newPos = Math.max(0, Math.min(150, newPos));
+      
+      state.subtitlePos = newPos;
+      const inv = getTauriInvoke();
+      if (inv) {
+        inv("set_subtitle_style", { scale: state.subtitleSize, pos: Math.round(newPos) });
+      }
+    });
+
+    window.addEventListener('mouseup', () => {
+      if (isDraggingSub) {
+        isDraggingSub = false;
+        localStorage.setItem("flashplex_sub_pos", state.subtitlePos);
+        console.log("[SUB-DRAG] Finished dragging. Saved Pos:", state.subtitlePos);
+      }
+    });
+
     ui.playerOverlay.addEventListener('click', (e) => {
+      if (isDraggingSub) return; // Don't toggle play if we were dragging
       if (e.target.closest('.osc-ctrl-btn') || e.target.closest('input')) return;
       console.log("[OSC-EVENT] Overlay background click -> togglePlay");
-      togglePlay(e);
+      togglePlay();
     });
   }
 
@@ -2537,16 +2803,14 @@ function setupPremiumOSC() {
 
   // Volume Slider
   if (ui.oscVolumeSlider) {
+    ui.oscVolumeSlider.value = state.volume; // Init slider
     ui.oscVolumeSlider.addEventListener("input", (e) => {
       const vol = parseInt(e.target.value);
+      state.volume = vol;
+      localStorage.setItem("flashplex_volume", vol);
       console.log("[OSC-DRAG] Volume change:", vol);
       if (state.isNativeActive) {
-        const invoke =
-          window.__TAURI__ && window.__TAURI__.core
-            ? window.__TAURI__.core.invoke
-            : window.__TAURI__
-              ? window.__TAURI__.invoke
-              : null;
+        const invoke = getTauriInvoke();
         if (invoke) invoke("native_set_volume", { volume: vol }).catch(console.error);
       } else if (ui.mainPlayer) {
         ui.mainPlayer.volume = vol / 100;
@@ -2555,12 +2819,18 @@ function setupPremiumOSC() {
   }
 
   // [TAURI BRIDGE] Event Listener Setup (Replaced with Polling for Stability)
-  const getTauriListen = () => {
-    if (!window.__TAURI__) return null;
-    return (window.__TAURI__.core && window.__TAURI__.core.invoke) || window.__TAURI__.invoke;
-  };
+  function getTauriInvoke() {
+  const invoke = window.__TAURI_CDN_INVOKE__ || (window.__TAURI__ && window.__TAURI__.core ? window.__TAURI__.core.invoke : (window.__TAURI__ ? window.__TAURI__.invoke : null));
+  if (invoke && !window.tlog) {
+    window.tlog = (msg) => {
+        invoke("native_log", { msg }).catch(() => {});
+        console.log("[NATIVE-LOG]", msg);
+    };
+  }
+  return invoke;
+}
 
-  const invoke = getTauriListen();
+  const invoke = getTauriInvoke();
 
   if (invoke) {
     console.log("[PLAYER] Starting polling loop for native state...");

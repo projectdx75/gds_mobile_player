@@ -17,10 +17,6 @@
     "core:menu:default",
     "core:image:default",
     "core:event:default",
-    "allow-launch-mpv-player",
-    "allow-close-native-player",
-    "allow-search-gds",
-    "allow-ping",
     "http:default"
   ]
 }
