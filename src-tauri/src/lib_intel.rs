@@ -3,29 +3,21 @@ use std::sync::{Arc, Mutex};
 use tauri::Emitter;
 use tauri::Manager;
 use libmpv2::Mpv;
-use tauri_plugin_http::reqwest;
-use serde_json;
 
 struct MpvInstance {
     mpv: Mpv,
-    // [INTEL-MAC-FIX] Store view ID for cleanup
-    #[cfg(target_os = "macos")]
-    ns_view: usize,
 }
 
 struct MpvState(Arc<Mutex<Option<MpvInstance>>>);
 
 fn log_to_file(msg: &str) {
     use std::io::Write;
-    let timestamp = chrono::Local::now().format("%H:%M:%S");
-    println!("[{}] {}", timestamp, msg); // Console output
-    
     let mut file = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
         .open("/tmp/tauri_mpv.log")
         .unwrap();
-    let _ = writeln!(file, "[{}] {}", timestamp, msg);
+    let _ = writeln!(file, "[{}] {}", chrono::Local::now().format("%H:%M:%S"), msg);
 }
 
 #[tauri::command(rename_all = "snake_case")]
@@ -53,16 +45,8 @@ fn launch_mpv_player(
             
             let (tx, rx) = mpsc::channel();
             let app_ui = app.clone();
-            
-            // Channel to receive the NSView address back
-            let (view_tx, view_rx) = mpsc::channel();
-            
-            let t0 = std::time::Instant::now();
-            log_to_file("[PERF] Starting Layer Creation on Main Thread...");
-
             app.run_on_main_thread(move || {
                 let res = (|| -> Result<usize, String> {
-                    // ... (keep existing unsafe block)
                     let window = app_ui.get_webview_window("main")
                         .ok_or("Main window not found")?;
                     let ns_window = window.ns_window().map_err(|e| e.to_string())? as id;
@@ -72,8 +56,6 @@ fn launch_mpv_player(
                         // A. Webview Transparency (Crucial for seeing layer behind)
                         let subviews: id = msg_send![content_view, subviews];
                         let count: usize = msg_send![subviews, count];
-                        log_to_file(&format!("[LAYER] Subviews count: {}", count)); // Verbose
-
                         for i in 0..count {
                             let view: id = msg_send![subviews, objectAtIndex: i];
                             let no_obj: id = msg_send![class!(NSNumber), numberWithBool: 0i8];
@@ -92,20 +74,21 @@ fn launch_mpv_player(
                         
                         let metal_layer: id = msg_send![class!(CAMetalLayer), new];
                         let _: () = msg_send![metal_layer, setFrame: frame];
-                        // ...
                         let _: () = msg_send![metal_layer, setContentsScale: 2.0f64];
+                        
                         let _: () = msg_send![metal_layer, setOpaque: 1i8];
                         
                         let _: () = msg_send![mpv_container, setLayer: metal_layer];
                         let _: () = msg_send![mpv_container, setWantsLayer: 1i8];
                         
+                        // Set black background to container to prevent desktop bleed
                         let black: id = msg_send![class!(NSColor), blackColor];
                         let _: () = msg_send![mpv_container, setBackgroundColor: black];
 
+                        // Insert at bottom
                         let _: () = msg_send![content_view, addSubview: mpv_container positioned: -1isize relativeTo: ptr::null_mut::<std::ffi::c_void>()];
                         let _: () = msg_send![mpv_container, setTranslatesAutoresizingMaskIntoConstraints: 0i8];
 
-                        // ... (constraints)
                         let t_a: id = msg_send![mpv_container, topAnchor];
                         let b_a: id = msg_send![mpv_container, bottomAnchor];
                         let l_a: id = msg_send![mpv_container, leadingAnchor];
@@ -126,7 +109,6 @@ fn launch_mpv_player(
                         let _: () = msg_send![c_l, setActive: 1i8];
                         let _: () = msg_send![c_r, setActive: 1i8];
 
-                        let _ = view_tx.send(mpv_container as usize);
                         Ok(metal_layer as usize)
                     }
                 })();
@@ -134,33 +116,21 @@ fn launch_mpv_player(
             }).map_err(|e| e.to_string())?;
 
             let mpv_wid_raw = rx.recv().map_err(|_| "Channel recv error".to_string())??;
-            let ns_view_addr = view_rx.recv().map_err(|_| "View channel recv error".to_string())?;
-            
-            log_to_file(&format!("[PERF] Layer Created in {:.2}ms", t0.elapsed().as_millis()));
-
             let mpv_wid_str = format!("0x{:x}", mpv_wid_raw);
 
             // 2. Initialize MPV
             std::env::set_var("VK_ICD_FILENAMES", "/Users/A/Work/tauri_projects/gds_mobile_player/src-tauri/moltenvk_icd.json");
-            
-            let t1 = std::time::Instant::now();
             let mpv = Mpv::with_initializer(|init| {
                 let _ = init.set_option("config", "no");
                 let _ = init.set_option("wid", mpv_wid_str.as_str());
-                // [INTEL-MAC-FIX] Use OpenGL instead of Vulkan/MoltenVK for stability
-                let _ = init.set_option("vo", "gpu"); 
-                let _ = init.set_option("gpu-api", "opengl");
-                // let _ = init.set_option("gpu-context", "moltenvk"); // Removed
+                let _ = init.set_option("vo", "gpu-next");
+                let _ = init.set_option("gpu-api", "vulkan");
+                let _ = init.set_option("gpu-context", "moltenvk");
                 let _ = init.set_option("hwdec", "auto");
                 Ok(())
             }).map_err(|e| e.to_string())?;
-            
-            log_to_file(&format!("[PERF] MPV Initialized in {:.2}ms", t1.elapsed().as_millis()));
 
-            *lock = Some(MpvInstance { 
-                mpv, 
-                ns_view: ns_view_addr 
-            });
+            *lock = Some(MpvInstance { mpv });
 
             // Start Event Thread
             let app_events = app.clone();
@@ -198,16 +168,10 @@ fn launch_mpv_player(
             }
 
             if let Some(ref sub) = subtitle_url {
-                 log_to_file(&format!("[SUB] Adding subtitle: {}", sub));
-                 let _ = Mpv::command(&inst.mpv, "sub-add", &[sub.as_str(), "select"]);
+                let _ = Mpv::command(&inst.mpv, "sub-add", &[sub.as_str(), "select"]);
             }
             log_to_file(&format!("[PLAY] Loading file: {}", url));
-            let res = Mpv::command(&inst.mpv, "loadfile", &[url.as_str(), "replace"]);
-            if let Err(e) = res {
-                 log_to_file(&format!("[ERROR] loadfile failed: {}", e));
-            } else {
-                 log_to_file("[PLAY] loadfile sent successfully");
-            }
+            let _ = Mpv::command(&inst.mpv, "loadfile", &[url.as_str(), "replace"]);
             let _ = inst.mpv.set_property("pause", false).map_err(|e| e.to_string())?;
         }
     }
@@ -218,38 +182,16 @@ fn launch_mpv_player(
 }
 
 #[tauri::command(rename_all = "snake_case")]
-fn close_native_player(
-    state: tauri::State<'_, MpvState>,
-    app: tauri::AppHandle
-) -> Result<(), String> {
-    log_to_file("[INVOKE] close_native_player called");
+fn close_native_player(state: tauri::State<'_, MpvState>) -> Result<(), String> {
     let mut lock = state.0.lock().unwrap();
     if let Some(instance) = lock.take() {
         let _ = Mpv::command(&instance.mpv, "quit", &["0"]);
-        
-        #[cfg(target_os = "macos")]
-        {
-            use cocoa::base::id;
-            use objc::{msg_send, sel, sel_impl};
-            
-            let view_addr = instance.ns_view;
-            app.run_on_main_thread(move || {
-                unsafe {
-                    let view: id = view_addr as id;
-                    let _: () = msg_send![view, removeFromSuperview];
-                }
-            });
-            log_to_file("[CLEANUP] Native view removal requested on main thread");
-        }
-    } else {
-        log_to_file("[WARN] close_native_player called but no instance found");
     }
     Ok(())
 }
 
 #[tauri::command(rename_all = "snake_case")]
 fn native_play_pause(state: tauri::State<'_, MpvState>, pause: bool) -> Result<(), String> {
-    log_to_file(&format!("[CMD] native_play_pause: {}", pause));
     let lock = state.0.lock().map_err(|e| e.to_string())?;
     if let Some(ref instance) = *lock {
         instance.mpv.set_property("pause", pause).map_err(|e| e.to_string())?;
@@ -259,7 +201,6 @@ fn native_play_pause(state: tauri::State<'_, MpvState>, pause: bool) -> Result<(
 
 #[tauri::command(rename_all = "snake_case")]
 fn native_seek(state: tauri::State<'_, MpvState>, seconds: f64) -> Result<(), String> {
-    log_to_file(&format!("[CMD] native_seek: {}", seconds));
     let lock = state.0.lock().map_err(|e| e.to_string())?;
     if let Some(ref instance) = *lock {
         let _ = Mpv::command(&instance.mpv, "seek", &[&seconds.to_string(), "absolute"]);
@@ -269,7 +210,6 @@ fn native_seek(state: tauri::State<'_, MpvState>, seconds: f64) -> Result<(), St
 
 #[tauri::command(rename_all = "snake_case")]
 fn native_set_volume(state: tauri::State<'_, MpvState>, volume: i64) -> Result<(), String> {
-    log_to_file(&format!("[CMD] native_set_volume: {}", volume));
     let lock = state.0.lock().map_err(|e| e.to_string())?;
     if let Some(ref instance) = *lock {
         instance.mpv.set_property("volume", volume).map_err(|e| e.to_string())?;
@@ -277,128 +217,20 @@ fn native_set_volume(state: tauri::State<'_, MpvState>, volume: i64) -> Result<(
     Ok(())
 }
 
-// [NEW] Subtitle Commands
-#[tauri::command(rename_all = "snake_case")]
-fn get_subtitle_tracks(state: tauri::State<'_, MpvState>) -> Result<serde_json::Value, String> {
-    let lock = state.0.lock().map_err(|e| e.to_string())?;
-    if let Some(ref instance) = *lock {
-        let count = instance.mpv.get_property::<i64>("track-list/count").unwrap_or(0);
-        let mut tracks = Vec::new();
-
-        for i in 0..count {
-            let type_prop = format!("track-list/{}/type", i);
-            let track_type = instance.mpv.get_property::<String>(&type_prop).unwrap_or_default();
-
-            if track_type == "sub" {
-                let id_prop = format!("track-list/{}/id", i);
-                let id = instance.mpv.get_property::<i64>(&id_prop).unwrap_or(0);
-
-                let lang_prop = format!("track-list/{}/lang", i);
-                let lang = instance.mpv.get_property::<String>(&lang_prop).unwrap_or("".to_string());
-
-                let title_prop = format!("track-list/{}/title", i);
-                let title = instance.mpv.get_property::<String>(&title_prop).unwrap_or("".to_string());
-                
-                let selected_prop = format!("track-list/{}/selected", i);
-                let selected = instance.mpv.get_property::<bool>(&selected_prop).unwrap_or(false);
-
-                let external_prop = format!("track-list/{}/external", i);
-                let external = instance.mpv.get_property::<bool>(&external_prop).unwrap_or(false);
-
-                tracks.push(serde_json::json!({
-                    "id": id,
-                    "lang": lang,
-                    "title": title,
-                    "selected": selected,
-                    "external": external,
-                    "index": i
-                }));
-            }
-        }
-        Ok(serde_json::json!(tracks))
-    } else {
-        log_to_file("[WARN] get_subtitle_tracks: No instance");
-        Ok(serde_json::json!([]))
-    }
-}
-
-#[tauri::command(rename_all = "snake_case")]
-fn set_subtitle_track(state: tauri::State<'_, MpvState>, sid: i64) -> Result<(), String> {
-    log_to_file(&format!("[CMD] set_subtitle_track: {}", sid));
-    let lock = state.0.lock().map_err(|e| e.to_string())?;
-    if let Some(ref instance) = *lock {
-        if sid < 0 {
-             let _ = instance.mpv.set_property("sid", "no");
-        } else {
-             let _ = instance.mpv.set_property("sid", sid);
-        }
-    }
-    Ok(())
-}
-
-#[tauri::command(rename_all = "snake_case")]
-fn set_subtitle_style(state: tauri::State<'_, MpvState>, scale: Option<f64>, pos: Option<i64>) -> Result<(), String> {
-    let lock = state.0.lock().map_err(|e| e.to_string())?;
-    if let Some(ref instance) = *lock {
-        if let Some(s) = scale {
-            let _ = instance.mpv.set_property("sub-scale", s);
-        }
-        if let Some(p) = pos {
-            let _ = instance.mpv.set_property("sub-pos", p);
-        }
-    }
-    Ok(())
-}
-
-#[tauri::command(rename_all = "snake_case")]
-fn get_mpv_state(state: tauri::State<'_, MpvState>) -> Result<serde_json::Value, String> {
-    let lock = state.0.lock().map_err(|e| e.to_string())?;
-    if let Some(ref inst) = *lock {
-        let pos = inst.mpv.get_property::<f64>("time-pos").unwrap_or(0.0);
-        let dur = inst.mpv.get_property::<f64>("duration").unwrap_or(0.0);
-        let pause = inst.mpv.get_property::<bool>("pause").unwrap_or(false);
-        let hwdec: String = inst.mpv.get_property("hwdec-current").unwrap_or("no".to_string());
-        Ok(serde_json::json!({ "position": pos, "duration": dur, "pause": pause, "hwdec": hwdec }))
-    } else {
-        Ok(serde_json::json!({ "position": 0.0, "duration": 0.0, "pause": true, "hwdec": "no" })) 
-    }
-}
-
 #[tauri::command(rename_all = "snake_case")]
 async fn search_gds(query: String, server_url: String, api_key: String, category: String) -> Result<serde_json::Value, String> {
-    println!("[SEARCH] Query: {}, Category: {}", query, category);
-    
-    let base_url = format!("{}/gds_dviewer/normal/explorer/search", server_url.trim_end_matches('/'));
-    
+    let b_url = format!("{}/gds_dviewer/normal/explorer/search", server_url.trim_end_matches('/'));
     let client = reqwest::Client::new();
-    let response = client
-        .get(&base_url)
-        .query(&[
-            ("query", &query),
-            ("is_dir", &"false".to_string()),
-            ("limit", &"50".to_string()),
-            ("category", &category),
-            ("apikey", &api_key),
-        ])
-        .send()
-        .await
-        .map_err(|e: reqwest::Error| format!("Network error: {}", e))?;
-
-    let text = response
-        .text()
-        .await
-        .map_err(|e: reqwest::Error| format!("Read body error: {}", e))?;
-
-    let json: serde_json::Value = serde_json::from_str(&text)
-        .map_err(|e: serde_json::Error| format!("JSON error: {} | body: {}", e, text))?;
-
+    let resp = client.get(&b_url).query(&[
+            ("query", &query), ("is_dir", &"false".to_string()), ("limit", &"50".to_string()),
+            ("category", &category), ("apikey", &api_key),
+        ]).send().await.map_err(|e| e.to_string())?;
+    let json: serde_json::Value = resp.json().await.map_err(|e| e.to_string())?;
     Ok(json)
 }
 
 #[tauri::command(rename_all = "snake_case")]
-fn ping() -> String {
-    "pong".to_string()
-}
+fn ping() -> String { "pong".to_string() }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
@@ -408,17 +240,7 @@ pub fn run() {
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_libmpv::init())
         .invoke_handler(tauri::generate_handler![
-            launch_mpv_player,
-            close_native_player,
-            native_play_pause,
-            native_seek,
-            native_set_volume,
-            get_subtitle_tracks,
-            set_subtitle_track,
-            set_subtitle_style,
-            search_gds,
-            ping,
-            get_mpv_state
+            launch_mpv_player, close_native_player, native_play_pause, native_seek, native_set_volume, search_gds, ping
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
