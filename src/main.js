@@ -1449,17 +1449,25 @@ function playVideo(item) {
   if (ui.totalTime) ui.totalTime.textContent = "00:00";
 
   // 3. Robust URL & Extension Parsing
-  // [FIX] Standardize on bpath (Base64) for BOTH stream and subtitles - most reliable for server
-  // [FIX] Apply NFC normalization to handle macOS NFD issues (fixes 404 on Korean filenames)
-  const cleanPath = (item.path || "").normalize("NFC");
-  const bpath = encodeURIComponent(btoa(unescape(encodeURIComponent(cleanPath))));
+  // [FIX] Use path= for stream (proven) and bpath= for subtitles (solves encoding issues there)
+  // [FIX] Apply NFC normalization for macOS/Linux compatibility
+  let cleanPath = (item.path || "").normalize("NFC");
 
-  let streamUrl = `${state.serverUrl}/gds_dviewer/normal/explorer/stream?bpath=${bpath}&source_id=${item.source_id || 0}&apikey=${state.apiKey}`;
+  // [FIX] Ensure path starts with a slash if it doesn't - common for GDS server
+  if (cleanPath && !cleanPath.startsWith("/")) {
+    cleanPath = "/" + cleanPath;
+  }
+
+  const bpath = encodeURIComponent(btoa(unescape(encodeURIComponent(cleanPath))));
+  const encodedPath = encodeURIComponent(cleanPath);
+
+  let streamUrl = `${state.serverUrl}/gds_dviewer/normal/explorer/stream?path=${encodedPath}&source_id=${item.source_id || 0}&apikey=${state.apiKey}`;
   const subtitleUrl = `${state.serverUrl}/gds_dviewer/normal/explorer/external_subtitle?bpath=${bpath}&source_id=${item.source_id || 0}&apikey=${state.apiKey}`;
 
-  const extension = (item.path || "").split(".").pop().toLowerCase();
-  console.log("[PLAY] Extension Detected:", extension, "isAndroid:", isAndroid);
-  console.log("[PLAY] Standardized Stream URL:", streamUrl);
+  const extension = (cleanPath || "").split(".").pop().toLowerCase();
+  console.log("[PLAY] Extension Detected:", extension);
+  console.log("[PLAY] Standardized Stream URL (path):", streamUrl);
+  console.log("[PLAY] Standardized Subtitle URL (bpath):", subtitleUrl);
 
   // 4. [HYBRID] Native Playback Routing
   const isAudio =
