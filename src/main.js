@@ -991,6 +991,11 @@ function setupSettings() {
       state.subtitleSize = parseFloat(e.target.value);
       subtitleSizeVal.innerText = state.subtitleSize.toFixed(1) + "x";
       localStorage.setItem("flashplex_sub_size", state.subtitleSize);
+      // [NEW] Apply in real-time if native player is active
+      const inv = getTauriInvoke();
+      if (state.isNativeActive && inv) {
+        inv("set_subtitle_style", { scale: state.subtitleSize, pos: Math.round(state.subtitlePos) });
+      }
     });
   }
 
@@ -1001,6 +1006,11 @@ function setupSettings() {
       state.subtitlePos = parseFloat(e.target.value);
       subtitlePosVal.innerText = state.subtitlePos.toFixed(0) + "px";
       localStorage.setItem("flashplex_sub_pos", state.subtitlePos);
+      // [NEW] Apply in real-time if native player is active
+      const inv = getTauriInvoke();
+      if (state.isNativeActive && inv) {
+        inv("set_subtitle_style", { scale: state.subtitleSize, pos: Math.round(state.subtitlePos) });
+      }
     });
   }
 
@@ -1548,6 +1558,11 @@ function playVideo(item) {
           // [NEW] Check/Auto-select Subtitles after delay
           setTimeout(() => {
             checkAndSelectSubtitles();
+            // [NEW] Apply saved subtitle settings
+            invoke("set_subtitle_style", {
+              scale: state.subtitleSize,
+              pos: Math.round(state.subtitlePos)
+            }).catch(e => console.error("[SUB] Style apply failed:", e));
           }, 1000); // 1s delay to ensure tracks loaded
 
           ui.playerTitle.textContent = cleanTitle;
