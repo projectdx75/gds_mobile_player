@@ -1449,39 +1449,17 @@ function playVideo(item) {
   if (ui.totalTime) ui.totalTime.textContent = "00:00";
 
   // 3. Robust URL & Extension Parsing
-  // 3. Robust URL & Extension Parsing
-  let streamUrlRaw = item.stream_url || item.url;
+  // [FIX] Standardize on bpath (Base64) for BOTH stream and subtitles - most reliable for server
+  // [FIX] Apply NFC normalization to handle macOS NFD issues (fixes 404 on Korean filenames)
+  const cleanPath = (item.path || "").normalize("NFC");
+  const bpath = encodeURIComponent(btoa(unescape(encodeURIComponent(cleanPath))));
 
-  // If URL is missing (e.g. from raw list_directory), construct it
-  if (!streamUrlRaw && item.path) {
-    streamUrlRaw = `${state.serverUrl}/gds_dviewer/normal/explorer/stream?path=${encodeURIComponent(item.path)}&source_id=${item.source_id || 0}`;
-    console.log("[PLAY] Constructed Stream URL:", streamUrlRaw);
-  }
+  let streamUrl = `${state.serverUrl}/gds_dviewer/normal/explorer/stream?bpath=${bpath}&source_id=${item.source_id || 0}&apikey=${state.apiKey}`;
+  const subtitleUrl = `${state.serverUrl}/gds_dviewer/normal/explorer/external_subtitle?bpath=${bpath}&source_id=${item.source_id || 0}&apikey=${state.apiKey}`;
 
-  if (!streamUrlRaw) {
-    console.error("[PLAY] No valid URL or path provided for item");
-    return;
-  }
-
-  let streamUrl = streamUrlRaw;
-  if (!streamUrl.includes("apikey=")) {
-    const separator = streamUrl.includes("?") ? "&" : "?";
-    streamUrl += `${separator}apikey=${state.apiKey}`;
-  }
-
-  // [FIX] Ensure URL is properly encoded (handle spaces/Korean chars that server might send raw)
-  if (streamUrl.includes(" ") || /[^ -~]/.test(streamUrl)) {
-    console.log("[PLAY] Encoding unencoded URL parts");
-    streamUrl = encodeURI(streamUrl);
-  }
-
-  // Improved extension parser: Prefer item.path, then fallback to URL without query params
-  const extension = (item.path || streamUrlRaw.split("?")[0] || "")
-    .split(".")
-    .pop()
-    .toLowerCase();
-
+  const extension = (item.path || "").split(".").pop().toLowerCase();
   console.log("[PLAY] Extension Detected:", extension, "isAndroid:", isAndroid);
+  console.log("[PLAY] Standardized Stream URL:", streamUrl);
 
   // 4. [HYBRID] Native Playback Routing
   const isAudio =
@@ -1516,11 +1494,7 @@ function playVideo(item) {
       console.log("[PLAYBACK] Launching Native MPV for:", cleanTitle);
 
 
-      // [FIX] Use bpath (Base64) for subtitle URL (Standard Base64 + URL Encoded)
-      // "Invalid Base64 path" on server means it likely expects standard Base64 w/ padding,
-      // but correctly URL-encoded so '+' doesn't become ' '.
-      const bpath = encodeURIComponent(btoa(unescape(encodeURIComponent(item.path))));
-      const subtitleUrl = `${state.serverUrl}/gds_dviewer/normal/explorer/external_subtitle?bpath=${bpath}&source_id=${item.source_id || 0}&apikey=${state.apiKey}`;
+      // (bpath construction moved to step 3)
 
       // [NEW] Show Premium OSC / Hide Web Controls (Moved to success callback)
       // if (ui.premiumOsc) ...
