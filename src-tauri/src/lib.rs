@@ -141,16 +141,28 @@ fn launch_mpv_player(
             let mpv_wid_str = format!("0x{:x}", mpv_wid_raw);
 
             // 2. Initialize MPV
-            std::env::set_var("VK_ICD_FILENAMES", "/Users/A/Work/tauri_projects/gds_mobile_player/src-tauri/moltenvk_icd.json");
+            let is_x86 = cfg!(target_arch = "x86_64");
+            
+            if !is_x86 {
+                // M1/ARM64: Use Vulkan/MoltenVK for better performance
+                std::env::set_var("VK_ICD_FILENAMES", "/Users/A/Work/tauri_projects/gds_mobile_player/src-tauri/moltenvk_icd.json");
+            }
             
             let t1 = std::time::Instant::now();
             let mpv = Mpv::with_initializer(|init| {
                 let _ = init.set_option("config", "no");
                 let _ = init.set_option("wid", mpv_wid_str.as_str());
-                // [INTEL-MAC-FIX] Use OpenGL instead of Vulkan/MoltenVK for stability
-                let _ = init.set_option("vo", "gpu"); 
-                let _ = init.set_option("gpu-api", "opengl");
-                // let _ = init.set_option("gpu-context", "moltenvk"); // Removed
+                
+                if is_x86 {
+                    // [INTEL-MAC-FIX] Use OpenGL for stability on older Intel chips
+                    let _ = init.set_option("vo", "gpu"); 
+                    let _ = init.set_option("gpu-api", "opengl");
+                } else {
+                    // [M1-OPTIMIZATION] Use modern v2 renderer (vulkan)
+                    let _ = init.set_option("vo", "gpu-next");
+                    let _ = init.set_option("gpu-api", "vulkan");
+                }
+                
                 let _ = init.set_option("hwdec", "auto");
                 Ok(())
             }).map_err(|e| e.to_string())?;
