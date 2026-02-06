@@ -1,7 +1,7 @@
 use std::sync::{Arc, Mutex};
 use libmpv2::Mpv;
 use cocoa::base::id;
-// use cocoa::foundation::NSRect; // Removed unused
+use cocoa::foundation::NSRect;
 use objc::{msg_send, sel, sel_impl, class};
 use serde_json;
 use tauri_plugin_http::reqwest;
@@ -275,8 +275,7 @@ fn resize_native_player(state: tauri::State<'_, MpvState>, app: tauri::AppHandle
     #[cfg(target_os = "macos")]
     {
         use tauri::Manager;
-        use cocoa::appkit::{NSView, NSWindow};
-        use cocoa::foundation::NSRect;
+        // Global NSRect and id are now used
 
         let container_ptr_opt = {
             let lock = state.0.lock().unwrap();
