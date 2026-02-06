@@ -290,11 +290,12 @@ fn close_native_player(state: tauri::State<'_, MpvState>) -> Result<(), String> 
 }
 
 #[tauri::command(rename_all = "snake_case")]
-fn resize_native_player(state: tauri::State<'_, MpvState>, app: tauri::AppHandle) -> Result<(), String> {
+fn resize_native_player(state: tauri::State<'_, MpvState>, app: tauri::AppHandle, force_fullscreen: Option<bool>) -> Result<(), String> {
     #[cfg(target_os = "macos")]
     {
         use tauri::Manager;
-        use cocoa::appkit::{NSView, NSWindow};
+        use cocoa::appkit::{NSView, NSWindow, NSScreen}; // Added NSScreen
+        use cocoa::foundation::NSRect;
 
         // 1. Get container pointer safely without holding lock during async operation
         let container_ptr_opt = {
@@ -322,19 +323,40 @@ fn resize_native_player(state: tauri::State<'_, MpvState>, app: tauri::AppHandle
 
                 unsafe {
                     let container_ptr = container_view_addr as id;
+                    let mut rect: NSRect;
 
-                    // Get fresh bounds from main thread
-                    let content_view = ns_window_ptr.contentView();
-                    let bounds = content_view.bounds();
-                    let origin = bounds.origin;
-                    let size = bounds.size;
+                    if force_fullscreen == Some(true) {
+                         // [FIX] Force match Screen Frame (for proper fullscreen toggle)
+                         let screen: id = msg_send![ns_window_ptr, screen];
+                         if !screen.is_null() {
+                             let frame: NSRect = msg_send![screen, frame];
+                             rect = frame;
+                             println!("[RESIZE] Forced Fullscreen to Screen Frame: {}x{}", rect.size.width, rect.size.height);
+                         } else {
+                             // Fallback
+                             let content_view = ns_window_ptr.contentView();
+                             rect = content_view.bounds();
+                         }
+                    } else {
+                        // Regular resize (window bounds)
+                        let content_view = ns_window_ptr.contentView();
+                        rect = content_view.bounds();
+                    }
+
+                    // Lower 'origin.y' is 0 in Cocoa view coordinates usually
+                    // But screen frame might have origin.
+                    // For a subview filling the window content view, we usually want bounds (0,0), not screen frame origin.
+                    // However, if we are in fullscreen, window content view matches screen frame size.
+                    // Let's use 0,0 for origin relative to parent, but size from screen.
+                    let origin = cocoa::foundation::NSPoint::new(0.0, 0.0);
+                    let size = rect.size;
 
                     // Resize via msg_send (safe ABI)
                     let _: () = msg_send![container_ptr, setFrameOrigin: origin];
                     let _: () = msg_send![container_ptr, setFrameSize: size];
                     
-                    // [FIX] Use AutoresizingMask (WidthSizable | HeightSizable = 18) to ensure it follows parent resizing
-                    // This is safer than manually touching the CALayer which caused a crash
+                    // [SIMPLIFIED FIX] Use AutoresizingMask to follow parent resizing automatically
+                    // 18 = NSViewWidthSizable | NSViewHeightSizable
                     let _: () = msg_send![container_ptr, setAutoresizingMask: 18u64]; 
 
                     let _: () = msg_send![container_ptr, layoutSubtreeIfNeeded];
@@ -346,7 +368,7 @@ fn resize_native_player(state: tauri::State<'_, MpvState>, app: tauri::AppHandle
     }
     #[cfg(not(target_os = "macos"))]
     {
-        let _ = (state, app);
+        let _ = (state, app, force_fullscreen);
     }
     Ok(())
 }

@@ -2923,10 +2923,11 @@ function setupPremiumOSC() {
         // [FIX] After fullscreen transition, manually resize the native MPV container
         if (state.isNativeActive) {
           setTimeout(() => {
-            invoke("resize_native_player", {}).catch(err => {
+            // [NEW] Pass force_fullscreen: true to ensure it grabs screen bounds correctly
+            invoke("resize_native_player", { force_fullscreen: true }).catch(err => {
               console.error("[PLAYER] Resize failed:", err);
             });
-          }, 500); // 500ms delay to ensure macOS finish the fullscreen animation & main thread is ready
+          }, 600); // Slightly increased delay for stability
         }
       } else {
         throw new Error("Tauri Invoke not available");
