@@ -82,33 +82,14 @@ async fn launch_mpv_player(
                         // Position BELOW everything (at the bottom) to allow WebView (on top) to capture drag events
                         let _: () = msg_send![content_view, addSubview: mpv_container positioned: -1isize relativeTo: std::ptr::null_mut::<std::ffi::c_void>()];
                         
-                        // Disable Autoresizing Mask Translation for Auto Layout
-                        let _: () = msg_send![mpv_container, setTranslatesAutoresizingMaskIntoConstraints: 0i8];
-                        
-                        // Apply Constraints to Pin to Edges
-                        let top_anchor: id = msg_send![mpv_container, topAnchor];
-                        let parent_top: id = msg_send![content_view, topAnchor];
-                        let constraint: id = msg_send![top_anchor, constraintEqualToAnchor: parent_top];
-                        let _: () = msg_send![constraint, setActive: 1i8];
-                        
-                        let bottom_anchor: id = msg_send![mpv_container, bottomAnchor];
-                        let parent_bottom: id = msg_send![content_view, bottomAnchor];
-                        let constraint: id = msg_send![bottom_anchor, constraintEqualToAnchor: parent_bottom];
-                        let _: () = msg_send![constraint, setActive: 1i8];
-                        
-                        let left_anchor: id = msg_send![mpv_container, leadingAnchor];
-                        let parent_left: id = msg_send![content_view, leadingAnchor];
-                        let constraint: id = msg_send![left_anchor, constraintEqualToAnchor: parent_left];
-                        let _: () = msg_send![constraint, setActive: 1i8];
-                        
-                        let right_anchor: id = msg_send![mpv_container, trailingAnchor];
-                        let parent_right: id = msg_send![content_view, trailingAnchor];
-                        let constraint: id = msg_send![right_anchor, constraintEqualToAnchor: parent_right];
-                        let _: () = msg_send![constraint, setActive: 1i8];
-
-                        // [ADD] Autoresizing Mask for redundant safety (especially for fullscreen transitions)
-                        // NSViewWidthSizable (2) | NSViewHeightSizable (16) = 18
+                        // [FIX] Use Old-School Autoresizing Mask (More reliable for fullscreen transitions)
+                        // This allows the OS to handle resizing automatically as the parent view grows
+                        let _: () = msg_send![mpv_container, setTranslatesAutoresizingMaskIntoConstraints: 1i8];
                         let _: () = msg_send![mpv_container, setAutoresizingMask: 18usize];
+                        
+                        // Set initial frame to match parent bounds
+                        let bounds: NSRect = msg_send![content_view, bounds];
+                        let _: () = msg_send![mpv_container, setFrame: bounds];
 
                         // Get the layer POINTER from the container (should be same as `layer`)
                         let backing_layer: id = msg_send![mpv_container, layer];
@@ -290,14 +271,13 @@ fn close_native_player(state: tauri::State<'_, MpvState>) -> Result<(), String> 
 }
 
 #[tauri::command(rename_all = "snake_case")]
-fn resize_native_player(state: tauri::State<'_, MpvState>, app: tauri::AppHandle, force_fullscreen: Option<bool>) -> Result<(), String> {
+fn resize_native_player(state: tauri::State<'_, MpvState>, app: tauri::AppHandle) -> Result<(), String> {
     #[cfg(target_os = "macos")]
     {
         use tauri::Manager;
-        use cocoa::appkit::{NSView, NSWindow, NSScreen}; // Added NSScreen
+        use cocoa::appkit::{NSView, NSWindow};
         use cocoa::foundation::NSRect;
 
-        // 1. Get container pointer safely without holding lock during async operation
         let container_ptr_opt = {
             let lock = state.0.lock().unwrap();
             lock.as_ref().map(|inst| inst.container_view)
@@ -306,7 +286,6 @@ fn resize_native_player(state: tauri::State<'_, MpvState>, app: tauri::AppHandle
         if let Some(container_view_addr) = container_ptr_opt {
             let app_handle = app.clone();
             
-            // 2. Perform UI resizing on Main Thread (Critical for macOS)
             app.run_on_main_thread(move || {
                 let window = match app_handle.get_webview_window("main") {
                     Some(w) => w,
@@ -315,60 +294,29 @@ fn resize_native_player(state: tauri::State<'_, MpvState>, app: tauri::AppHandle
                 
                 let ns_window_ptr = match window.ns_window() {
                     Ok(ptr) => ptr as id,
-                    Err(e) => {
-                        println!("[RESIZE-ERR] Failed to get ns_window: {}", e);
-                        return;
-                    }
+                    Err(_) => return,
                 };
 
                 unsafe {
                     let container_ptr = container_view_addr as id;
-                    let mut rect: NSRect;
+                    let content_view: id = msg_send![ns_window_ptr, contentView];
+                    let bounds: NSRect = msg_send![content_view, bounds];
 
-                    if force_fullscreen == Some(true) {
-                         // [FIX] Force match Screen Frame (for proper fullscreen toggle)
-                         let screen: id = msg_send![ns_window_ptr, screen];
-                         if !screen.is_null() {
-                             let frame: NSRect = msg_send![screen, frame];
-                             rect = frame;
-                             println!("[RESIZE] Forced Fullscreen to Screen Frame: {}x{}", rect.size.width, rect.size.height);
-                         } else {
-                             // Fallback
-                             let content_view = ns_window_ptr.contentView();
-                             rect = content_view.bounds();
-                         }
-                    } else {
-                        // Regular resize (window bounds)
-                        let content_view = ns_window_ptr.contentView();
-                        rect = content_view.bounds();
-                    }
-
-                    // Lower 'origin.y' is 0 in Cocoa view coordinates usually
-                    // But screen frame might have origin.
-                    // For a subview filling the window content view, we usually want bounds (0,0), not screen frame origin.
-                    // However, if we are in fullscreen, window content view matches screen frame size.
-                    // Let's use 0,0 for origin relative to parent, but size from screen.
-                    let origin = cocoa::foundation::NSPoint::new(0.0, 0.0);
-                    let size = rect.size;
-
-                    // Resize via msg_send (safe ABI)
-                    let _: () = msg_send![container_ptr, setFrameOrigin: origin];
-                    let _: () = msg_send![container_ptr, setFrameSize: size];
+                    // Force Match Parent Bounds
+                    let _: () = msg_send![container_ptr, setTranslatesAutoresizingMaskIntoConstraints: 1i8];
+                    let _: () = msg_send![container_ptr, setAutoresizingMask: 18u64];
+                    let _: () = msg_send![container_ptr, setFrame: bounds];
                     
-                    // [SIMPLIFIED FIX] Use AutoresizingMask to follow parent resizing automatically
-                    // 18 = NSViewWidthSizable | NSViewHeightSizable
-                    let _: () = msg_send![container_ptr, setAutoresizingMask: 18u64]; 
-
                     let _: () = msg_send![container_ptr, layoutSubtreeIfNeeded];
 
-                    println!("[RESIZE] Container resized on MAIN THREAD to {}x{}", size.width, size.height);
+                    println!("[RESIZE] Container forced to parent bounds: {}x{}", bounds.size.width, bounds.size.height);
                 }
             });
         }
     }
     #[cfg(not(target_os = "macos"))]
     {
-        let _ = (state, app, force_fullscreen);
+        let _ = (state, app);
     }
     Ok(())
 }
