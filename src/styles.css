@@ -46,10 +46,10 @@ body {
   top: 0;
   left: 0;
   width: 100%;
-  /* Increased top padding (42px) to clear macOS traffic lights perfectly */
-  padding: calc(var(--safe-area-inset-top) + 42px) 4% 15px;
+  /* Reduced top padding to move nav upward while still clearing traffic lights (~28px) */
+  padding: calc(var(--safe-area-inset-top) + 28px) 4% 12px;
   height: auto; 
-  min-height: 100px;
+  min-height: 75px;
   background: linear-gradient(to bottom, rgba(0,0,0,0.95) 0%, rgba(0,0,0,0.4) 80%, transparent 100%);
   backdrop-filter: blur(15px);
   -webkit-backdrop-filter: blur(15px);
@@ -58,10 +58,39 @@ body {
   display: flex;
   align-items: center;
   transition: all 0.4s ease;
-  pointer-events: auto;
+  pointer-events: auto !important; /* Ensure dragging events are captured */
   user-select: none;
   -webkit-user-select: none;
-  -webkit-app-region: drag; /* Restore native drag for the background */
+  /* Keep native drag region as primary */
+  -webkit-app-region: drag !important;
+}
+
+.glass-header::before {
+  content: "";
+  position: absolute;
+  top: 6px;
+  left: 50%;
+  transform: translateX(-50%);
+  width: 36px;
+  height: 4px;
+  background: rgba(255, 255, 255, 0.2);
+  border-radius: 2px;
+  pointer-events: none;
+  z-index: 5002;
+}
+
+.glass-header::before {
+  content: "";
+  position: absolute;
+  top: 8px;
+  left: 50%;
+  transform: translateX(-50%);
+  width: 40px;
+  height: 4px;
+  background: rgba(255, 255, 255, 0.15);
+  border-radius: 2px;
+  pointer-events: none;
+  z-index: 5002;
 }
 
 .glass-header.scrolled {
@@ -129,6 +158,89 @@ body {
   font-weight: 700;
 }
 
+/* Global Loading Bar */
+.loader-line {
+  position: absolute;
+  top: 0;
+  left: 0;
+  width: 0;
+  height: 3px;
+  background: var(--primary-accent);
+  z-index: 10000;
+  transition: width 0.4s cubic-bezier(0.1, 0.7, 0.1, 1), opacity 0.3s ease;
+  opacity: 0;
+  box-shadow: 0 0 10px var(--primary-accent);
+}
+
+.loader-line.active {
+  opacity: 1;
+}
+
+/* [NEW] Category Sub-Menu Overlay */
+.category-menu-overlay {
+  position: fixed;
+  top: 0;
+  left: 0;
+  width: 100%;
+  height: 100vh;
+  background: rgba(0, 0, 0, 0.4);
+  backdrop-filter: blur(5px);
+  -webkit-backdrop-filter: blur(5px);
+  z-index: 6000;
+  display: flex;
+  justify-content: center;
+  align-items: center;
+  opacity: 0;
+  visibility: hidden;
+  transition: all 0.3s ease;
+}
+
+.category-menu-overlay.active {
+  opacity: 1;
+  visibility: visible;
+}
+
+.category-menu-content {
+  background: #181818;
+  border: 1px solid rgba(255, 255, 255, 0.1);
+  border-radius: 8px;
+  width: 90%;
+  max-width: 300px;
+  padding: 10px 0;
+  box-shadow: 0 10px 30px rgba(0,0,0,0.5);
+  transform: translateY(20px);
+  transition: transform 0.3s ease;
+}
+
+.category-menu-overlay.active .category-menu-content {
+  transform: translateY(0);
+}
+
+.category-option {
+  padding: 12px 20px;
+  color: var(--text-secondary);
+  font-size: 0.95rem;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.05);
+  cursor: pointer;
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+}
+
+.category-option:last-child {
+  border-bottom: none;
+}
+
+.category-option:hover, .category-option:active {
+  background: rgba(255, 255, 255, 0.08);
+  color: #fff;
+}
+
+.category-option.active {
+  color: var(--primary-accent);
+  font-weight: 700;
+}
+
 .header-actions {
   display: flex;
   align-items: center;
@@ -149,65 +261,14 @@ body {
   width: 100%;
   aspect-ratio: 16 / 9;
   max-height: 85vh;
-  /* Pulled up to go behind the transparent header */
-  margin-top: calc(-100px - var(--safe-area-inset-top));
+  /* Removed negative margin to prevent excessive overlap with the compact header */
+  margin-top: 0; 
+  padding-top: var(--safe-area-inset-top);
   overflow: hidden;
 }
 
-.hero-carousel {
-  width: 100%;
-  height: 100%;
-}
+/* Obsolete horizontal carousel styles removed */
 
-.hero-slide {
-  position: absolute;
-  inset: 0;
-  background-size: cover;
-  background-position: center 20%;
-  display: flex;
-  align-items: flex-end;
-  padding: 4% 4% 8%;
-  opacity: 0;
-  transition: opacity 0.8s ease;
-}
-
-.hero-slide.active {
-  opacity: 1;
-}
-
-.hero-slide::after {
-  content: '';
-  position: absolute;
-  inset: 0;
-  background: linear-gradient(to top, var(--bg-color) 0%, transparent 40%),
-              linear-gradient(to right, rgba(0,0,0,0.6) 0%, transparent 50%);
-  pointer-events: none;
-}
-
-.hero-content {
-  position: relative;
-  z-index: 2;
-  max-width: 500px;
-  display: flex;
-  flex-direction: column;
-  gap: 15px;
-}
-
-.hero-title-img {
-  width: 100%;
-  max-width: 400px;
-  margin-bottom: 10px;
-}
-
-.hero-summary {
-  font-size: 0.95rem;
-  text-shadow: 2px 2px 4px rgba(0,0,0,0.5);
-  display: -webkit-box;
-  -webkit-line-clamp: 3;
-  line-clamp: 3;
-  -webkit-box-orient: vertical;
-  overflow: hidden;
-}
 
 .hero-btns {
   display: flex;
@@ -398,12 +459,31 @@ body {
   border-radius: var(--border-radius-md);
   overflow: hidden;
   position: relative;
-  transition: var(--transition);
+  transition: var(--transition), opacity 0.4s ease;
   border: 1px solid rgba(255, 255, 255, 0.05);
   display: flex;
   flex-direction: column;
   backdrop-filter: blur(10px);
   -webkit-backdrop-filter: blur(10px);
+  opacity: 1;
+}
+
+/* [BATCH REVEAL] Cards start hidden and reveal together */
+.card.batch-hidden {
+  opacity: 0;
+}
+
+.card:not(.batch-hidden) {
+  animation: batchReveal 0.3s ease-out forwards;
+}
+
+@keyframes batchReveal {
+  from {
+    opacity: 0;
+  }
+  to {
+    opacity: 1;
+  }
 }
 
 #main-player {
@@ -468,6 +548,34 @@ body {
   overflow: hidden;
   text-overflow: ellipsis;
 }
+
+/* Card Tags for distinction */
+.card-tags {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+  margin-bottom: 6px;
+  min-height: 1.2rem;
+}
+
+.card-tag {
+  font-size: 0.6rem;
+  font-weight: 800;
+  padding: 1px 6px;
+  border-radius: 3px;
+  background: rgba(255, 255, 255, 0.08);
+  color: rgba(255, 255, 255, 0.6);
+  text-transform: uppercase;
+  border: 1px solid rgba(255, 255, 255, 0.05);
+  letter-spacing: 0.02em;
+}
+
+.card-tag.accent {
+  background: rgba(229, 9, 20, 0.15);
+  color: var(--primary-accent);
+  border-color: rgba(229, 9, 20, 0.2);
+}
+
 
 /* Glass Placeholder for no-poster */
 .no-poster-placeholder {
@@ -1287,7 +1395,8 @@ body.native-player-active #player-overlay {
 /* Orientation Fixes */
 @media (orientation: landscape) {
   #player-overlay {
-    background: #000;
+    /* [FIX] Keep transparent in landscape if native player is active to prevent black screen overlay */
+    background: transparent !important;
   }
 }
 
@@ -1297,6 +1406,29 @@ body.native-player-active #player-overlay {
   width: 100vw;
   height: 100vh;
   max-height: none;
+  background: transparent !important; /* [FIX] Ensure backdrop/element doesn't go black */
+}
+
+/* [FIX] Hardware-accelerated native view bypass for Mac */
+html:fullscreen, 
+body:fullscreen,
+html:-webkit-full-screen,
+body:-webkit-full-screen {
+  background-color: transparent !important;
+  background: transparent !important;
+}
+
+/* [NEW] Handle the black backdrop in native fullscreen mode */
+:fullscreen::backdrop {
+  background: transparent !important;
+}
+:-webkit-full-screen::backdrop {
+  background: transparent !important;
+}
+
+body.native-player-active :fullscreen,
+body.native-player-active :-webkit-full-screen {
+    background-color: transparent !important;
 }
 
 .audio-mode #main-player {
@@ -1683,7 +1815,13 @@ input:focus {
 }
 
 .osc-ctrl-btn:hover {
-  background: rgba(255, 255, 255, 0.15); /* Slightly more visible gray square */
+  background: rgba(229, 9, 20, 0.2); /* Netflix red tint background */
+  color: #E50914; /* Netflix red */
+}
+
+.osc-ctrl-btn:hover svg {
+  stroke: #E50914;
+  fill: #E50914;
 }
 
 .osc-ctrl-btn.small {
@@ -1893,41 +2031,184 @@ input:focus {
   width: 100%;
   height: 100%;
   opacity: 0;
-  transition: opacity 0.8s ease-in-out;
+  visibility: hidden;
+  transition: opacity 2.5s cubic-bezier(0.4, 0, 0.2, 1);
   background: #000;
+  overflow: hidden;
+  z-index: 1;
 }
 
 .hero-slide.active {
   opacity: 1;
-  z-index: 1;
+  visibility: visible;
+  z-index: 10;
 }
 
+/* Cinematic Ken Burns Effect */
 .hero-img {
   width: 100%;
   height: 100%;
   object-fit: cover;
   object-position: center top;
-  opacity: 0.8;
+  transform: scale(1);
+  transition: transform 12s cubic-bezier(0.25, 0.46, 0.45, 0.94);
+}
+
+.hero-slide.active .hero-img {
+  transform: scale(1.15) translateX(2%); /* Subtle zoom and pan */
 }
 
 .hero-overlay {
   position: absolute;
   inset: 0;
-  background: linear-gradient(to bottom,
-      rgba(0, 0, 0, 0.1) 0%,
-      rgba(0, 0, 0, 0.3) 50%,
-      rgba(10, 10, 10, 1) 98%);
+  background: linear-gradient(to top, 
+    #141414 0%, 
+    rgba(20, 20, 20, 0.8) 15%, 
+    rgba(20, 20, 20, 0.3) 40%, 
+    transparent 80%);
   z-index: 2;
 }
 
 .hero-content {
   position: absolute;
-  bottom: 40px;
-  left: 20px;
-  right: 20px;
-  z-index: 3;
-  max-width: 600px;
-  text-shadow: 0 2px 4px rgba(0, 0, 0, 0.8);
+  bottom: 12%;
+  left: 5%;
+  right: 5%;
+  z-index: 10;
+  max-width: 800px;
+  pointer-events: none;
+}
+
+/* Staggered Entrance Animations */
+.hero-tag, .hero-title, .hero-meta, .hero-btns {
+  opacity: 0;
+  transform: translateY(40px);
+  filter: blur(10px);
+  transition: all 1.2s cubic-bezier(0.23, 1, 0.32, 1);
+}
+
+.hero-slide.active .hero-tag {
+  opacity: 1;
+  transform: translateY(0);
+  filter: blur(0);
+  transition-delay: 0.6s;
+}
+
+.hero-slide.active .hero-title {
+  opacity: 1;
+  transform: translateY(0);
+  filter: blur(0);
+  transition-delay: 0.8s;
+}
+
+.hero-slide.active .hero-meta {
+  opacity: 0.8;
+  transform: translateY(0);
+  filter: blur(0);
+  transition-delay: 1s;
+}
+
+.hero-slide.active .hero-btns {
+  opacity: 1;
+  transform: translateY(0);
+  filter: blur(0);
+  transition-delay: 1.2s;
+}
+
+.hero-tag {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  color: var(--primary-accent);
+  font-weight: 800;
+  font-size: 0.85rem;
+  text-transform: uppercase;
+  letter-spacing: 3px;
+  margin-bottom: 12px;
+}
+
+.hero-title {
+  font-size: clamp(2.5rem, 10vw, 4.5rem);
+  font-weight: 900;
+  line-height: 1.05;
+  margin-bottom: 20px;
+  letter-spacing: -3px;
+  color: white;
+  text-shadow: 0 10px 30px rgba(0,0,0,0.5);
+}
+
+.hero-meta {
+  display: flex;
+  align-items: center;
+  gap: 20px;
+  font-size: 1.1rem;
+  font-weight: 500;
+  margin-bottom: 30px;
+  color: #ccc;
+}
+
+.hero-btns {
+  display: flex;
+  gap: 15px;
+  pointer-events: auto;
+}
+
+.btn-play-hero {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 18px 42px;
+  background: #ffffff;
+  color: #000000;
+  border: none;
+  border-radius: 6px;
+  font-weight: 700;
+  font-size: 1.25rem;
+  cursor: pointer;
+  transition: all 0.3s cubic-bezier(0.165, 0.84, 0.44, 1);
+  box-shadow: 0 10px 25px rgba(0,0,0,0.3);
+}
+
+.btn-play-hero:hover {
+  transform: scale(1.08) translateY(-5px);
+  background: #ffffff;
+  box-shadow: 0 20px 40px rgba(0,0,0,0.4), 0 0 20px rgba(255,255,255,0.2);
+}
+
+.btn-play-hero:active {
+  transform: scale(0.95);
+}
+
+.btn-play-hero i {
+  width: 24px;
+  height: 24px;
+  fill: #000;
+}
+
+.btn-play-hero:hover {
+  background: var(--primary-accent);
+  color: #fff;
+  transform: scale(1.06) translateY(-3px);
+  box-shadow: 0 10px 30px rgba(229, 9, 20, 0.4);
+}
+
+.btn-play-hero:active {
+  transform: scale(0.96);
+}
+
+.btn-play-hero i {
+  width: 22px;
+  height: 22px;
+  fill: currentColor;
+}
+
+.btn-play-hero:hover {
+  background: rgba(255, 255, 255, 0.8);
+  transform: scale(1.05);
+}
+
+.btn-play-hero:active {
+  transform: scale(0.95);
 }
 
 .hero-tag {

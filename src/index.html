@@ -18,14 +18,17 @@
     
     window.__TAURI_CDN_INVOKE__ = invoke;
     window.__TAURI_CDN_LISTEN__ = listen;
+    window.__TAURI_WINDOW__ = getCurrentWindow();
     
-    console.log("[CDN] Tauri API v2.2.0 loaded - Native Drag Regions Active");
+    console.log("[CDN] Tauri API v2.2.0 loaded - Native Drag Regions & Manual Fallback Active");
   </script>
-  <script src="main.js"></script>
+  <script src="main.js" type="module"></script>
 </head>
 
 
 <header class="glass-header" data-tauri-drag-region>
+  <!-- Global loading bar -->
+  <div id="global-loader" class="loader-line"></div>
   <div class="header-content" data-tauri-drag-region>
     <div class="header-nav-left" data-tauri-drag-region>
       <div class="app-logo">FLASH PLEX</div>

@@ -106,8 +106,15 @@ async fn launch_mpv_player(
                         let constraint: id = msg_send![right_anchor, constraintEqualToAnchor: parent_right];
                         let _: () = msg_send![constraint, setActive: 1i8];
 
+                        // [ADD] Autoresizing Mask for redundant safety (especially for fullscreen transitions)
+                        // NSViewWidthSizable (2) | NSViewHeightSizable (16) = 18
+                        let _: () = msg_send![mpv_container, setAutoresizingMask: 18usize];
+
                         // Get the layer POINTER from the container (should be same as `layer`)
                         let backing_layer: id = msg_send![mpv_container, layer];
+                        
+                        // [ADD] Ensure layer also resizes if host resizes
+                        let _: () = msg_send![layer, setAutoresizingMask: 18usize];
                         
                         // Visual properties (moved from original layer setup)
                         let ns_black: id = msg_send![class!(NSColor), blackColor];
@@ -282,12 +289,74 @@ fn close_native_player(state: tauri::State<'_, MpvState>) -> Result<(), String> 
     Ok(())
 }
 
+#[tauri::command(rename_all = "snake_case")]
+fn resize_native_player(state: tauri::State<'_, MpvState>, app: tauri::AppHandle) -> Result<(), String> {
+    #[cfg(target_os = "macos")]
+    {
+        use tauri::Manager;
+        use cocoa::appkit::{NSView, NSWindow};
+
+        // 1. Get container pointer safely without holding lock during async operation
+        let container_ptr_opt = {
+            let lock = state.0.lock().unwrap();
+            lock.as_ref().map(|inst| inst.container_view)
+        };
+
+        if let Some(container_view_addr) = container_ptr_opt {
+            let app_handle = app.clone();
+            
+            // 2. Perform UI resizing on Main Thread (Critical for macOS)
+            app.run_on_main_thread(move || {
+                let window = match app_handle.get_webview_window("main") {
+                    Some(w) => w,
+                    None => return,
+                };
+                
+                let ns_window_ptr = match window.ns_window() {
+                    Ok(ptr) => ptr as id,
+                    Err(e) => {
+                        println!("[RESIZE-ERR] Failed to get ns_window: {}", e);
+                        return;
+                    }
+                };
+
+                unsafe {
+                    let container_ptr = container_view_addr as id;
+
+                    // Get fresh bounds from main thread
+                    let content_view = ns_window_ptr.contentView();
+                    let bounds = content_view.bounds();
+                    let origin = bounds.origin;
+                    let size = bounds.size;
+
+                    // Resize via msg_send (safe ABI)
+                    let _: () = msg_send![container_ptr, setFrameOrigin: origin];
+                    let _: () = msg_send![container_ptr, setFrameSize: size];
+                    
+                    // [FIX] Use AutoresizingMask (WidthSizable | HeightSizable = 18) to ensure it follows parent resizing
+                    // This is safer than manually touching the CALayer which caused a crash
+                    let _: () = msg_send![container_ptr, setAutoresizingMask: 18u64]; 
+
+                    let _: () = msg_send![container_ptr, layoutSubtreeIfNeeded];
+
+                    println!("[RESIZE] Container resized on MAIN THREAD to {}x{}", size.width, size.height);
+                }
+            });
+        }
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = (state, app);
+    }
+    Ok(())
+}
+
 #[tauri::command]
 async fn search_gds(query: String, server_url: String, api_key: String, category: String) -> Result<serde_json::Value, String> {
     println!("[SEARCH] Query: {}, Category: {}", query, category);
     
     // Using a simpler URL construction to avoid urlencoding crate dependency issues for now
-    let base_url = format!("{}/gds_dviewer/normal/explorer/search", server_url.trim_end_matches('/'));
+    let base_url = format!("{}/gds_dviewer/normal/search", server_url.trim_end_matches('/'));
     
     let client = reqwest::Client::new();
     let response = client
@@ -446,16 +515,29 @@ fn native_log(msg: String) {
     println!("[JS-LOG] {}", msg);
 }
 
+#[tauri::command(rename_all = "snake_case")]
+fn native_toggle_fullscreen(app: tauri::AppHandle) -> Result<(), String> {
+    use tauri::Manager;
+    let window = app.get_webview_window("main").ok_or("Window not found")?;
+    let is_fs = window.is_fullscreen().map_err(|e| e.to_string())?;
+    window.set_fullscreen(!is_fs).map_err(|e| e.to_string())?;
+    Ok(())
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    println!("\n\n!!! GDS MOBILE PLAYER - NEW BUILD LOADED !!!\n\n");
     tauri::Builder::default()
         .manage(MpvState(Arc::new(Mutex::new(None))))
         .plugin(tauri_plugin_http::init())
         .plugin(tauri_plugin_opener::init())
+        .plugin(tauri_plugin_drag::init())
         .plugin(tauri_plugin_libmpv::init())
         .invoke_handler(tauri::generate_handler![
             launch_mpv_player,
             close_native_player,
+            resize_native_player,
+            native_toggle_fullscreen,
             native_play_pause,
             native_seek,
             native_set_volume,
