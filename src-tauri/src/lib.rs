@@ -10,6 +10,7 @@ use tauri_plugin_http::reqwest;
 struct MpvInstance {
     mpv: Mpv,
     container_view: usize, // Store container to remove on close
+    using_layer_wid: bool, // true: CAMetalLayer wid, false: NSView wid
 }
 
 unsafe impl Send for MpvInstance {}
@@ -26,13 +27,55 @@ fn log_to_file(msg: &str) {
     }
 }
 
+fn apply_quality_profile(mpv: &Mpv, profile: &str) -> String {
+    let normalized = match profile {
+        "quality" => "quality",
+        "smooth" => "smooth",
+        _ => "balanced",
+    };
+
+    // Common baseline options.
+    let _ = mpv.set_property("deband", "yes");
+    let _ = mpv.set_property("dscale", "mitchell");
+    let _ = mpv.set_property("scale", "ewa_lanczossharp");
+    let _ = mpv.set_property("cscale", "spline36");
+    let _ = mpv.set_property("sigmoid-upscaling", "yes");
+
+    match normalized {
+        "quality" => {
+            let _ = mpv.set_property("deband-iterations", 3);
+            let _ = mpv.set_property("interpolation", "yes");
+            let _ = mpv.set_property("video-sync", "display-resample");
+            let _ = mpv.set_property("tscale", "oversample");
+        }
+        "smooth" => {
+            let _ = mpv.set_property("scale", "bilinear");
+            let _ = mpv.set_property("cscale", "bilinear");
+            let _ = mpv.set_property("deband", "no");
+            let _ = mpv.set_property("interpolation", "yes");
+            let _ = mpv.set_property("video-sync", "display-resample");
+            let _ = mpv.set_property("tscale", "oversample");
+        }
+        _ => {
+            let _ = mpv.set_property("deband-iterations", 2);
+            let _ = mpv.set_property("interpolation", "no");
+            let _ = mpv.set_property("video-sync", "audio");
+        }
+    }
+
+    println!("[QUALITY] Applied profile: {}", normalized);
+    normalized.to_string()
+}
+
 #[tauri::command]
 async fn launch_mpv_player(
     state: tauri::State<'_, MpvState>,
     app: tauri::AppHandle,
     title: String,
     url: String,
-    subtitle_url: Option<String>
+    subtitle_url: Option<String>,
+    start_pos: Option<f64>,
+    start_paused: Option<bool>,
 ) -> Result<(), String> {
     log_to_file(&format!("[INVOKE] launch_mpv_player: title={}, url={}", title, url));
     println!("[INVOKE] launch_mpv_player: title={}, url={}", title, url);
@@ -41,12 +84,12 @@ async fn launch_mpv_player(
         let mut lock = state.0.lock().map_err(|e| e.to_string())?;
         if lock.is_none() {
             log_to_file("[INVOKE] Lock acquired, initializing MPV...");
-            let (tx_wid, rx_wid) = std::sync::mpsc::channel::<Result<(usize, usize), String>>();
+            let (tx_wid, rx_wid) = std::sync::mpsc::channel::<Result<(usize, usize, usize), String>>();
             let app_handle_for_wid = app.clone();
             
             // 1. Get WID/NSView on main thread
             app.run_on_main_thread(move || {
-                let res: Result<(usize, usize), String> = (|| {
+                let res: Result<(usize, usize, usize), String> = (|| {
                     use tauri::Manager;
                     let window = app_handle_for_wid.get_webview_window("main").ok_or_else(|| "Main window not found".to_string())?;
                     let ns_window = window.ns_window().map_err(|e| e.to_string())? as id;
@@ -61,20 +104,21 @@ async fn launch_mpv_player(
                     // Main content view
                     let content_view: id = unsafe { msg_send![ns_window, contentView] };
                     
-                    // Create CAMetalLayer (Plezy Strategy)
-                    let (metal_layer_ptr, mpv_container_ptr): (usize, usize) = unsafe {
+                    // Create embedding NSView for mpv.
+                    // Keep CAMetalLayer* as the primary WID candidate.
+                    let (layer_wid_ptr, mpv_container_ptr): (usize, usize) = unsafe {
                         // Ensure parent has a layer backing
                         let _: () = msg_send![content_view, setWantsLayer: 1i8];
                         let _: () = msg_send![content_view, layer]; // Ensure root layer exists
-                        
-                        // Create Metal Layer
+
+                        // Create explicit CAMetalLayer
                         let layer: id = msg_send![class!(CAMetalLayer), layer];
-                        
+
                         // Create a container view for MPV
                         let mpv_container: id = msg_send![class!(NSView), alloc];
                         let mpv_container: id = msg_send![mpv_container, init];
                         
-                        // Enable Layer-Hosting View
+                        // Host the explicit CAMetalLayer
                         let _: () = msg_send![mpv_container, setWantsLayer: 1i8];
                         let _: () = msg_send![mpv_container, setLayer: layer];
                         
@@ -90,11 +134,7 @@ async fn launch_mpv_player(
                         // Set initial frame to match parent bounds
                         let bounds: NSRect = msg_send![content_view, bounds];
                         let _: () = msg_send![mpv_container, setFrame: bounds];
-
-                        // Get the layer POINTER from the container (should be same as `layer`)
-                        let backing_layer: id = msg_send![mpv_container, layer];
-                        
-                        // [ADD] Ensure layer also resizes if host resizes
+                        let _: () = msg_send![layer, setFrame: bounds];
                         let _: () = msg_send![layer, setAutoresizingMask: 18usize];
                         
                         // Visual properties (moved from original layer setup)
@@ -102,21 +142,21 @@ async fn launch_mpv_player(
                         let black_cg: id = msg_send![ns_black, CGColor];
                         let _: () = msg_send![layer, setBackgroundColor: black_cg];
 
-                        println!("[DEBUG] CAMetalLayer created and attached via NSView container. Returning LAYER Pointer: {:p}", backing_layer);
+                        println!("[DEBUG] MPV container created. LAYER ptr: {:p}", layer);
                         
-                        (backing_layer as usize, mpv_container as usize) // Return both
+                        (layer as usize, mpv_container as usize)
                     };
                     
-                    Ok((metal_layer_ptr, mpv_container_ptr))
+                    // Return both candidates:
+                    //   1) CAMetalLayer* for Layer WID path
+                    //   2) NSView*      for NSView WID path
+                    Ok((layer_wid_ptr, mpv_container_ptr, mpv_container_ptr))
                 })();
             let _ = tx_wid.send(res);
         }).map_err(|e| e.to_string())?;
 
-        println!("[INVOKE] Waiting for WID (Layer Pointer)...");
-        let (mpv_wid_raw, container_view_ptr) = rx_wid.recv().map_err(|_| "Failed to receive WID")??;
-        
-        let mpv_wid_str = mpv_wid_raw.to_string();
-        println!("[INVOKE] Initializing MPV with Layer WID: {}", mpv_wid_str);
+        println!("[INVOKE] Waiting for WID pointers...");
+        let (layer_wid_raw, nsview_wid_raw, container_view_ptr) = rx_wid.recv().map_err(|_| "Failed to receive WID")??;
 
         // --- Dynamic MoltenVK ICD Detection ---
         let m1_lib = "/opt/homebrew/lib/libMoltenVK.dylib";
@@ -153,47 +193,137 @@ async fn launch_mpv_player(
         println!("[INVOKE] Using Dynamic ICD: {} -> {}", icd_temp_path, actual_lib);
         // --------------------------------------
         
-        let mpv = Mpv::with_initializer(|init| {
-            // 0. Disable Config
-            let _ = init.set_option("config", "no");
-            let _ = init.set_option("load-scripts", "no");
+        let try_init_mpv = |wid_raw: usize, wid_kind: &str, profile: &str| -> Result<Mpv, String> {
+            let wid_i64 = wid_raw as i64;
+            println!("[INVOKE] Initializing MPV with {} WID ({}): {}", wid_kind, profile, wid_i64);
 
-            // 1. Set WID (Layer Pointer)
-            if let Err(e) = init.set_option("wid", mpv_wid_str.as_str()) { 
-                println!("[ERROR] Init wid: {}", e); 
-                return Err(e); 
+            Mpv::with_initializer(|init| {
+                // 0. Disable Config
+                let _ = init.set_option("config", "no");
+                let _ = init.set_option("load-scripts", "no");
+
+                // 1. Set WID
+                if let Err(e) = init.set_option("wid", wid_i64) {
+                    println!("[ERROR] Init wid ({}) failed: {}", wid_kind, e);
+                    return Err(e);
+                }
+                
+                // 2. Set VO and Context profile
+                match profile {
+                    "nsview-metal" => {
+                        if let Err(e) = init.set_option("vo", "gpu-next") { println!("[ERROR] Init vo: {}", e); }
+                        let metal_api_res = init.set_option("gpu-api", "metal");
+                        let metal_ctx_res = init.set_option("gpu-context", "cocoa");
+                        let metal_ok = metal_api_res.is_ok() && metal_ctx_res.is_ok();
+                        if metal_ok {
+                            println!("[INVOKE] MPV GPU profile: gpu-next + metal/cocoa");
+                        } else {
+                            println!("[ERROR] gpu-next + metal/cocoa init path failed");
+                            if let Err(e) = metal_api_res {
+                                return Err(e);
+                            }
+                            if let Err(e) = metal_ctx_res {
+                                return Err(e);
+                            }
+                        }
+                    }
+                    "nsview-gpu" => {
+                        if let Err(e) = init.set_option("vo", "gpu") { println!("[ERROR] Init vo: {}", e); }
+                        let _ = init.set_option("gpu-context", "cocoa");
+                        println!("[INVOKE] MPV GPU profile: gpu + cocoa (legacy fallback)");
+                    }
+                    "nsview-opengl" => {
+                        if let Err(e) = init.set_option("vo", "gpu") { println!("[ERROR] Init vo: {}", e); }
+                        // Force OpenGL path to avoid MoltenVK/Metal surface selector issues on NSView.
+                        let _ = init.set_option("gpu-api", "opengl");
+                        let _ = init.set_option("gpu-context", "cocoa");
+                        println!("[INVOKE] MPV GPU profile: gpu + opengl/cocoa (experimental)");
+                    }
+                    _ => {
+                        let layer_legacy_vo = std::env::var("MPV_LAYER_VO_LEGACY")
+                            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+                            .unwrap_or(false);
+                        if layer_legacy_vo {
+                            let _ = init.set_option("vo", "gpu");
+                            let _ = init.set_option("gpu-api", "vulkan");
+                            let _ = init.set_option("gpu-context", "moltenvk");
+                            println!("[INVOKE] MPV GPU profile: gpu + vulkan/moltenvk (layer-legacy)");
+                        } else {
+                            if let Err(e) = init.set_option("vo", "gpu-next") { println!("[ERROR] Init vo: {}", e); }
+                            let metal_ok = init.set_option("gpu-api", "metal").is_ok()
+                                && init.set_option("gpu-context", "cocoa").is_ok();
+                            if metal_ok {
+                                println!("[INVOKE] MPV GPU profile: gpu-next + metal/cocoa");
+                            } else {
+                                println!("[WARN] gpu-api=metal failed, fallback to vulkan/moltenvk");
+                                let _ = init.set_option("gpu-api", "vulkan");
+                                let _ = init.set_option("gpu-context", "moltenvk");
+                                println!("[INVOKE] MPV GPU profile: gpu-next + vulkan/moltenvk");
+                            }
+                        }
+                    }
+                }
+                if let Err(e) = init.set_option("hwdec", "videotoolbox") { println!("[ERROR] Init hwdec: {}", e); }
+                
+                // 3. Behavioral Options
+                let _ = init.set_option("keepaspect-window", "no");
+                let _ = init.set_option("input-default-bindings", "no");
+                let _ = init.set_option("input-vo-keyboard", "no");
+                let _ = init.set_option("osc", "no");
+                let _ = init.set_option("terminal", "yes");
+
+                Ok(())
+            })
+            .map_err(|e| {
+                println!("[ERROR] MPV init failed with {} WID: {}", wid_kind, e);
+                e.to_string()
+            })
+        };
+
+        // Default to Layer WID for stability.
+        // NSView WID can be tested explicitly by setting:
+        //   MPV_WID_EXPERIMENT=nsview
+        // because this path can crash in MoltenVK with selector mismatch.
+        let wid_experiment = std::env::var("MPV_WID_EXPERIMENT").unwrap_or_default();
+        let (mpv, using_layer_wid) = if wid_experiment == "nsview" {
+            if let Ok(m) = try_init_mpv(nsview_wid_raw, "NSView", "nsview-metal") {
+                println!("[INVOKE] Selected WID path: NSView + metal/cocoa (experimental)");
+                (m, false)
+            } else if let Ok(m) = try_init_mpv(nsview_wid_raw, "NSView", "nsview-opengl") {
+                println!("[INVOKE] Selected WID path: NSView + opengl/cocoa (experimental)");
+                (m, false)
+            } else if let Ok(m) = try_init_mpv(nsview_wid_raw, "NSView", "nsview-gpu") {
+                println!("[INVOKE] Selected WID path: NSView + gpu/cocoa (experimental)");
+                (m, false)
+            } else {
+                let m = try_init_mpv(layer_wid_raw, "Layer", "layer-fallback")?;
+                println!("[INVOKE] NSView experimental path failed -> fallback Layer");
+                (m, true)
             }
-            
-            // 2. Set VO and Context (Plezy Config)
-            if let Err(e) = init.set_option("vo", "gpu-next") { println!("[ERROR] Init vo: {}", e); }
-            if let Err(e) = init.set_option("gpu-api", "vulkan") { println!("[ERROR] Init gpu-api: {}", e); }
-            if let Err(e) = init.set_option("gpu-context", "moltenvk") { println!("[ERROR] Init gpu-context: {}", e); } // Plezy uses 'moltenvk'
-            // Enable HWDEC (Plezy uses videotoolbox)
-            if let Err(e) = init.set_option("hwdec", "videotoolbox") { println!("[ERROR] Init hwdec: {}", e); } 
-            
-            // 3. Behavioral Options
-            let _ = init.set_option("keepaspect-window", "no");
-            let _ = init.set_option("input-default-bindings", "no");
-            let _ = init.set_option("input-vo-keyboard", "no");
-            let _ = init.set_option("osc", "no");
-            let _ = init.set_option("terminal", "yes");
-            // let _ = init.set_option("msg-level", "all=debug"); // Verbose logging
-
-            Ok(())
-        }).map_err(|e| {
-            println!("[ERROR] MPV init failed: {}", e);
-            e.to_string()
-        })?;
+        } else {
+            let m = try_init_mpv(layer_wid_raw, "Layer", "layer-fallback")?;
+            println!("[INVOKE] Selected WID path: Layer (default)");
+            (m, true)
+        };
 
         println!("[INVOKE] MPV initialized (MacVK/Metal).");
-        *lock = Some(MpvInstance { mpv, container_view: container_view_ptr });
+        *lock = Some(MpvInstance { mpv, container_view: container_view_ptr, using_layer_wid });
 
         } // End Init Block
 
         if let Some(ref mut instance) = *lock {
             // 1. Load File First (Reset playlist)
-            let args: &[&str] = &[url.as_str(), "replace"];
-            let _ = Mpv::command(&instance.mpv, "loadfile", args);
+            let mut load_args_owned: Vec<String> = vec![url.clone(), "replace".to_string()];
+            if let Some(pos) = start_pos {
+                if pos > 0.2 {
+                    load_args_owned.push(format!("start={:.3}", pos));
+                }
+            }
+            if start_paused.unwrap_or(false) {
+                load_args_owned.push("pause=yes".to_string());
+            }
+            let load_args: Vec<&str> = load_args_owned.iter().map(|s| s.as_str()).collect();
+            let _ = Mpv::command(&instance.mpv, "loadfile", &load_args);
             // println!("[EMBEDDED] Playing: {} -> {}", title, url);
 
             // 2. Add Subtitle After loading
@@ -277,15 +407,18 @@ fn resize_native_player(state: tauri::State<'_, MpvState>, app: tauri::AppHandle
         use tauri::Manager;
         // Global NSRect and id are now used
 
-        let container_ptr_opt = {
-            let lock = state.0.lock().unwrap();
-            lock.as_ref().map(|inst| inst.container_view)
+        let (container_ptr_opt, using_layer_wid) = {
+            let lock = state.0.lock().map_err(|e| e.to_string())?;
+            (
+                lock.as_ref().map(|inst| inst.container_view),
+                lock.as_ref().map(|inst| inst.using_layer_wid).unwrap_or(false),
+            )
         };
 
         if let Some(container_view_addr) = container_ptr_opt {
             let app_handle = app.clone();
             
-            app.run_on_main_thread(move || {
+            let _ = app.run_on_main_thread(move || {
                 let window = match app_handle.get_webview_window("main") {
                     Some(w) => w,
                     None => return,
@@ -300,17 +433,69 @@ fn resize_native_player(state: tauri::State<'_, MpvState>, app: tauri::AppHandle
                     let container_ptr = container_view_addr as id;
                     let content_view: id = msg_send![ns_window_ptr, contentView];
                     let bounds: NSRect = msg_send![content_view, bounds];
+                    let scale: f64 = msg_send![ns_window_ptr, backingScaleFactor];
 
                     // Force Match Parent Bounds
                     let _: () = msg_send![container_ptr, setTranslatesAutoresizingMaskIntoConstraints: 1i8];
-                    let _: () = msg_send![container_ptr, setAutoresizingMask: 18u64];
+                    let _: () = msg_send![container_ptr, setAutoresizingMask: 18usize];
                     let _: () = msg_send![container_ptr, setFrame: bounds];
+
+                    if using_layer_wid {
+                        // Keep CAMetalLayer bounds aligned with container bounds
+                        // when mpv renders against layer pointer (`wid`).
+                        let layer: id = msg_send![container_ptr, layer];
+                        if !layer.is_null() {
+                            let _: () = msg_send![layer, setFrame: bounds];
+                            let _: () = msg_send![layer, setContentsScale: scale];
+                            let supports_drawable_size: bool = msg_send![layer, respondsToSelector: sel!(setDrawableSize:)];
+                            if supports_drawable_size {
+                                let drawable_size = cocoa::foundation::NSSize::new(
+                                    bounds.size.width * scale,
+                                    bounds.size.height * scale,
+                                );
+                                let _: () = msg_send![layer, setDrawableSize: drawable_size];
+                            }
+                            let _: () = msg_send![layer, setNeedsDisplay];
+                        }
+                    } else {
+                        // NSView-wid path: force layout/display updates on container view.
+                        let _: () = msg_send![container_ptr, setNeedsLayout: 1i8];
+                        let _: () = msg_send![container_ptr, setNeedsDisplay: 1i8];
+                    }
                     
                     let _: () = msg_send![container_ptr, layoutSubtreeIfNeeded];
 
-                    println!("[RESIZE] Container forced to parent bounds: {}x{}", bounds.size.width, bounds.size.height);
+                    println!(
+                        "[RESIZE] Container/{} -> {}x{} (scale: {}, drawable: {}x{})",
+                        if using_layer_wid { "LAYER" } else { "NSVIEW" },
+                        bounds.size.width,
+                        bounds.size.height,
+                        scale,
+                        bounds.size.width * scale,
+                        bounds.size.height * scale
+                    );
                 }
             });
+
+            // Trigger mpv VO refresh after host view resize.
+            // Some Layer-wid paths keep rendering at the initial size until a VO-side update occurs.
+            {
+                let lock = state.0.lock().map_err(|e| e.to_string())?;
+                if let Some(ref instance) = *lock {
+                    let zoom = instance.mpv.get_property::<f64>("video-zoom").unwrap_or(0.0);
+                    let _ = instance.mpv.set_property("video-zoom", zoom + 0.0001f64);
+                    let _ = instance.mpv.set_property("video-zoom", zoom);
+                    let _ = Mpv::command(&instance.mpv, "seek", &["+0", "relative"]);
+                    let osd_w = instance.mpv.get_property::<i64>("osd-width").unwrap_or(-1);
+                    let osd_h = instance.mpv.get_property::<i64>("osd-height").unwrap_or(-1);
+                    let out_dw = instance.mpv.get_property::<i64>("video-out-params/dw").unwrap_or(-1);
+                    let out_dh = instance.mpv.get_property::<i64>("video-out-params/dh").unwrap_or(-1);
+                    println!(
+                        "[RESIZE] MPV reconfigure poke sent (osd={}x{}, out={}x{})",
+                        osd_w, osd_h, out_dw, out_dh
+                    );
+                }
+            }
         }
     }
     #[cfg(not(target_os = "macos"))]
@@ -360,9 +545,37 @@ fn get_mpv_state(state: tauri::State<'_, MpvState>) -> Result<serde_json::Value,
         let dur = inst.mpv.get_property::<f64>("duration").unwrap_or(0.0);
         let pause = inst.mpv.get_property::<bool>("pause").unwrap_or(false);
         let hwdec: String = inst.mpv.get_property("hwdec-current").unwrap_or("no".to_string());
-        Ok(serde_json::json!({ "position": pos, "duration": dur, "pause": pause, "hwdec": hwdec }))
+        let sid = inst.mpv.get_property::<i64>("sid").unwrap_or(-1);
+        let volume = inst.mpv.get_property::<i64>("volume").unwrap_or(100);
+        let osd_w = inst.mpv.get_property::<i64>("osd-width").unwrap_or(-1);
+        let osd_h = inst.mpv.get_property::<i64>("osd-height").unwrap_or(-1);
+        let out_w = inst.mpv.get_property::<i64>("video-out-params/dw").unwrap_or(-1);
+        let out_h = inst.mpv.get_property::<i64>("video-out-params/dh").unwrap_or(-1);
+        Ok(serde_json::json!({
+            "position": pos,
+            "duration": dur,
+            "pause": pause,
+            "hwdec": hwdec,
+            "sid": sid,
+            "volume": volume,
+            "osd_width": osd_w,
+            "osd_height": osd_h,
+            "out_width": out_w,
+            "out_height": out_h
+        }))
     } else {
-        Ok(serde_json::json!({ "position": 0.0, "duration": 0.0, "pause": true, "hwdec": "no" })) 
+        Ok(serde_json::json!({
+            "position": 0.0,
+            "duration": 0.0,
+            "pause": true,
+            "hwdec": "no",
+            "sid": -1,
+            "volume": 100,
+            "osd_width": -1,
+            "osd_height": -1,
+            "out_width": -1,
+            "out_height": -1
+        }))
     }
 }
 
@@ -475,6 +688,29 @@ fn native_set_volume(state: tauri::State<'_, MpvState>, volume: i64) -> Result<(
 }
 
 #[tauri::command(rename_all = "snake_case")]
+fn set_quality_profile(state: tauri::State<'_, MpvState>, profile: String) -> Result<String, String> {
+    let lock = state.0.lock().map_err(|e| e.to_string())?;
+    if let Some(ref instance) = *lock {
+        Ok(apply_quality_profile(&instance.mpv, profile.as_str()))
+    } else {
+        Ok(match profile.as_str() {
+            "quality" => "quality".to_string(),
+            "smooth" => "smooth".to_string(),
+            _ => "balanced".to_string(),
+        })
+    }
+}
+
+#[tauri::command(rename_all = "snake_case")]
+fn native_set_mpv_fullscreen(state: tauri::State<'_, MpvState>, fullscreen: bool) -> Result<(), String> {
+    let lock = state.0.lock().map_err(|e| e.to_string())?;
+    if let Some(ref instance) = *lock {
+        let _ = instance.mpv.set_property("fullscreen", fullscreen);
+    }
+    Ok(())
+}
+
+#[tauri::command(rename_all = "snake_case")]
 fn ping() -> String {
     "pong".to_string()
 }
@@ -487,10 +723,66 @@ fn native_log(msg: String) {
 #[tauri::command(rename_all = "snake_case")]
 fn native_toggle_fullscreen(app: tauri::AppHandle) -> Result<(), String> {
     use tauri::Manager;
-    let window = app.get_webview_window("main").ok_or("Window not found")?;
-    let is_fs = window.is_fullscreen().map_err(|e| e.to_string())?;
-    window.set_fullscreen(!is_fs).map_err(|e| e.to_string())?;
-    Ok(())
+    let (tx, rx) = std::sync::mpsc::channel::<Result<(), String>>();
+    let app_for_main = app.clone();
+    app.run_on_main_thread(move || {
+        let result = (|| {
+            let window = app_for_main.get_webview_window("main").ok_or("Window not found".to_string())?;
+            let is_fs = window.is_fullscreen().map_err(|e| e.to_string())?;
+            window.set_fullscreen(!is_fs).map_err(|e| e.to_string())
+        })();
+        let _ = tx.send(result);
+    })
+    .map_err(|e| e.to_string())?;
+    rx.recv().map_err(|_| "fullscreen result channel closed".to_string())?
+}
+
+#[tauri::command(rename_all = "snake_case")]
+fn native_get_fullscreen(app: tauri::AppHandle) -> Result<bool, String> {
+    use tauri::Manager;
+    let (tx, rx) = std::sync::mpsc::channel::<Result<bool, String>>();
+    let app_for_main = app.clone();
+    app.run_on_main_thread(move || {
+        let result = (|| {
+            let window = app_for_main.get_webview_window("main").ok_or("Window not found".to_string())?;
+            window.is_fullscreen().map_err(|e| e.to_string())
+        })();
+        let _ = tx.send(result);
+    })
+    .map_err(|e| e.to_string())?;
+    rx.recv().map_err(|_| "fullscreen state channel closed".to_string())?
+}
+
+#[tauri::command(rename_all = "snake_case")]
+fn native_set_fullscreen(app: tauri::AppHandle, fullscreen: bool) -> Result<(), String> {
+    use tauri::Manager;
+    let (tx, rx) = std::sync::mpsc::channel::<Result<(), String>>();
+    let app_for_main = app.clone();
+    app.run_on_main_thread(move || {
+        let result = (|| {
+            let window = app_for_main.get_webview_window("main").ok_or("Window not found".to_string())?;
+            window.set_fullscreen(fullscreen).map_err(|e| e.to_string())
+        })();
+        let _ = tx.send(result);
+    })
+    .map_err(|e| e.to_string())?;
+    rx.recv().map_err(|_| "set fullscreen channel closed".to_string())?
+}
+
+#[tauri::command(rename_all = "snake_case")]
+fn native_start_drag(app: tauri::AppHandle) -> Result<(), String> {
+    use tauri::Manager;
+    let (tx, rx) = std::sync::mpsc::channel::<Result<(), String>>();
+    let app_for_main = app.clone();
+    app.run_on_main_thread(move || {
+        let result = (|| {
+            let window = app_for_main.get_webview_window("main").ok_or("Window not found".to_string())?;
+            window.start_dragging().map_err(|e| e.to_string())
+        })();
+        let _ = tx.send(result);
+    })
+    .map_err(|e| e.to_string())?;
+    rx.recv().map_err(|_| "drag result channel closed".to_string())?
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -507,9 +799,14 @@ pub fn run() {
             close_native_player,
             resize_native_player,
             native_toggle_fullscreen,
+            native_get_fullscreen,
+            native_set_fullscreen,
+            native_start_drag,
             native_play_pause,
             native_seek,
             native_set_volume,
+            native_set_mpv_fullscreen,
+            set_quality_profile,
             // [NEW] Subtitle Commands
             get_subtitle_tracks,
             set_subtitle_track,

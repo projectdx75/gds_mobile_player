@@ -4,22 +4,28 @@ use std::path::PathBuf;
 fn main() {
     #[cfg(target_os = "macos")]
     {
+        println!("cargo:rerun-if-env-changed=MPV_LINK_MODE");
         let manifest_dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap());
-        
+        let link_mode = env::var("MPV_LINK_MODE").unwrap_or_else(|_| "framework".to_string());
+        println!("cargo:warning=MPV_LINK_MODE={}", link_mode);
         let lib_dir = manifest_dir.join("lib");
-        
-        // [FIX] Use Universal Framework (ARM64 + x86_64) instead of static lib
         let framework_search_path = lib_dir.join("Libmpv.xcframework/macos-arm64_x86_64");
-        
-        // [FIX] Link Local Libmpv Framework FIRST
-        println!("cargo:warning=Linking against Universal Libmpv.framework at: {}", framework_search_path.display());
-        // Use -F to specify framework search path explicitly
-        println!("cargo:rustc-link-search=framework={}", framework_search_path.display());
-        println!("cargo:rustc-link-lib=framework=Libmpv");
-        
-        // Ensure runtime finding
-        println!("cargo:rustc-link-arg=-Wl,-rpath,@loader_path/../Frameworks");
-        println!("cargo:rustc-link-arg=-Wl,-rpath,{}", framework_search_path.display());
+
+        if link_mode == "system" {
+            // Quick diagnostic mode: link against Homebrew libmpv dylib.
+            let homebrew_lib = PathBuf::from("/opt/homebrew/lib");
+            println!("cargo:warning=Linking against system libmpv from: {}", homebrew_lib.display());
+            println!("cargo:rustc-link-search=native={}", homebrew_lib.display());
+            println!("cargo:rustc-link-lib=dylib=mpv");
+            println!("cargo:rustc-link-arg=-Wl,-rpath,{}", homebrew_lib.display());
+        } else {
+            // Default: project-local framework
+            println!("cargo:warning=Linking against Universal Libmpv.framework at: {}", framework_search_path.display());
+            println!("cargo:rustc-link-search=framework={}", framework_search_path.display());
+            println!("cargo:rustc-link-lib=framework=Libmpv");
+            println!("cargo:rustc-link-arg=-Wl,-rpath,@loader_path/../Frameworks");
+            println!("cargo:rustc-link-arg=-Wl,-rpath,{}", framework_search_path.display());
+        }
 
         
         // Link system frameworks required by libmpv
@@ -42,7 +48,9 @@ fn main() {
         let lib_deps_dir = manifest_dir.join("lib_deps");
         println!("cargo:rustc-link-search=native={}", lib_deps_dir.display());
         println!("cargo:rustc-link-search=native={}", lib_dir.display());
-        println!("cargo:rustc-link-lib=dylib=MoltenVK");
+        if link_mode != "system" {
+            println!("cargo:rustc-link-lib=dylib=MoltenVK");
+        }
         
         // Resolve other dependencies referenced by Libmpv (Homebrew)
         println!("cargo:rustc-link-lib=dylib=uchardet");

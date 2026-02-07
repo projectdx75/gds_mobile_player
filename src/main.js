@@ -18,6 +18,7 @@ const state = {
   subtitleSize: parseFloat(localStorage.getItem("flashplex_sub_size") || "1.1"), // Default font scale
   subtitlePos: parseFloat(localStorage.getItem("flashplex_sub_pos") || "100.0"), // Default vertical offset (Bottom)
   volume: parseInt(localStorage.getItem("flashplex_volume") || "100"),
+  qualityProfile: localStorage.getItem("flashplex_quality_profile") || "balanced",
 
   // [PHASE 4] Infinite Scroll State
   offset: 0,
@@ -33,12 +34,16 @@ const state = {
   seenPaths: new Set(),
   isFirstFreshLoadDone: false,
   isFreshLoading: false, // [NEW] Concurrency guard for fresh loads
+  nativeSource: null, // { title, url, subtitleUrl }
+  nativeRecreating: false,
 };
 
 // Platform Detection
 const isAndroid = /Android/i.test(navigator.userAgent);
 const isIOS = /iPhone|iPad|iPod/i.test(navigator.userAgent);
 const isDesktop = !isAndroid && !isIOS;
+const folderMetaCache = new Map();
+let nativeStatePollTimer = null;
 
 // Helper for cross-version Tauri invoke
 function getTauriInvoke() {
@@ -50,6 +55,138 @@ function getTauriInvoke() {
     };
   }
   return invoke;
+}
+
+function normalizeQualityProfile(profile) {
+  if (profile === "quality" || profile === "smooth") return profile;
+  return "balanced";
+}
+
+async function applyNativeQualityProfile(profile, silent = false) {
+  const invoke = getTauriInvoke();
+  const normalized = normalizeQualityProfile(profile);
+  state.qualityProfile = normalized;
+  localStorage.setItem("flashplex_quality_profile", normalized);
+
+  if (!invoke || !state.isNativeActive) return normalized;
+  try {
+    const applied = await invoke("set_quality_profile", { profile: normalized });
+    const finalProfile = normalizeQualityProfile(applied || normalized);
+    state.qualityProfile = finalProfile;
+    localStorage.setItem("flashplex_quality_profile", finalProfile);
+    if (!silent) console.log("[QUALITY] Applied profile:", finalProfile);
+    return finalProfile;
+  } catch (err) {
+    console.error("[QUALITY] Failed to apply profile:", err);
+    return normalized;
+  }
+}
+
+async function recreateNativePlayerAfterResize(reason = "fullscreen") {
+  const invoke = getTauriInvoke();
+  if (!invoke || !state.isNativeActive || state.nativeRecreating || !state.nativeSource) return;
+
+  state.nativeRecreating = true;
+  setNativeTransitionMask(true);
+  if (ui.premiumOsc) ui.premiumOsc.classList.add("hidden");
+  try {
+    const wasPausedBefore = !!state.nativePaused;
+    let mpvState = {
+      position: typeof state.nativePos === "number" ? state.nativePos : 0,
+      pause: wasPausedBefore,
+      sid: -1,
+      volume: typeof state.volume === "number" ? state.volume : 100,
+    };
+
+    // Freeze playback position first to avoid timing drift while recreating.
+    await invoke("native_play_pause", { pause: true }).catch(() => {});
+    await new Promise((r) => setTimeout(r, 70));
+
+    try {
+      const snap = await invoke("get_mpv_state");
+      if (snap && typeof snap === "object") {
+        mpvState.position = typeof snap.position === "number" ? snap.position : mpvState.position;
+        // Do not override pause with the forced pause state we just applied.
+        mpvState.sid = typeof snap.sid === "number" ? snap.sid : mpvState.sid;
+        mpvState.volume = typeof snap.volume === "number" ? snap.volume : mpvState.volume;
+      }
+    } catch (_) {}
+    const shouldResume = !wasPausedBefore;
+
+    const source = state.nativeSource;
+    console.log(`[NATIVE-RECREATE] start (${reason})`, source, "pos=", mpvState.position);
+
+    await invoke("close_native_player").catch(() => {});
+    await new Promise((r) => setTimeout(r, 100));
+
+    await invoke("launch_mpv_player", {
+      title: source.title,
+      url: source.url,
+      subtitle_url: source.subtitleUrl || null,
+      start_pos: mpvState.position,
+      start_paused: true,
+    });
+
+    // Wait until mpv is ready enough to accept seek reliably.
+    for (let i = 0; i < 12; i += 1) {
+      await new Promise((r) => setTimeout(r, 90));
+      try {
+        const s = await invoke("get_mpv_state");
+        if (s && typeof s.duration === "number" && s.duration > 1) break;
+      } catch (_) {}
+    }
+    await invoke("resize_native_player", {}).catch(() => {});
+    await applyNativeQualityProfile(state.qualityProfile, true);
+
+    if (typeof mpvState.position === "number" && mpvState.position > 0.2) {
+      await invoke("native_seek", { seconds: mpvState.position }).catch(() => {});
+      await new Promise((r) => setTimeout(r, 120));
+      await invoke("native_seek", { seconds: mpvState.position }).catch(() => {});
+    }
+    if (typeof mpvState.sid === "number" && mpvState.sid >= 0) {
+      await invoke("set_subtitle_track", { sid: mpvState.sid }).catch(() => {});
+    }
+    if (typeof mpvState.volume === "number") {
+      await invoke("native_set_volume", { volume: Math.round(mpvState.volume) }).catch(() => {});
+    }
+
+    const applySubPos = (typeof state.subtitlePos === "number") ? state.subtitlePos : 100.0;
+    await invoke("set_subtitle_style", {
+      scale: state.subtitleSize,
+      pos: Math.round(applySubPos),
+    }).catch(() => {});
+
+    if (shouldResume) {
+      await new Promise((r) => setTimeout(r, 110));
+      await invoke("native_play_pause", { pause: false }).catch(() => {});
+      state.nativePaused = false;
+    } else {
+      await invoke("native_play_pause", { pause: true }).catch(() => {});
+      state.nativePaused = true;
+    }
+
+    console.log(`[NATIVE-RECREATE] done (${reason})`);
+  } catch (err) {
+    console.error(`[NATIVE-RECREATE] failed (${reason})`, err);
+  } finally {
+    state.nativeRecreating = false;
+    if (ui.premiumOsc) {
+      setTimeout(() => {
+        if (state.isNativeActive && !state.nativeRecreating) {
+          ui.premiumOsc.classList.remove("hidden");
+        }
+        setNativeTransitionMask(false);
+      }, 250);
+    } else {
+      setTimeout(() => setNativeTransitionMask(false), 250);
+    }
+  }
+}
+
+function setNativeTransitionMask(active) {
+  document.body.classList.toggle("native-recreate-active", !!active);
+  document.documentElement.classList.toggle("native-recreate-active", !!active);
+  if (ui.premiumOsc && active) ui.premiumOsc.classList.add("hidden");
 }
 
 // [NEW] Shared logic for checking/selecting subs and updating badge with retry
@@ -174,6 +311,8 @@ function initElements() {
 // Initialize
 window.addEventListener("DOMContentLoaded", () => {
   console.log("[STARTUP] Application booting...");
+  document.documentElement.classList.add("appletv-skin");
+  document.body.classList.add("appletv-skin");
 
 
 
@@ -251,6 +390,7 @@ window.addEventListener("DOMContentLoaded", () => {
   }
 
   initElements();
+  if (window.lucide) lucide.createIcons();
 
   // Register robust global listeners
   document.addEventListener("click", (e) => {
@@ -302,22 +442,22 @@ window.addEventListener("DOMContentLoaded", () => {
   }
 
   // [FIX] Robust Manual Dragging Fallback
-  if (header) {
-    header.addEventListener("mousedown", (e) => {
+  const dragHandle = document.getElementById("stable-drag-bar") || header;
+  if (dragHandle) {
+    dragHandle.addEventListener("mousedown", (e) => {
       // Don't drag if clicking buttons, links, or logo
       if (e.target.closest("button") || 
           e.target.closest(".nav-link") || 
-          e.target.closest(".app-logo") ||
           e.target.hasAttribute("data-tauri-no-drag")) {
         return;
       }
-      
-      if (window.__TAURI_WINDOW__) {
-        console.log("[DRAG] Manual dragging initiated");
-        window.__TAURI_WINDOW__.startDragging().catch(err => {
-            console.error("[DRAG] startDragging failed:", err);
-        });
-      }
+
+      const invoke = getTauriInvoke();
+      if (!invoke) return;
+      console.log("[DRAG] Manual dragging initiated");
+      invoke("native_start_drag").catch((err) => {
+        console.error("[DRAG] native_start_drag failed:", err);
+      });
     });
   }
 
@@ -356,6 +496,7 @@ function switchView(viewName) {
     if (invoke) {
       invoke("close_native_player").catch(() => {});
       state.isNativeActive = false;
+      state.nativeSource = null;
       document.body.classList.remove("native-player-active");
       document.documentElement.classList.remove("native-player-active");
     }
@@ -522,7 +663,7 @@ async function gdsFetch(endpoint, options = {}) {
   const separator = url.includes("?") ? "&" : "?";
   const finalUrl = `${url}${separator}apikey=${state.apiKey}`;
 
-  console.log(`[GDS-API] Calling (${method}): ${finalUrl}`);
+  console.log(`[GDS-API] Calling (${method}): ${url}`);
 
   // Tauri HTTP Plugin Logic
   const tauriHttp =
@@ -562,8 +703,7 @@ async function gdsFetch(endpoint, options = {}) {
       throw new Error(`HTTP Error: ${response.status} ${response.statusText}`);
     }
     const data = await response.json();
-    console.log(`[GDS-API] Final URL: ${finalUrl}`);
-    console.log(`[GDS-API] Response Content:`, data);
+    console.log(`[GDS-API] Success (${method}):`, endpoint);
     return data;
   } catch (e) {
     console.error("[GDS-API] Fetch Error:", e);
@@ -786,6 +926,41 @@ async function loadLibrary(forceRefresh = false, isAppend = false) {
     }
 
     if (data && data.ret === "success") {
+      // [META-DEBUG] Quick visibility check: does server actually return meta fields?
+      if (!isAppend && state.currentPath) {
+        const pathParts = String(state.currentPath).split("/").filter(Boolean);
+        const parentPath =
+          (state.pathStack && state.pathStack.length > 1
+            ? state.pathStack[state.pathStack.length - 2]
+            : pathParts.slice(0, -1).join("/")) || "";
+        const parentMeta = parentPath ? folderMetaCache.get(parentPath) : null;
+
+        const metaProbe = (currentList || []).slice(0, 3).map((it) => ({
+          name: it?.name,
+          path: it?.path,
+          is_dir: it?.is_dir,
+          meta_id: it?.meta_id,
+          meta_title: it?.meta_title,
+          title: it?.title,
+          meta_summary_len: (it?.meta_summary || "").length,
+          has_meta_poster: !!it?.meta_poster,
+          has_poster: !!it?.poster,
+        }));
+        console.log("[META-DEBUG] path:", state.currentPath);
+        if (parentPath) {
+          console.log("[META-DEBUG] parentPath:", parentPath);
+          console.log("[META-DEBUG] parentMeta(cache):", {
+            title: parentMeta?.title || parentMeta?.meta_title || parentMeta?.name || "",
+            has_meta_poster: !!parentMeta?.meta_poster,
+            has_poster: !!parentMeta?.poster,
+            meta_summary_len: (parentMeta?.meta_summary || "").length,
+          });
+        } else {
+          console.log("[META-DEBUG] parentPath: <none>");
+        }
+        console.table(metaProbe);
+      }
+
       state.isLoadingMore = false;
       let finalItems = currentList;
 
@@ -891,11 +1066,13 @@ async function loadLibrary(forceRefresh = false, isAppend = false) {
           if (state.currentView === "library" && !state.currentPath) {
             const heroCarousel = document.getElementById("hero-carousel");
             if (heroCarousel) renderHeroPlaceholder(heroCarousel);
-            // initHeroCarousel(); // [REMOVED] Already handled by switchView("library")
+            // Re-init when category/path changes inside library.
+            setTimeout(() => initHeroCarousel(), 40);
           }
         }
       }
 
+      renderFolderContextPanel(displayItems);
       renderGrid(grid, displayItems, isFolderCategory, isAppend);
 
       // [FIX] Ensure scroll is at top after rendering first page
@@ -909,6 +1086,7 @@ async function loadLibrary(forceRefresh = false, isAppend = false) {
   } catch (err) {
     console.error("[LOAD] Fetch Error:", err);
     ui.statusDot.className = "status-dot error";
+    renderFolderContextPanel([]);
   } finally {
     hideLoader();
     state.isLoadingMore = false;
@@ -923,6 +1101,8 @@ async function loadLibrary(forceRefresh = false, isAppend = false) {
 function renderSubCategoryChips(folders) {
   const chipContainer = document.getElementById("sub-category-chips");
   if (!chipContainer) return;
+  document.body.classList.toggle("has-folder-path", !!state.currentPath);
+  document.documentElement.classList.toggle("has-folder-path", !!state.currentPath);
 
   // Clear previous content
   chipContainer.innerHTML = "";
@@ -942,6 +1122,20 @@ function renderSubCategoryChips(folders) {
     loadLibrary();
   };
   chipContainer.appendChild(homeChip);
+
+  // Back action as chip instead of a bulky first card in grid
+  if (state.currentPath && state.pathStack.length > 0) {
+    const backChip = document.createElement("div");
+    backChip.className = "chip chip-back";
+    backChip.tabIndex = 0;
+    backChip.innerText = "← 이전";
+    backChip.onclick = () => {
+      state.pathStack.pop();
+      state.currentPath = state.pathStack[state.pathStack.length - 1] || "";
+      loadLibrary();
+    };
+    chipContainer.appendChild(backChip);
+  }
 
   // Index Folders chips if passed
   if (!state.currentPath && folders && Array.isArray(folders)) {
@@ -988,7 +1182,7 @@ function renderSubCategoryChips(folders) {
     }
   }
 
-  // 2. Parse current path and Create Breadcrumbs
+  // 2. Parse current path and Create compact breadcrumbs
   if (state.currentPath) {
     const parts = state.currentPath.split("/");
     let builtPath = "";
@@ -1004,28 +1198,30 @@ function renderSubCategoryChips(folders) {
         '애니메이션': '애니메이션'
     };
 
+    const crumbQueue = [];
     parts.forEach((part, index) => {
       if (!part) return; 
       builtPath += (builtPath ? "/" : "") + part;
 
       const displayLabel = labelMap[part] !== undefined ? labelMap[part] : part;
       if (displayLabel === '') return; // Skip if mapped to empty (like VIDEO)
+      crumbQueue.push({ label: displayLabel, path: builtPath });
+    });
 
+    const visibleCrumbs = crumbQueue.slice(-2);
+    visibleCrumbs.forEach(({ label, path }) => {
       const breadcrumb = document.createElement("div");
       breadcrumb.className = "chip";
-      breadcrumb.innerText = displayLabel;
-
-      const pathForThisChip = builtPath;
+      breadcrumb.innerText = label;
       breadcrumb.onclick = () => {
-        state.currentPath = pathForThisChip;
-        if (state.pathStack.includes(pathForThisChip)) {
-            state.pathStack = state.pathStack.slice(0, state.pathStack.indexOf(pathForThisChip) + 1);
+        state.currentPath = path;
+        if (state.pathStack.includes(path)) {
+          state.pathStack = state.pathStack.slice(0, state.pathStack.indexOf(path) + 1);
         } else {
-            state.pathStack = [pathForThisChip];
+          state.pathStack = [path];
         }
         loadLibrary();
       };
-
       chipContainer.appendChild(breadcrumb);
     });
   }
@@ -1034,6 +1230,81 @@ function renderSubCategoryChips(folders) {
 function hideSubCategoryChips() {
   const chipContainer = document.getElementById("sub-category-chips");
   if (chipContainer) chipContainer.style.display = "none";
+  document.body.classList.remove("has-folder-path");
+  document.documentElement.classList.remove("has-folder-path");
+}
+
+function renderFolderContextPanel(items = []) {
+  const panel = document.getElementById("folder-context-panel");
+  if (!panel) return;
+
+  if (!state.currentPath) {
+    panel.classList.add("hidden");
+    panel.innerHTML = "";
+    return;
+  }
+
+  const pathParts = String(state.currentPath).split("/").filter(Boolean);
+  const currentName = pathParts[pathParts.length - 1] || "";
+  const parentName = pathParts.length > 1 ? pathParts[pathParts.length - 2] : "";
+  const seasonMatch = currentName.match(/^(season|s|시즌)\s*([0-9]+)/i);
+  const isSeasonFolder = !!seasonMatch;
+
+  const normalizeTitle = (raw) =>
+    String(raw || "")
+      .replace(/^[【\[]\s*|\s*[】\]]$/g, "")
+      .replace(/\((19|20)\d{2}\)\s*$/g, "")
+      .replace(/\s{2,}/g, " ")
+      .trim();
+
+  const seriesTitle = normalizeTitle(isSeasonFolder ? parentName : currentName) || "컬렉션";
+  const seasonLabel = isSeasonFolder ? `Season ${seasonMatch[2]}` : normalizeTitle(currentName);
+  const parentPath =
+    (state.pathStack && state.pathStack.length > 1
+      ? state.pathStack[state.pathStack.length - 2]
+      : pathParts.slice(0, -1).join("/")) || "";
+  const currentMeta = folderMetaCache.get(state.currentPath) || null;
+  const parentMeta = parentPath ? folderMetaCache.get(parentPath) : null;
+  const episodes = (items || []).filter((i) => i && !i.is_dir);
+  const subFolders = (items || []).filter((i) => i && i.is_dir);
+  const episodeCount = episodes.length;
+  const seasonCount = subFolders.length;
+  const firstMedia = episodes[0] || (items || []).find((i) => i && !i.is_dir) || items[0] || null;
+  const firstFolder = subFolders[0] || null;
+  const mediaPath = firstMedia?.path || "";
+  const resolvedSeriesTitle =
+    normalizeTitle(currentMeta?.title || currentMeta?.meta_title || currentMeta?.album_info?.title || currentMeta?.name) ||
+    normalizeTitle(parentMeta?.title || parentMeta?.meta_title || parentMeta?.album_info?.title || parentMeta?.name) ||
+    seriesTitle;
+  const backdrop = currentMeta?.meta_poster || currentMeta?.album_info?.posters || currentMeta?.poster ||
+    parentMeta?.meta_poster || parentMeta?.album_info?.posters || parentMeta?.poster ||
+    firstFolder?.meta_poster || firstFolder?.poster ||
+    firstMedia?.meta_poster || firstMedia?.poster || (
+    mediaPath
+      ? `${state.serverUrl}/gds_dviewer/normal/thumbnail?bpath=${toUrlSafeBase64(mediaPath)}&source_id=${firstMedia?.source_id || 0}&w=960&apikey=${state.apiKey}`
+      : `${state.serverUrl}/gds_dviewer/static/img/no_poster.png`
+  );
+  const summary = (
+    currentMeta?.meta_summary || currentMeta?.summary || currentMeta?.desc ||
+    parentMeta?.meta_summary || parentMeta?.summary || parentMeta?.desc ||
+    firstMedia?.meta_summary || firstMedia?.summary || firstMedia?.desc || ""
+  ).trim();
+  const countLabel = episodeCount > 0 ? `${episodeCount} Episodes` : `${seasonCount} Seasons`;
+
+  panel.innerHTML = `
+    <div class="folder-context-art" style="background-image:url('${backdrop}')"></div>
+    <div class="folder-context-body">
+      <div class="folder-context-top">SERIES CONTEXT</div>
+      <h2 class="folder-context-title">${resolvedSeriesTitle}</h2>
+      <div class="folder-context-meta">
+        <span class="folder-context-chip season">${seasonLabel}</span>
+        <span class="folder-context-chip">${countLabel}</span>
+        ${(currentMeta?.year || parentMeta?.year) ? `<span class="folder-context-chip">${currentMeta?.year || parentMeta?.year}</span>` : ""}
+      </div>
+      ${summary ? `<p class="folder-context-summary">${summary}</p>` : ""}
+    </div>
+  `;
+  panel.classList.remove("hidden");
 }
 
 
@@ -1105,6 +1376,13 @@ function renderGrid(container, items, isFolderCategory = false, isAppend = false
   if (!isAppend) {
     container.innerHTML = "";
   }
+  const existingKeys = isAppend
+    ? new Set(
+        Array.from(container.querySelectorAll("[data-path]"))
+          .map((el) => el.getAttribute("data-path"))
+          .filter(Boolean),
+      )
+    : new Set();
 
   // [MOD] Adaptive Grid Class
   if (state.currentPath) {
@@ -1115,27 +1393,6 @@ function renderGrid(container, items, isFolderCategory = false, isAppend = false
     container.classList.remove("folder-view");
   }
 
-  // Add back button logic handles itself (only when not appending)
-  if (state.currentPath && !isAppend) {
-    const backBtn = document.createElement("div");
-    // ... (Keep existing back button code) ...
-    backBtn.className = "card back-card";
-    backBtn.tabIndex = 0;
-    backBtn.innerHTML = `
-      <div class="back-icon"><i data-lucide="arrow-left"></i></div>
-      <div class="card-info">
-        <div class="card-title">돌아가기</div>
-        <div class="card-subtitle">이전 폴더로</div>
-      </div>
-    `;
-    backBtn.addEventListener("click", () => {
-      state.pathStack.pop();
-      state.currentPath = state.pathStack[state.pathStack.length - 1] || "";
-      loadLibrary();
-    });
-    container.appendChild(backBtn);
-  }
-
   if ((!items || items.length === 0) && !isAppend) {
     container.innerHTML +=
       '<div style="grid-column: 1/-1; text-align:center; padding:40px; color:var(--text-secondary)">No items found.</div>';
@@ -1144,24 +1401,58 @@ function renderGrid(container, items, isFolderCategory = false, isAppend = false
 
   if (!items) return; // Nothing to append
 
+  const getBasename = (p) => {
+    if (!p) return "";
+    const parts = String(p).split("/").filter(Boolean);
+    return parts.length ? parts[parts.length - 1] : "";
+  };
+
+  const cleanSeriesLabel = (raw) => {
+    if (!raw) return "";
+    return String(raw)
+      .replace(/^[【\[]\s*|\s*[】\]]$/g, "")
+      .replace(/\((19|20)\d{2}\)\s*$/g, "")
+      .replace(/\s{2,}/g, " ")
+      .trim();
+  };
+
+  const newCards = [];
   items.forEach((item, index) => {
     // [NEW] Robust Deduplication check in the grid itself
     // Key MUST match the logic in loadLibrary deduplication
     const isCatRoot = !state.currentPath;
     const itemKey = getDedupKey(item, isCatRoot);
 
-    const existing = container.querySelector(`[data-path="${CSS.escape(itemKey)}"]`);
-    if (existing && isAppend) {
+    if (isAppend && existingKeys.has(itemKey)) {
         console.warn("[GRID] skipping duplicate item:", itemKey);
         return; 
     }
+    if (isAppend) existingKeys.add(itemKey);
 
     const card = document.createElement("div");
     card.setAttribute("data-path", itemKey); // Store key for checking
     card.tabIndex = 0; // Make card focusable for remote navigation
-    card.className = "card batch-hidden"; // [BATCH] Start hidden for batch reveal
-
     const isFolder = item.is_dir;
+    if (isFolder && item.path) {
+      folderMetaCache.set(item.path, {
+        path: item.path,
+        name: item.name,
+        title: item.title || item.meta_title || item.album_info?.title || item.name,
+        meta_title: item.meta_title || "",
+        meta_summary: item.meta_summary || item.summary || item.desc || "",
+        summary: item.summary || "",
+        desc: item.desc || "",
+        meta_poster: item.meta_poster || item.album_info?.posters || "",
+        poster: item.poster || "",
+        year: item.year || item.album_info?.release_date || "",
+        album_info: item.album_info || null,
+        source_id: item.source_id || 0,
+      });
+    }
+    const baseCardClass = `card atv-card ${isFolder ? "is-folder" : "is-file"}`;
+    card.className = isAppend
+      ? `${baseCardClass} batch-hidden`
+      : `${baseCardClass} card-loading`;
 
     // [MOD] Filename Cleaning for Premium Look
     let displayTitle = item.title || item.name;
@@ -1174,6 +1465,20 @@ function renderGrid(container, items, isFolderCategory = false, isAppend = false
         )
         .trim();
     }
+    if (!isFolder) {
+      const epMatch = (item.name || "").match(/S(\d{1,2})E(\d{1,3})/i);
+      if (epMatch) {
+        const epNo = String(parseInt(epMatch[2], 10)).padStart(2, "0");
+        displayTitle = `Episode ${epNo}`;
+      }
+    }
+    const seasonMatch = (item.name || "").match(/^(season|s|시즌)\s*([0-9]+)/i);
+    const isSeasonFolder = !!(isFolder && seasonMatch);
+    if (isSeasonFolder) {
+      const seasonNo = seasonMatch[2];
+      displayTitle = `Season ${seasonNo}`;
+      card.classList.add("season-card");
+    }
 
     // Poster logic with smart fallback
     const noPoster = `${state.serverUrl}/gds_dviewer/static/img/no_poster.png`;
@@ -1183,6 +1488,13 @@ function renderGrid(container, items, isFolderCategory = false, isAppend = false
     if (!poster) {
       if (isFolder) {
         poster = item.poster || null;
+        if (!poster && item.path) {
+          const itemParts = String(item.path).split("/").filter(Boolean);
+          const parentPathForItem = itemParts.slice(0, -1).join("/");
+          const parentMeta = folderMetaCache.get(parentPathForItem);
+          if (parentMeta?.meta_poster) poster = parentMeta.meta_poster;
+          else if (parentMeta?.poster) poster = parentMeta.poster;
+        }
       } else {
         const category = item.category || "other";
         if (["video", "animation", "music_video"].includes(category)) {
@@ -1199,6 +1511,10 @@ function renderGrid(container, items, isFolderCategory = false, isAppend = false
 
     // [MOD] Cleaner Subtitle for Folders (No more "0 항목")
     const getFolderSubtitle = (item) => {
+      if (isSeasonFolder) {
+        const parentSeries = cleanSeriesLabel(getBasename(state.currentPath));
+        if (parentSeries) return parentSeries;
+      }
       if (item.children_count > 0) return `${item.children_count}개 항목`;
       const catMap = { 'tv_show': '시리즈', 'movie': '영화', 'animation': '애니메이션', 'music_video': 'M/V', 'audio': '음악' };
       return catMap[item.category] || "폴더";
@@ -1206,7 +1522,12 @@ function renderGrid(container, items, isFolderCategory = false, isAppend = false
 
     const subtitle = isFolder
       ? getFolderSubtitle(item)
-      : item.meta_summary || formatSize(item.size);
+      : (item.meta_summary || item.summary || item.desc || formatSize(item.size));
+    const yearMatch = (item.name || "").match(/\b(19|20)\d{2}\b/);
+    const yearTag = yearMatch ? yearMatch[0] : "";
+    const mediaLabel = isSeasonFolder
+      ? "SEASON"
+      : (isFolder ? "COLLECTION" : ((item.category || "MEDIA").replace("_", " ").toUpperCase()));
 
     // [NEW] Extract Tags for Distinction
     const tags = [];
@@ -1251,16 +1572,20 @@ function renderGrid(container, items, isFolderCategory = false, isAppend = false
           <span>${isFolder ? "Folder" : item.category || "Media"}</span>
         </div>
         <div class="card-info">
-          <div class="card-title">${isFolder ? "📁 " : ""}${displayTitle}</div>
+          <div class="card-eyebrow">${mediaLabel}${yearTag ? ` · ${yearTag}` : ""}</div>
+          <div class="card-title">${displayTitle}</div>
           ${tagsHtml}
           <div class="card-subtitle">${subtitle}</div>
         </div>
       `;
     } else {
+      const imgLoading = !isAppend && index < 14 ? "eager" : "lazy";
       card.innerHTML = `
-        <img class="card-poster" src="${poster}" alt="${item.name}" loading="lazy" onerror="this.parentElement.innerHTML='<div class=no-poster-placeholder><i data-lucide=film></i><span>Media</span></div>'+this.parentElement.querySelector('.card-info').outerHTML">
+        <div class="card-poster-skeleton"></div>
+        <img class="card-poster" src="${poster}" alt="${item.name}" loading="${imgLoading}" onerror="this.onerror=null; this.src='${noPoster}'">
         <div class="card-info">
-          <div class="card-title">${isFolder ? "📁 " : ""}${displayTitle}</div>
+          <div class="card-eyebrow">${mediaLabel}${yearTag ? ` · ${yearTag}` : ""}</div>
+          <div class="card-title">${displayTitle}</div>
           ${tagsHtml}
           <div class="card-subtitle">${subtitle}</div>
         </div>
@@ -1278,39 +1603,89 @@ function renderGrid(container, items, isFolderCategory = false, isAppend = false
       card.addEventListener("click", () => playVideo(item));
     }
     container.appendChild(card);
+    newCards.push(card);
   });
 
   if (window.lucide) lucide.createIcons();
 
-  // [BATCH REVEAL v2] Viewport-based: reveal cards as they enter the visible area
-  const allCards = container.querySelectorAll('.card.batch-hidden');
-  
-  if (allCards.length > 0) {
-    const revealCard = (card) => {
-      card.classList.remove('batch-hidden');
+  // [BATCH REVEAL + PLACEHOLDER] Keep cards visible first, then reveal viewport images together.
+  if (newCards.length > 0) {
+    const revealBatch = () => {
+      newCards.forEach((card) => card.classList.remove("batch-hidden"));
     };
 
-    const observer = new IntersectionObserver((entries) => {
-      entries.forEach(entry => {
-        if (entry.isIntersecting) {
-          const card = entry.target;
-          const img = card.querySelector('img.card-poster');
-          
-          if (img && !img.complete) {
-            // Wait for this image to load (with timeout)
-            const reveal = () => revealCard(card);
-            img.addEventListener('load', reveal, { once: true });
-            img.addEventListener('error', reveal, { once: true });
-            setTimeout(reveal, 1500); // 1.5s timeout per card
-          } else {
-            revealCard(card);
-          }
-          observer.unobserve(card);
-        }
-      });
-    }, { rootMargin: '50px', threshold: 0.1 }); // Start loading 50px before visible
+    if (isAppend) {
+      requestAnimationFrame(revealBatch);
+    } else {
+      const contentContainer = document.querySelector(".content-container");
+      const gridStyle = window.getComputedStyle(container);
+      const colsRaw = (gridStyle.gridTemplateColumns || "").trim();
+      const colCount = Math.max(
+        1,
+        colsRaw && colsRaw !== "none"
+          ? colsRaw.split(/\s+/).length
+          : 1,
+      );
 
-    allCards.forEach(card => observer.observe(card));
+      const firstCard = newCards[0];
+      const cardHeight =
+        (firstCard && firstCard.getBoundingClientRect().height) || 320;
+      const viewportHeight =
+        (contentContainer && contentContainer.clientHeight) || window.innerHeight || 800;
+      const estimatedRows = Math.max(2, Math.ceil(viewportHeight / Math.max(cardHeight, 1)) + 1);
+      const preloadCount = Math.min(newCards.length, colCount * estimatedRows);
+      const cardsWithImages = newCards
+        .map((card) => ({ card, img: card.querySelector("img.card-poster") }))
+        .filter(({ img }) => !!img);
+
+      const batchTargets = cardsWithImages.slice(0, preloadCount);
+      const deferredTargets = cardsWithImages.slice(preloadCount);
+
+      // Below-the-fold cards can reveal individually when each image is ready.
+      deferredTargets.forEach(({ card, img }) => {
+        if (img.complete) {
+          card.classList.remove("card-loading");
+          return;
+        }
+        const revealOne = () => card.classList.remove("card-loading");
+        img.addEventListener("load", revealOne, { once: true });
+        img.addEventListener("error", revealOne, { once: true });
+      });
+
+      if (batchTargets.length === 0) {
+        requestAnimationFrame(() => {
+          newCards.forEach((card) => card.classList.remove("card-loading"));
+        });
+      } else {
+        const waitForImgs = batchTargets.map(({ img }) => {
+          const waitDecode = () => {
+            if (typeof img.decode === "function") {
+              return img.decode().catch(() => {});
+            }
+            return Promise.resolve();
+          };
+
+          if (img.complete) {
+            return waitDecode();
+          }
+
+          return new Promise((resolve) => {
+            const onDone = () => waitDecode().finally(resolve);
+            img.addEventListener("load", onDone, { once: true });
+            img.addEventListener("error", resolve, { once: true });
+          });
+        });
+
+        Promise.race([
+          Promise.all(waitForImgs),
+          new Promise((resolve) => setTimeout(resolve, 3800)),
+        ]).then(() =>
+          requestAnimationFrame(() => {
+            batchTargets.forEach(({ card }) => card.classList.remove("card-loading"));
+          }),
+        );
+      }
+    }
   }
 
   // [REMOTE] Auto-focus first card if coming from tabs or if no focus
@@ -1718,6 +2093,8 @@ function setupButtons() {
       // [NEW] Explicitly tell Rust to kill mpv
       const invoke = window.__TAURI__ ? window.__TAURI__.core.invoke : null;
       if (invoke) invoke("close_native_player").catch(console.error);
+      state.isNativeActive = false;
+      state.nativeSource = null;
 
       if (ui.playerOverlay) ui.playerOverlay.classList.remove("active");
 
@@ -1856,6 +2233,8 @@ function closePlayer() {
       );
     }
     state.isNativeActive = false;
+    stopNativeStatePolling();
+    state.nativeSource = null;
     updateNativeTransparency(false);
 
     // Restore Web Player UI
@@ -1876,6 +2255,68 @@ function closePlayer() {
 
   if (ui.playerOverlay) ui.playerOverlay.classList.remove("active");
   document.body.classList.remove("player-active");
+}
+
+function startNativeStatePolling() {
+  if (nativeStatePollTimer) return;
+  const invoke = getTauriInvoke();
+  if (!invoke) return;
+  console.log("[PLAYER] Starting polling loop for native state...");
+  nativeStatePollTimer = setInterval(() => {
+    if (!state.isNativeActive) return;
+    invoke("get_mpv_state")
+      .then((data) => {
+        if (!data) return;
+        state.nativePos = typeof data.position === "number" ? data.position : 0;
+        state.nativeDuration = typeof data.duration === "number" ? data.duration : 0;
+        state.nativePaused = !!data.pause;
+
+        if (ui.oscCurrentTime) ui.oscCurrentTime.textContent = formatTime(state.nativePos);
+        if (ui.oscTotalTime) ui.oscTotalTime.textContent = formatTime(state.nativeDuration);
+        if (ui.oscSubtitle) {
+          ui.oscSubtitle.textContent = `${formatTime(state.nativePos)} / ${formatTime(state.nativeDuration)}`;
+        }
+
+        if (ui.oscHwBadge) {
+          const rawHw = (data.hwdec || "").toLowerCase();
+          if (state.lastHwDec !== rawHw) {
+            console.log("[PLAYER] HW Status:", rawHw);
+            state.lastHwDec = rawHw;
+          }
+          const isHw = rawHw !== "no" && rawHw !== "" && (
+            rawHw.includes("videotoolbox") ||
+            rawHw.includes("vtb") ||
+            rawHw.includes("auto") ||
+            rawHw.includes("yes")
+          );
+          ui.oscHwBadge.textContent = isHw ? "HW" : "SW";
+          ui.oscHwBadge.className = isHw ? "hw-badge hw" : "hw-badge sw";
+        }
+
+        const percent = state.nativeDuration > 0 ? (state.nativePos / state.nativeDuration) * 100 : 0;
+        if (ui.oscProgressFill) ui.oscProgressFill.style.width = percent + "%";
+        if (ui.oscProgressSlider && !state.isDraggingOscSlider) ui.oscProgressSlider.value = percent;
+
+        const icon = state.nativePaused ? "play" : "pause";
+        if (ui.btnOscPlayPause) {
+          ui.btnOscPlayPause.innerHTML = `<i data-lucide="${icon}"></i>`;
+          if (window.lucide) lucide.createIcons();
+        }
+        if (ui.btnOscCenterPlay) {
+          ui.btnOscCenterPlay.style.display = state.nativePaused ? "flex" : "none";
+          ui.btnOscCenterPlay.innerHTML = `<i data-lucide="${icon}"></i>`;
+          if (window.lucide) lucide.createIcons();
+        }
+      })
+      .catch(() => {});
+  }, 500);
+}
+
+function stopNativeStatePolling() {
+  if (nativeStatePollTimer) {
+    clearInterval(nativeStatePollTimer);
+    nativeStatePollTimer = null;
+  }
 }
 
 // [NEW] Native Mode transparency helper
@@ -2055,6 +2496,7 @@ function playVideo(item) {
     // Desktop Native (MPV for Video)
     if (isDesktop && !isAudio) {
       console.log("[PLAYBACK] Launching Native MPV for:", cleanTitle);
+      state.nativeSource = { title: cleanTitle, url: streamUrl, subtitleUrl };
 
       // [FIX] Force UI Redraw / Transparency Refresh
       document.body.classList.remove("native-player-active");
@@ -2075,6 +2517,9 @@ function playVideo(item) {
       })
         .then(() => {
           console.log(`[PLAYBACK] ${cmd} Success`);
+          startNativeStatePolling();
+          invoke("resize_native_player", {}).catch(() => {});
+          invoke("set_quality_profile", { profile: normalizeQualityProfile(state.qualityProfile) }).catch(() => {});
 
           // [UI] Success - Switch to Native UI
           if (ui.premiumOsc) {
@@ -2161,6 +2606,9 @@ function playVideo(item) {
         .catch((err) => {
           console.error(`[PLAYBACK] All native attempts failed:`, err);
           document.body.classList.remove("native-player-active");
+          state.isNativeActive = false;
+          stopNativeStatePolling();
+          state.nativeSource = null;
 
           // [UI] Reset Native UI if failed
           if (ui.premiumOsc) ui.premiumOsc.style.display = "none";
@@ -2371,6 +2819,7 @@ function renderHeroPlaceholder(heroCarouselContainer) {
 function renderHeroSlides(items, container) {
   if (!container) return;
   container.innerHTML = ""; 
+  const heroFallback = `${state.serverUrl}/gds_dviewer/static/img/no_poster.png`;
 
   items.forEach((item, index) => {
     const slide = document.createElement("div");
@@ -2386,6 +2835,7 @@ function renderHeroSlides(items, container) {
         const bpath = toUrlSafeBase64(item.path || "");
         imgUrl = `${state.serverUrl}/gds_dviewer/normal/thumbnail?bpath=${bpath}&source_id=${item.source_id || 0}&w=1080&apikey=${state.apiKey}`;
     }
+    slide.style.background = `center center / cover no-repeat url("${imgUrl}")`;
 
     // Clean Title
     let displayTitle = item.meta_title || item.title || item.name;
@@ -2395,8 +2845,8 @@ function renderHeroSlides(items, container) {
 
     slide.innerHTML = `
       <img src="${imgUrl}" class="hero-img" alt="${displayTitle}"
-           onload="console.log('[HERO] Image loaded: ${displayTitle}')"
-           onerror="console.error('[HERO] Image failed to load: ${displayTitle}'); this.src='${state.serverUrl}/gds_dviewer/static/img/no_poster.png'">
+           onload="this.closest('.hero-slide').style.background='center center / cover no-repeat url(${imgUrl})'; console.log('[HERO] Image loaded: ${displayTitle}')"
+           onerror="console.error('[HERO] Image failed to load: ${displayTitle}'); this.src='${heroFallback}'; this.closest('.hero-slide').style.background='center center / cover no-repeat url(${heroFallback})'">
       <div class="hero-overlay"></div>
       <div class="hero-content">
         <span class="hero-tag">Trending Now</span>
@@ -2696,87 +3146,6 @@ function formatSize(bytes) {
   const i = Math.floor(Math.log(bytes) / Math.log(k));
   return parseFloat((bytes / Math.pow(k, i)).toFixed(2)) + " " + sizes[i];
 }
-// [PHASE 10] Web Player Controls Logic
-function setupPlayerControls() {
-  const overlay = ui.playerOverlay;
-  const video = ui.mainPlayer;
-  const playBtn = document.getElementById("btn-play-pause");
-  const centerPlayBtn = document.getElementById("btn-center-play");
-  const closeBtn = document.getElementById("btn-close-player");
-  const slider = document.getElementById("progress-slider");
-  const currentTimeLabel = document.getElementById("current-time");
-  const durationLabel = document.getElementById("duration");
-
-  if (!video || !overlay) return;
-
-  function togglePlay() {
-    if (video.paused) {
-      video.play();
-      if (centerPlayBtn) centerPlayBtn.style.opacity = "0";
-      if (playBtn)
-        playBtn.innerHTML = '<i data-lucide="pause" style="width:24px;"></i>';
-      lucide.createIcons();
-    } else {
-      video.pause();
-      if (centerPlayBtn) centerPlayBtn.style.opacity = "1";
-      if (playBtn)
-        playBtn.innerHTML = '<i data-lucide="play" style="width:24px;"></i>';
-      lucide.createIcons();
-    }
-  }
-
-  // Bind Play/Pause Buttons
-  if (playBtn)
-    playBtn.onclick = (e) => {
-      e.stopPropagation();
-      togglePlay();
-    };
-  if (centerPlayBtn)
-    centerPlayBtn.onclick = (e) => {
-      e.stopPropagation();
-      togglePlay();
-    };
-
-  // Bind Close Button
-  if (closeBtn)
-    closeBtn.onclick = (e) => {
-      e.stopPropagation();
-      closePlayer(); // Call the global close function which handles native close
-    };
-
-  // Update Progress Bar
-  video.addEventListener("timeupdate", () => {
-    if (!slider || isDraggingSlider) return;
-    const percent = (video.currentTime / video.duration) * 100;
-    slider.value = isNaN(percent) ? 0 : percent;
-    if (currentTimeLabel)
-      currentTimeLabel.textContent = formatTime(video.currentTime);
-  });
-
-  video.addEventListener("loadedmetadata", () => {
-    if (durationLabel) durationLabel.textContent = formatTime(video.duration);
-  });
-
-  // Slider Seek Logic
-  let isDraggingSlider = false;
-  if (slider) {
-    slider.addEventListener("input", () => {
-      isDraggingSlider = true;
-    });
-    slider.addEventListener("change", () => {
-      isDraggingSlider = false;
-      const time = (slider.value / 100) * video.duration;
-      video.currentTime = time;
-    });
-  }
-}
-
-// Ensure icons are created
-document.addEventListener("DOMContentLoaded", () => {
-  lucide.createIcons();
-  setupPlayerControls();
-});
-
 // [NEW] Premium OSC Logic
 function setupPremiumOSC() {
   const osc = ui.premiumOsc;
@@ -2788,6 +3157,7 @@ function setupPremiumOSC() {
   let oscHideTimeout;
 
   const showOSC = () => {
+    if (state.nativeRecreating) return;
     if (osc) {
       if (osc.classList.contains("hidden")) {
         console.log("[OSC] Showing OSC UI");
@@ -2914,31 +3284,92 @@ function setupPremiumOSC() {
   bind(ui.btnOscFullscreen, "Fullscreen", async (e) => {
     e.stopPropagation();
     const invoke = getTauriInvoke();
+    const applyWindowFullscreenClass = (isFs) => {
+      document.body.classList.toggle("window-fullscreen", !!isFs);
+      document.documentElement.classList.toggle("window-fullscreen", !!isFs);
+    };
+    const scheduleNativeResize = () => {
+      if (!state.isNativeActive || !invoke) return;
+      [0, 120, 450].forEach((delay) => {
+        setTimeout(() => {
+          invoke("resize_native_player", {}).catch((err) => {
+            console.error("[PLAYER] resize_native_player failed:", err);
+          });
+        }, delay);
+      });
+    };
     try {
-      // [FIX] Use Rust command to toggle fullscreen (Bypasses Tauri v2 JS API issues)
+      // [FIX] Use explicit fullscreen state set (more reliable than toggle on macOS).
       if (invoke) {
-        await invoke("native_toggle_fullscreen");
-        console.log("[PLAYER] Native Fullscreen Toggled via Rust Command");
-        
-        // [FIX] After fullscreen transition, manually resize the native MPV container
+        setNativeTransitionMask(true);
+        const currentFs = await invoke("native_get_fullscreen").catch(() => false);
+        const targetFs = !currentFs;
+        await invoke("native_set_fullscreen", { fullscreen: targetFs });
+        await new Promise((r) => setTimeout(r, 180));
+
+        const afterFs = await invoke("native_get_fullscreen").catch(() => currentFs);
+        if (afterFs !== targetFs) {
+          console.warn("[PLAYER] Fullscreen first attempt mismatch. Retrying once...");
+          await invoke("native_set_fullscreen", { fullscreen: targetFs });
+        }
+        applyWindowFullscreenClass(targetFs);
+
+        console.log("[PLAYER] Native Fullscreen Set:", targetFs);
+        scheduleNativeResize();
+        // Single deterministic flow: after parent fullscreen settles, recreate once.
         if (state.isNativeActive) {
-          setTimeout(() => {
-            // [FIX] Increased delay to ensure window state is fully changed
-            invoke("resize_native_player", {}).catch(err => {
-              console.error("[PLAYER] Resize failed:", err);
-            });
-          }, 1000); 
+          await new Promise((r) => setTimeout(r, targetFs ? 220 : 140));
+          await recreateNativePlayerAfterResize(targetFs ? "fullscreen-enter" : "fullscreen-exit");
+        } else {
+          setTimeout(() => setNativeTransitionMask(false), 160);
         }
       } else {
         throw new Error("Tauri Invoke not available");
       }
     } catch (err) {
       console.error("[PLAYER] Native Fullscreen Error:", err);
+      setNativeTransitionMask(false);
       // Fallback to DOM fullscreen if native fails
       if (!document.fullscreenElement) document.documentElement.requestFullscreen().catch(console.error);
       else if (document.exitFullscreen) document.exitFullscreen();
+      applyWindowFullscreenClass(!!document.fullscreenElement);
     }
   });
+
+  // Keep embedded MPV container in sync with parent window size/fullscreen state.
+  if (!window.__nativeResizeSyncBound) {
+    window.__nativeResizeSyncBound = true;
+    const applyWindowFullscreenClass = (isFs) => {
+      document.body.classList.toggle("window-fullscreen", !!isFs);
+      document.documentElement.classList.toggle("window-fullscreen", !!isFs);
+    };
+    const syncNativeResize = () => {
+      const inv = getTauriInvoke();
+      if (!state.isNativeActive || !inv) return;
+      inv("resize_native_player", {}).catch((err) => {
+        console.error("[PLAYER] Resize sync failed:", err);
+      });
+    };
+    const onNativeFullscreenChange = () => {
+      syncNativeResize();
+      const inv = getTauriInvoke();
+      if (inv) {
+        inv("native_get_fullscreen")
+          .then((isFs) => {
+            applyWindowFullscreenClass(isFs);
+            inv("native_set_mpv_fullscreen", { fullscreen: !!isFs }).catch(() => {});
+          })
+          .catch(() => {});
+      } else {
+        applyWindowFullscreenClass(!!document.fullscreenElement);
+      }
+      // Keep fullscreen transition stable: avoid recreate here.
+      // Recreate can reintroduce fixed-size fallback on some macOS setups.
+    };
+    window.addEventListener("resize", syncNativeResize);
+    document.addEventListener("fullscreenchange", onNativeFullscreenChange);
+    setTimeout(onNativeFullscreenChange, 200);
+  }
 
   bind(ui.btnOscSubtitles, "Subtitles", (e) => {
     e.stopPropagation();
@@ -2951,6 +3382,7 @@ function setupPremiumOSC() {
 
   bind(ui.btnOscSettings, "Settings", (e) => {
     e.stopPropagation();
+    showQualityMenu();
     showOSC();
   });
 
@@ -2968,6 +3400,60 @@ function setupPremiumOSC() {
       console.error("[SUB] Failed to load tracks:", e);
       alert("Failed to load subtitle tracks");
     }
+  }
+
+  function showQualityMenu() {
+    const existing = document.getElementById("quality-menu-overlay");
+    if (existing) existing.remove();
+
+    const overlay = document.createElement("div");
+    overlay.id = "quality-menu-overlay";
+    overlay.className = "item-options-overlay active";
+
+    const current = normalizeQualityProfile(state.qualityProfile);
+    const options = [
+      { id: "balanced", label: "Balanced", desc: "기본 추천" },
+      { id: "quality", label: "Quality", desc: "고화질(부하 증가)" },
+      { id: "smooth", label: "Smooth", desc: "부드러움 우선" },
+    ];
+
+    overlay.innerHTML = `
+      <div class="options-content" style="max-height: 55vh; display:flex; flex-direction:column;">
+        <div class="options-header">
+          <h3>Playback Quality</h3>
+          <button class="close-options-btn"><i data-lucide="x"></i></button>
+        </div>
+        <div class="subtitle-track-list" style="overflow-y:auto; flex:1;">
+          ${options.map((opt) => `
+            <button class="sort-option ${opt.id === current ? "active" : ""}" data-qprofile="${opt.id}" style="width:100%; border:none;">
+              <span style="display:flex; flex-direction:column; align-items:flex-start; gap:2px;">
+                <strong>${opt.label}</strong>
+                <small style="opacity:0.75;">${opt.desc}</small>
+              </span>
+              ${opt.id === current ? '<i data-lucide="check" style="width:16px;"></i>' : ""}
+            </button>
+          `).join("")}
+        </div>
+      </div>
+    `;
+
+    document.body.appendChild(overlay);
+    if (window.lucide) lucide.createIcons();
+
+    const closeMenu = () => overlay.remove();
+    overlay.querySelector(".close-options-btn").addEventListener("click", closeMenu);
+    overlay.addEventListener("click", (evt) => {
+      if (evt.target === overlay) closeMenu();
+    });
+
+    overlay.querySelectorAll("[data-qprofile]").forEach((el) => {
+      el.addEventListener("click", async (evt) => {
+        evt.stopPropagation();
+        const profile = normalizeQualityProfile(el.dataset.qprofile || "balanced");
+        await applyNativeQualityProfile(profile);
+        closeMenu();
+      });
+    });
   }
 
   function renderSubtitleMenu(tracks) {
@@ -3196,79 +3682,6 @@ function setupPremiumOSC() {
     });
   }
 
-
-  const invoke = getTauriInvoke();
-
-  if (invoke) {
-    console.log("[PLAYER] Starting polling loop for native state...");
-    setInterval(() => {
-      invoke("get_mpv_state")
-        .then(data => {
-          if (data) {
-            // [DEBUG] Check HW status
-            // if (data.hwdec) console.log("[POLL] hwdec:", data.hwdec);
-
-            state.isNativeActive = true;
-            state.nativePos = typeof data.position === 'number' ? data.position : 0;
-            state.nativeDuration = typeof data.duration === 'number' ? data.duration : 0;
-            state.nativePaused = !!data.pause;
-
-            // UI Update
-            if (ui.oscCurrentTime) ui.oscCurrentTime.textContent = formatTime(state.nativePos);
-            if (ui.oscTotalTime) ui.oscTotalTime.textContent = formatTime(state.nativeDuration);
-
-            // [OSC] Update Subtitle (Time Text)
-            if (ui.oscSubtitle) {
-              ui.oscSubtitle.textContent = `${formatTime(state.nativePos)} / ${formatTime(state.nativeDuration)}`;
-            }
-
-            // [OSC] HW/SW Badge
-            if (ui.oscHwBadge) {
-              const rawHw = (data.hwdec || "").toLowerCase();
-
-              // Log change for debugging
-              if (state.lastHwDec !== rawHw) {
-                console.log("[PLAYER] HW Status:", rawHw);
-                state.lastHwDec = rawHw;
-              }
-
-              // Check for specific HW keywords or generic "not no"
-              const isHw = rawHw !== "no" && rawHw !== "" && (
-                rawHw.includes("videotoolbox") ||
-                rawHw.includes("vtb") ||
-                rawHw.includes("auto") ||
-                rawHw.includes("yes")
-              );
-
-              ui.oscHwBadge.textContent = isHw ? "HW" : "SW";
-              ui.oscHwBadge.className = isHw ? "hw-badge hw" : "hw-badge sw";
-            }
-
-            const percent = (state.nativeDuration > 0) ? (state.nativePos / state.nativeDuration) * 100 : 0;
-            if (ui.oscProgressFill) ui.oscProgressFill.style.width = percent + "%";
-            if (ui.oscProgressSlider && !state.isDraggingOscSlider) ui.oscProgressSlider.value = percent;
-
-            // Icons
-            const icon = state.nativePaused ? "play" : "pause";
-            if (ui.btnOscPlayPause) {
-              ui.btnOscPlayPause.innerHTML = `<i data-lucide="${icon}"></i>`;
-              if (window.lucide) lucide.createIcons();
-            }
-            if (ui.btnOscCenterPlay) {
-              ui.btnOscCenterPlay.style.display = state.nativePaused ? "flex" : "none";
-              ui.btnOscCenterPlay.innerHTML = `<i data-lucide="${icon}"></i>`;
-              if (window.lucide) lucide.createIcons();
-            }
-          }
-        })
-        .catch(err => {
-          // Squelch errors if player closed
-          // console.warn("[POLL] Fail:", err);
-        });
-    }, 500);
-  } else {
-    console.error("[CRITICAL] window.__TAURI__.invoke NOT FOUND. Time sync will fail.");
-  }
 
   showOSC();
 }

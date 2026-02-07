@@ -27,6 +27,12 @@
 
 
 <header class="glass-header" data-tauri-drag-region>
+  <div id="stable-drag-bar" data-tauri-drag-region>
+    <div class="drag-grip-hint" aria-hidden="true">
+      <i data-lucide="grip-horizontal"></i>
+      <span>Drag</span>
+    </div>
+  </div>
   <!-- Global loading bar -->
   <div id="global-loader" class="loader-line"></div>
   <div class="header-content" data-tauri-drag-region>
@@ -106,6 +112,7 @@
         <!-- Dynamic sub-category chips -->
       </div>
     </div>
+    <section id="folder-context-panel" class="folder-context-panel hidden"></section>
     <div id="library-grid" class="grid">
       <!-- Skeleton items -->
       <div class="card skeleton"></div>

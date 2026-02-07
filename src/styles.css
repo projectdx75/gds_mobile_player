@@ -477,12 +477,50 @@ body {
   animation: batchReveal 0.3s ease-out forwards;
 }
 
+.card .card-poster-skeleton {
+  position: absolute;
+  inset: 0;
+  border-radius: inherit;
+  background: linear-gradient(
+    110deg,
+    rgba(155, 186, 236, 0.12) 8%,
+    rgba(187, 212, 255, 0.22) 28%,
+    rgba(155, 186, 236, 0.12) 46%
+  );
+  background-size: 220% 100%;
+  animation: posterSkeletonShimmer 1.2s linear infinite;
+  z-index: 1;
+}
+
+.card.card-loading .card-poster {
+  opacity: 0;
+}
+
+.card.card-loading .card-info {
+  opacity: 0.92;
+}
+
+.card:not(.card-loading) .card-poster-skeleton {
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity 0.24s ease;
+}
+
 @keyframes batchReveal {
   from {
     opacity: 0;
   }
   to {
     opacity: 1;
+  }
+}
+
+@keyframes posterSkeletonShimmer {
+  0% {
+    background-position: 120% 0;
+  }
+  100% {
+    background-position: -120% 0;
   }
 }
 
@@ -938,11 +976,55 @@ body {
   background: transparent !important;
 }
 
+/* Mask fullscreen->recreate transition to avoid visible two-step jump */
+body.native-recreate-active #player-overlay {
+  background: #000 !important;
+}
+
+body.native-recreate-active #premium-osc {
+  display: none !important;
+}
+
 /* Reverted native player overrides for headers to default */
 
 #stable-drag-bar {
-  pointer-events: none !important; /* Prevent blocking header buttons */
-  display: none; /* Already using data-tauri-drag-region on header */
+  position: absolute;
+  top: 0;
+  left: 0;
+  right: 0;
+  height: 28px;
+  pointer-events: auto;
+  -webkit-app-region: drag;
+  z-index: 5000;
+  cursor: grab;
+  display: flex;
+  justify-content: center;
+  align-items: center;
+}
+
+#stable-drag-bar:active {
+  cursor: grabbing;
+}
+
+.drag-grip-hint {
+  pointer-events: none;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 2px 10px;
+  border-radius: 999px;
+  background: rgba(0, 0, 0, 0.35);
+  border: 1px solid rgba(255, 255, 255, 0.18);
+  color: rgba(255, 255, 255, 0.78);
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.02em;
+}
+
+.drag-grip-hint i {
+  width: 14px;
+  height: 14px;
+  opacity: 0.9;
 }
 
 .video-container {
@@ -1463,6 +1545,7 @@ body.native-player-active {
 /* Hide only the content, keep the headers/tabs */
 body.native-player-active .view-header,
 body.native-player-active .hero-section,
+body.native-player-active .folder-context-panel,
 body.native-player-active #library-grid,
 body.native-player-active .bottom-nav {
   opacity: 0;
@@ -2353,4 +2436,558 @@ input:focus {
 
 .icon-btn-sm:hover {
   background: rgba(255, 255, 255, 0.2);
+}
+
+/* Apple TV Theme Override */
+body.appletv-skin {
+  font-family: "Avenir Next", "SF Pro Display", "Segoe UI", sans-serif;
+  background:
+    radial-gradient(1200px 560px at 12% -12%, rgba(125, 166, 255, 0.45), transparent 62%),
+    radial-gradient(980px 560px at 95% 4%, rgba(73, 222, 255, 0.32), transparent 62%),
+    linear-gradient(180deg, #131d34 0%, #161f35 44%, #10182b 100%);
+}
+
+html.appletv-skin body.appletv-skin .content-container {
+  padding-top: 88px;
+}
+
+body.appletv-skin .glass-header {
+  background: linear-gradient(to bottom, rgba(17, 28, 52, 0.88), rgba(17, 28, 52, 0.42));
+  border-bottom: 1px solid rgba(160, 215, 255, 0.38);
+  backdrop-filter: blur(22px);
+  padding-top: calc(var(--safe-area-inset-top) + 10px);
+  padding-bottom: 8px;
+  min-height: 64px;
+}
+
+body.appletv-skin .app-logo {
+  color: #f6f8ff;
+  letter-spacing: 0.04em;
+  font-size: 1rem;
+  font-weight: 700;
+  opacity: 0.92;
+}
+
+body.appletv-skin .netflix-nav {
+  gap: 8px;
+  background: rgba(200, 224, 255, 0.09);
+  border: 1px solid rgba(218, 235, 255, 0.2);
+  border-radius: 999px;
+  padding: 5px;
+}
+
+body.appletv-skin .nav-link {
+  color: rgba(220, 228, 255, 0.78);
+  font-weight: 650;
+  border-radius: 999px;
+  padding: 7px 12px;
+  transition: all 0.2s ease;
+  font-size: 0.78rem;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+}
+
+body.appletv-skin .nav-link.tab.active {
+  background: linear-gradient(135deg, rgba(151, 216, 255, 0.52), rgba(98, 134, 255, 0.48));
+  color: #fff;
+  box-shadow: 0 8px 28px rgba(40, 95, 224, 0.45);
+}
+
+body.appletv-skin .header-actions .icon-btn {
+  background: rgba(186, 214, 255, 0.12);
+  border: 1px solid rgba(220, 235, 255, 0.24);
+  border-radius: 12px;
+  width: 36px;
+  height: 36px;
+}
+
+body.appletv-skin .hero-section {
+  width: calc(100% - 5%);
+  height: 36vh;
+  min-height: 280px;
+  max-height: 430px;
+  margin-bottom: 16px;
+  border-radius: 22px;
+  overflow: hidden;
+  margin-left: 2.5%;
+  margin-right: 2.5%;
+  max-width: none;
+  box-sizing: border-box;
+}
+
+body.appletv-skin .hero-carousel,
+body.appletv-skin .hero-slide {
+  width: 100%;
+  height: 100%;
+}
+
+body.appletv-skin #hero-carousel {
+  position: relative;
+  display: block !important;
+  width: 100% !important;
+  max-width: none !important;
+}
+
+body.appletv-skin .hero-slide {
+  position: absolute !important;
+  top: 0 !important;
+  left: 0 !important;
+  right: 0 !important;
+  inset: 0;
+  width: 100% !important;
+  min-width: 100% !important;
+  max-width: none !important;
+  background-position: center center;
+  background-size: cover;
+  background-repeat: no-repeat;
+}
+
+body.appletv-skin .hero-slide .hero-img {
+  position: absolute;
+  inset: 0;
+  display: block !important;
+  width: 100%;
+  min-width: 100% !important;
+  max-width: none !important;
+  height: 100%;
+  object-fit: cover;
+  object-position: center center;
+  opacity: 1;
+  pointer-events: none;
+}
+
+html.window-fullscreen body.appletv-skin .hero-section,
+body.window-fullscreen.appletv-skin .hero-section {
+  height: 48vh;
+  min-height: 360px;
+  max-height: 620px;
+  margin-left: 2.8%;
+  margin-right: 2.8%;
+  margin-bottom: 18px;
+}
+
+html.window-fullscreen body.appletv-skin .hero-content,
+body.window-fullscreen.appletv-skin .hero-content {
+  left: 3.8%;
+  right: 3.8%;
+}
+
+html.window-fullscreen body.appletv-skin .hero-title,
+body.window-fullscreen.appletv-skin .hero-title {
+  font-size: clamp(2.6rem, 5vw, 4.8rem);
+}
+
+html.window-fullscreen body.appletv-skin .btn-play-hero,
+body.window-fullscreen.appletv-skin .btn-play-hero {
+  min-height: 62px;
+  padding: 18px 40px;
+  font-size: 1.32rem;
+}
+
+body.appletv-skin .hero-overlay {
+  background: linear-gradient(to top, #0b0f19 0%, rgba(11, 15, 25, 0.55) 20%, transparent 80%);
+}
+
+body.appletv-skin .hero-content {
+  left: 4.5%;
+  right: 4.5%;
+}
+
+body.appletv-skin .hero-title {
+  letter-spacing: -0.02em;
+  font-weight: 700;
+  text-shadow: 0 12px 38px rgba(0, 0, 0, 0.6);
+}
+
+body.appletv-skin .btn-play-hero {
+  display: inline-flex;
+  align-items: center;
+  gap: 12px;
+  min-height: 56px;
+  padding: 14px 28px;
+  border-radius: 14px;
+  border: 1px solid rgba(235, 247, 255, 0.55);
+  background: linear-gradient(135deg, rgba(255, 255, 255, 0.97), rgba(224, 239, 255, 0.95));
+  color: #0e1c34;
+  font-size: 1.18rem;
+  font-weight: 700;
+  letter-spacing: 0.01em;
+  box-shadow: 0 14px 30px rgba(8, 20, 46, 0.35), 0 2px 0 rgba(255, 255, 255, 0.5) inset;
+  transition: transform 0.18s ease, box-shadow 0.18s ease, filter 0.18s ease;
+}
+
+body.appletv-skin .btn-play-hero i {
+  width: 20px;
+  height: 20px;
+  padding: 7px;
+  border-radius: 999px;
+  background: rgba(20, 48, 88, 0.1);
+  color: #0e1c34;
+}
+
+body.appletv-skin .btn-play-hero:hover {
+  transform: translateY(-2px) scale(1.015);
+  filter: brightness(1.04);
+  box-shadow: 0 20px 38px rgba(8, 20, 46, 0.4), 0 2px 0 rgba(255, 255, 255, 0.6) inset;
+}
+
+body.appletv-skin .btn-play-hero:active {
+  transform: translateY(0) scale(0.992);
+}
+
+body.appletv-skin .btn-play-hero:focus-visible {
+  outline: none;
+  box-shadow: 0 0 0 3px rgba(163, 213, 255, 0.9), 0 16px 34px rgba(8, 20, 46, 0.38);
+}
+
+body.appletv-skin .grid {
+  grid-template-columns: repeat(auto-fill, minmax(260px, 1fr));
+  gap: 26px;
+  padding: 0 4.5% 30px;
+}
+
+body.appletv-skin .card.atv-card {
+  position: relative;
+  border-radius: 20px;
+  overflow: hidden;
+  border: 1px solid rgba(206, 229, 255, 0.26);
+  background: rgba(25, 39, 68, 0.78);
+  box-shadow: 0 12px 34px rgba(7, 14, 33, 0.4);
+  transition: transform 0.22s ease, box-shadow 0.22s ease, border-color 0.22s ease;
+}
+
+body.appletv-skin .card.atv-card:hover,
+body.appletv-skin .card.atv-card:focus-visible {
+  transform: translateY(-8px) scale(1.035);
+  border-color: rgba(170, 224, 255, 0.95);
+  box-shadow: 0 26px 58px rgba(7, 14, 33, 0.52), 0 0 0 1px rgba(162, 220, 255, 0.62);
+}
+
+body.appletv-skin .card.atv-card .card-poster {
+  width: 100%;
+  aspect-ratio: 2 / 3;
+  object-fit: cover;
+  display: block;
+}
+
+body.appletv-skin .card.atv-card .card-info {
+  position: absolute;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  padding: 16px 14px 14px;
+  background: linear-gradient(180deg, rgba(6, 9, 16, 0) 0%, rgba(7, 12, 24, 0.78) 52%, rgba(7, 12, 24, 0.92) 100%);
+}
+
+body.appletv-skin .card-eyebrow {
+  font-size: 0.68rem;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: rgba(153, 194, 255, 0.92);
+  margin-bottom: 5px;
+  max-height: 0;
+  overflow: hidden;
+  opacity: 0;
+  transform: translateY(4px);
+  transition: max-height 0.2s ease, opacity 0.2s ease, transform 0.2s ease;
+}
+
+body.appletv-skin .card-title {
+  color: #f6f9ff;
+  font-weight: 600;
+  line-height: 1.22;
+  font-size: 1.08rem;
+  text-shadow: 0 4px 14px rgba(0, 0, 0, 0.6);
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+}
+
+body.appletv-skin .card-subtitle {
+  color: rgba(223, 235, 255, 0.84);
+  font-size: 0.76rem;
+  max-height: 0;
+  overflow: hidden;
+  opacity: 0;
+  transform: translateY(4px);
+  transition: max-height 0.2s ease, opacity 0.2s ease, transform 0.2s ease;
+}
+
+body.appletv-skin .card-tags {
+  margin: 6px 0;
+  max-height: 0;
+  overflow: hidden;
+  opacity: 0;
+  transform: translateY(4px);
+  transition: max-height 0.2s ease, opacity 0.2s ease, transform 0.2s ease;
+}
+
+body.appletv-skin .card-tag {
+  background: rgba(220, 235, 255, 0.16);
+  border: 1px solid rgba(220, 235, 255, 0.24);
+  color: #e7efff;
+}
+
+body.appletv-skin .card-tag.accent {
+  background: rgba(126, 193, 255, 0.2);
+  border-color: rgba(126, 193, 255, 0.5);
+  color: #d7ecff;
+}
+
+body.appletv-skin .card.atv-card:hover .card-eyebrow,
+body.appletv-skin .card.atv-card:hover .card-tags,
+body.appletv-skin .card.atv-card:hover .card-subtitle,
+body.appletv-skin .card.atv-card:focus-visible .card-eyebrow,
+body.appletv-skin .card.atv-card:focus-visible .card-tags,
+body.appletv-skin .card.atv-card:focus-visible .card-subtitle {
+  max-height: 36px;
+  opacity: 1;
+  transform: translateY(0);
+}
+
+body.appletv-skin .view-header {
+  position: sticky;
+  top: calc(var(--safe-area-inset-top) + 64px);
+  z-index: 29;
+  padding: 6px 2.5% 0;
+  margin-top: 0;
+  margin-bottom: 0;
+  border: 0;
+  background: linear-gradient(to bottom, rgba(17, 28, 52, 0.76), rgba(17, 28, 52, 0.25));
+  backdrop-filter: blur(8px);
+}
+
+/* In deep folder browsing, sticky breadcrumbs feel intrusive.
+   Let chips flow naturally with content while keeping style. */
+body.appletv-skin.has-folder-path .view-header {
+  position: relative;
+  top: 0;
+  z-index: 8;
+  padding-top: 8px;
+  background: transparent;
+  backdrop-filter: none;
+}
+
+body.appletv-skin .sub-category-bar {
+  align-items: center;
+  gap: 9px;
+  padding: 0;
+  margin: 0;
+  min-height: 34px;
+}
+
+body.appletv-skin #library-grid {
+  margin-top: 14px;
+}
+
+body.appletv-skin .folder-context-panel {
+  margin: 8px 2.5% 14px;
+  min-height: 440px;
+  max-height: 62vh;
+  border-radius: 18px;
+  overflow: hidden;
+  position: relative;
+  border: 1px solid rgba(180, 218, 255, 0.25);
+  background: rgba(18, 30, 56, 0.7);
+  box-shadow: 0 12px 34px rgba(7, 14, 33, 0.36);
+}
+
+body.appletv-skin .folder-context-panel.hidden {
+  display: none;
+}
+
+body.appletv-skin .folder-context-art {
+  position: absolute;
+  inset: 0;
+  background-size: cover;
+  background-position: center;
+  filter: saturate(1.05) brightness(0.75);
+}
+
+body.appletv-skin .folder-context-art::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  background: linear-gradient(90deg, rgba(8, 14, 29, 0.82) 0%, rgba(8, 14, 29, 0.58) 46%, rgba(8, 14, 29, 0.12) 100%);
+}
+
+body.appletv-skin .folder-context-body {
+  position: relative;
+  z-index: 2;
+  padding: 22px 26px;
+  max-width: 62%;
+}
+
+body.appletv-skin .folder-context-top {
+  font-size: 0.66rem;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+  color: rgba(176, 216, 255, 0.88);
+  margin-bottom: 5px;
+}
+
+body.appletv-skin .folder-context-title {
+  font-size: 1.72rem;
+  line-height: 1.2;
+  color: #f7fbff;
+  margin: 0 0 10px;
+}
+
+body.appletv-skin .folder-context-meta {
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+  margin-bottom: 8px;
+}
+
+body.appletv-skin .folder-context-chip {
+  font-size: 0.72rem;
+  color: rgba(226, 240, 255, 0.92);
+  border: 1px solid rgba(178, 214, 255, 0.42);
+  border-radius: 999px;
+  padding: 5px 10px;
+  background: rgba(95, 140, 210, 0.23);
+}
+
+body.appletv-skin .folder-context-chip.season {
+  color: #fff;
+  font-weight: 800;
+  letter-spacing: 0.02em;
+  border-color: rgba(165, 218, 255, 0.88);
+  background: linear-gradient(135deg, rgba(113, 189, 255, 0.62), rgba(89, 120, 244, 0.58));
+  box-shadow: 0 4px 14px rgba(65, 121, 255, 0.35);
+}
+
+body.appletv-skin .card.atv-card.season-card .card-eyebrow {
+  color: rgba(172, 218, 255, 0.95);
+  max-height: 24px;
+  opacity: 1;
+  transform: translateY(0);
+}
+
+body.appletv-skin .card.atv-card.season-card .card-title {
+  font-size: 1.22rem;
+  font-weight: 750;
+  letter-spacing: 0.01em;
+  color: #ffffff;
+}
+
+/* In season-folder episode grid, nudge episode title slightly downward */
+body.appletv-skin.has-folder-path .card.atv-card.is-file .card-title {
+  margin-top: 6px;
+}
+
+/* Season folders look better as compact landscape tiles, not tall posters */
+body.appletv-skin .card.atv-card.season-card .card-poster {
+  aspect-ratio: 16 / 10;
+}
+
+body.appletv-skin .folder-context-summary {
+  margin: 0;
+  font-size: 0.82rem;
+  line-height: 1.4;
+  color: rgba(226, 237, 255, 0.84);
+  display: -webkit-box;
+  -webkit-line-clamp: 3;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+}
+
+body.appletv-skin .chip {
+  border-radius: 999px;
+  border: 1px solid rgba(189, 219, 255, 0.3);
+  background: rgba(111, 151, 222, 0.15);
+  color: rgba(223, 236, 255, 0.92);
+  font-weight: 600;
+  font-size: 0.78rem;
+  letter-spacing: 0.01em;
+  padding: 7px 14px;
+}
+
+body.appletv-skin .chip.active,
+body.appletv-skin .chip:hover {
+  background: linear-gradient(135deg, rgba(134, 199, 255, 0.35), rgba(97, 127, 255, 0.28));
+  border-color: rgba(180, 225, 255, 0.72);
+  color: #fff;
+}
+
+body.appletv-skin .chip-back {
+  border-style: dashed;
+}
+
+body.appletv-skin .bottom-nav {
+  width: min(520px, calc(100% - 44px));
+  left: 50%;
+  right: auto;
+  transform: translateX(-50%);
+  bottom: 16px;
+  border-radius: 999px;
+  background: rgba(16, 24, 43, 0.66);
+  border: 1px solid rgba(215, 231, 255, 0.18);
+  backdrop-filter: blur(20px);
+  box-shadow: 0 18px 45px rgba(0, 0, 0, 0.35);
+}
+
+body.appletv-skin .bottom-nav .nav-item {
+  border-radius: 14px;
+}
+
+body.appletv-skin .bottom-nav .nav-item.active {
+  background: rgba(138, 198, 255, 0.14);
+}
+
+@media (max-width: 900px) {
+  body.appletv-skin .grid {
+    padding: 0 12px 22px;
+    gap: 14px;
+    grid-template-columns: repeat(auto-fill, minmax(170px, 1fr));
+  }
+  body.appletv-skin .hero-section {
+    height: 32vh;
+    min-height: 240px;
+    margin-left: 12px;
+    margin-right: 12px;
+    border-radius: 14px;
+  }
+  html.window-fullscreen body.appletv-skin .hero-section,
+  body.window-fullscreen.appletv-skin .hero-section {
+    height: 40vh;
+    min-height: 270px;
+    max-height: 460px;
+    margin-left: 10px;
+    margin-right: 10px;
+  }
+  html.appletv-skin body.appletv-skin .content-container {
+    padding-top: 82px;
+  }
+  body.appletv-skin .glass-header {
+    min-height: 58px;
+    padding-top: calc(var(--safe-area-inset-top) + 8px);
+    padding-bottom: 6px;
+  }
+  body.appletv-skin .view-header {
+    top: calc(var(--safe-area-inset-top) + 58px);
+    padding-top: 4px;
+    padding-bottom: 0;
+    margin-top: 0;
+  }
+  body.appletv-skin .folder-context-panel {
+    margin: 8px 12px 10px;
+    min-height: 260px;
+    max-height: 48vh;
+  }
+  body.appletv-skin .folder-context-body {
+    max-width: 88%;
+    padding: 12px 14px;
+  }
+  body.appletv-skin .folder-context-title {
+    font-size: 1.2rem;
+  }
+  body.appletv-skin .folder-context-summary {
+    display: none;
+  }
+  body.appletv-skin #library-grid {
+    margin-top: 12px;
+  }
 }
