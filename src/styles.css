@@ -503,7 +503,7 @@ body {
 .card:not(.card-loading) .card-poster-skeleton {
   opacity: 0;
   pointer-events: none;
-  transition: opacity 0.24s ease;
+  transition: opacity 0.16s ease;
 }
 
 @keyframes batchReveal {
@@ -673,7 +673,7 @@ body {
 .skeleton {
   background: linear-gradient(90deg, #121212 25%, #1a1a1a 50%, #121212 75%);
   background-size: 200% 100%;
-  animation: shimmer 1.5s infinite;
+  animation: shimmer 2.2s ease-in-out infinite;
 }
 
 @keyframes shimmer {
@@ -968,6 +968,7 @@ body {
   display: none;
   overflow: hidden;
   user-select: none;
+  transition: background 0.22s ease;
 }
 
 #player-overlay.active {
@@ -978,7 +979,7 @@ body {
 
 /* Mask fullscreen->recreate transition to avoid visible two-step jump */
 body.native-recreate-active #player-overlay {
-  background: #000 !important;
+  background: rgba(0, 0, 0, 0.94) !important;
 }
 
 body.native-recreate-active #premium-osc {
@@ -1564,6 +1565,12 @@ body.native-player-active .content-container {
   background: transparent !important;
   opacity: 1 !important;
   pointer-events: auto !important;
+  overflow: hidden !important;
+  scrollbar-width: none;
+}
+
+body.native-player-active .content-container::-webkit-scrollbar {
+  display: none;
 }
 
 #btn-exit-native {
@@ -1643,8 +1650,8 @@ body.native-player-active #btn-exit-native {
 }
 
 .card:focus {
-  outline: 4px solid var(--primary-accent);
-  outline-offset: 4px;
+  outline: 2px solid #7ec1ff;
+  outline-offset: 3px;
   transform: scale(1.03);
   box-shadow: 0 0 20px rgba(58, 134, 255, 0.5);
   z-index: 10;
@@ -1658,8 +1665,8 @@ body.native-player-active #btn-exit-native {
 .card.focused,
 .tab.focused,
 .nav-item.focused {
-  outline: 4px solid var(--primary-accent);
-  outline-offset: 4px;
+  outline: 2px solid #7ec1ff;
+  outline-offset: 3px;
   transform: scale(1.05);
   background: rgba(255, 255, 255, 0.1);
 }
@@ -2648,12 +2655,14 @@ body.appletv-skin .grid {
 
 body.appletv-skin .card.atv-card {
   position: relative;
-  border-radius: 20px;
+  border-radius: 14px;
   overflow: hidden;
   border: 1px solid rgba(206, 229, 255, 0.26);
   background: rgba(25, 39, 68, 0.78);
   box-shadow: 0 12px 34px rgba(7, 14, 33, 0.4);
   transition: transform 0.22s ease, box-shadow 0.22s ease, border-color 0.22s ease;
+  content-visibility: auto;
+  contain-intrinsic-size: 320px 520px;
 }
 
 body.appletv-skin .card.atv-card:hover,
@@ -2672,11 +2681,25 @@ body.appletv-skin .card.atv-card .card-poster {
 
 body.appletv-skin .card.atv-card .card-info {
   position: absolute;
-  left: 0;
-  right: 0;
+  left: -1px;
+  right: -1px;
   bottom: 0;
+  width: auto;
+  box-sizing: border-box;
   padding: 16px 14px 14px;
+  background: none;
+  z-index: 2;
+  overflow: hidden;
+  background-color: rgba(0, 255, 255, 0.3);
+}
+
+body.appletv-skin .card.atv-card .card-info::before {
+  content: "";
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
   background: linear-gradient(180deg, rgba(6, 9, 16, 0) 0%, rgba(7, 12, 24, 0.78) 52%, rgba(7, 12, 24, 0.92) 100%);
+  z-index: -1;
 }
 
 body.appletv-skin .card-eyebrow {
@@ -2748,10 +2771,10 @@ body.appletv-skin .card.atv-card:focus-visible .card-subtitle {
 
 body.appletv-skin .view-header {
   position: sticky;
-  top: calc(var(--safe-area-inset-top) + 64px);
+  top: calc(var(--safe-area-inset-top) - 24px);
   z-index: 29;
-  padding: 6px 2.5% 0;
-  margin-top: 0;
+  padding: 0px 2.5% 10px 2.5%;
+  margin-top: -8px;
   margin-bottom: 0;
   border: 0;
   background: linear-gradient(to bottom, rgba(17, 28, 52, 0.76), rgba(17, 28, 52, 0.25));
@@ -2772,13 +2795,13 @@ body.appletv-skin.has-folder-path .view-header {
 body.appletv-skin .sub-category-bar {
   align-items: center;
   gap: 9px;
-  padding: 0;
+  padding: 10px 0 0 0;
   margin: 0;
   min-height: 34px;
 }
 
 body.appletv-skin #library-grid {
-  margin-top: 14px;
+  margin-top: 32px;
 }
 
 body.appletv-skin .folder-context-panel {
@@ -2895,7 +2918,7 @@ body.appletv-skin .folder-context-summary {
 }
 
 body.appletv-skin .chip {
-  border-radius: 999px;
+  border-radius: 8px;
   border: 1px solid rgba(189, 219, 255, 0.3);
   background: rgba(111, 151, 222, 0.15);
   color: rgba(223, 236, 255, 0.92);

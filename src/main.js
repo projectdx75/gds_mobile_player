@@ -19,6 +19,7 @@ const state = {
   subtitlePos: parseFloat(localStorage.getItem("flashplex_sub_pos") || "100.0"), // Default vertical offset (Bottom)
   volume: parseInt(localStorage.getItem("flashplex_volume") || "100"),
   qualityProfile: localStorage.getItem("flashplex_quality_profile") || "balanced",
+  sourceId: 0,
 
   // [PHASE 4] Infinite Scroll State
   offset: 0,
@@ -36,14 +37,104 @@ const state = {
   isFreshLoading: false, // [NEW] Concurrency guard for fresh loads
   nativeSource: null, // { title, url, subtitleUrl }
   nativeRecreating: false,
+  appendStallCount: 0,
+  terminalProbeDone: false,
+  lastAppendRequestAt: 0,
+  scrollLoadArmed: false,
+  autoFillTriggered: false,
+  freshRequestSeq: 0,
+  freshAbortController: null,
+  episodeMetaReqSeq: 0,
+  episodeMetaCache: new Map(),
+  nativeFullscreenTransition: false,
 };
 
 // Platform Detection
 const isAndroid = /Android/i.test(navigator.userAgent);
 const isIOS = /iPhone|iPad|iPod/i.test(navigator.userAgent);
 const isDesktop = !isAndroid && !isIOS;
+const DEBUG_LOG = localStorage.getItem("flashplex_debug_logs") === "1";
+const dlog = (...args) => { if (DEBUG_LOG) console.log(...args); };
+const dwarn = (...args) => { if (DEBUG_LOG) console.warn(...args); };
 const folderMetaCache = new Map();
 let nativeStatePollTimer = null;
+let infiniteObserver = null;
+let observedInfiniteSentinel = null;
+let nativeResizeDebounceTimer = null;
+
+function isNearListBottom(extra = 220) {
+  const container = document.querySelector(".content-container");
+  if (!container) return false;
+  const remaining = container.scrollHeight - (container.scrollTop + container.clientHeight);
+  return remaining <= extra;
+}
+
+function maybeLoadMore(reason = "observer") {
+  const now = Date.now();
+  const minGap = 900;
+  if (now - (state.lastAppendRequestAt || 0) < minGap) return;
+
+  // Prevent prefetch storms before user actually scrolls.
+  if (reason !== "auto-fill") {
+    if (!state.scrollLoadArmed) return;
+    if (!isNearListBottom(260)) return;
+  } else if (state.autoFillTriggered) {
+    return;
+  }
+
+  if (state.hasMore && !state.isLoadingMore && state.isFirstFreshLoadDone) {
+    if (reason === "auto-fill") state.autoFillTriggered = true;
+    state.lastAppendRequestAt = now;
+    dlog(`[SCROLL:${reason}] Loading more items... offset=${state.offset}`);
+    loadLibrary(false, true);
+  }
+}
+
+function getInfiniteScrollRoot() {
+  const container = document.querySelector(".content-container");
+  return container || null;
+}
+
+function ensureInfiniteSentinel(gridEl) {
+  if (!gridEl) return;
+  let sentinel = gridEl.querySelector(".infinite-sentinel");
+  if (!sentinel) {
+    sentinel = document.createElement("div");
+    sentinel.className = "infinite-sentinel";
+    sentinel.style.height = "1px";
+    sentinel.style.width = "100%";
+    sentinel.style.gridColumn = "1 / -1";
+    sentinel.style.pointerEvents = "none";
+    gridEl.appendChild(sentinel);
+  } else {
+    // Keep sentinel at the end after new cards are appended.
+    gridEl.appendChild(sentinel);
+  }
+
+  if (!("IntersectionObserver" in window)) return;
+
+  const root = getInfiniteScrollRoot();
+  if (!infiniteObserver) {
+    infiniteObserver = new IntersectionObserver(
+      (entries) => {
+        entries.forEach((entry) => {
+          if (entry.isIntersecting) maybeLoadMore("sentinel");
+        });
+      },
+      {
+        root,
+        rootMargin: "0px 0px 420px 0px",
+        threshold: 0,
+      },
+    );
+  }
+
+  if (observedInfiniteSentinel !== sentinel) {
+    if (observedInfiniteSentinel) infiniteObserver.unobserve(observedInfiniteSentinel);
+    infiniteObserver.observe(sentinel);
+    observedInfiniteSentinel = sentinel;
+  }
+}
 
 // Helper for cross-version Tauri invoke
 function getTauriInvoke() {
@@ -60,6 +151,101 @@ function getTauriInvoke() {
 function normalizeQualityProfile(profile) {
   if (profile === "quality" || profile === "smooth") return profile;
   return "balanced";
+}
+
+function normalizeSourceId(value) {
+  const parsed = Number(value);
+  if (Number.isFinite(parsed) && parsed >= 0) return String(parsed);
+  return String(state.sourceId ?? 0);
+}
+
+function cssEscapeValue(value) {
+  const str = String(value ?? "");
+  if (window.CSS && typeof window.CSS.escape === "function") return window.CSS.escape(str);
+  return str.replace(/["\\]/g, "\\$&");
+}
+
+function getAdaptiveThumbnailWidth(container) {
+  try {
+    if (!container) return 400;
+    const dpr = Math.max(1, Math.min(2, window.devicePixelRatio || 1));
+    const style = window.getComputedStyle(container);
+    const colsRaw = (style.gridTemplateColumns || "").trim();
+    let colCount = 1;
+    if (colsRaw && colsRaw !== "none") {
+      colCount = Math.max(1, colsRaw.split(/\s+/).length);
+    }
+    const gap = parseFloat(style.columnGap || style.gap || "0") || 0;
+    const available = Math.max(320, container.clientWidth - gap * Math.max(0, colCount - 1));
+    const cssCardWidth = Math.max(160, available / colCount);
+    const requested = Math.round(cssCardWidth * dpr);
+    return Math.max(280, Math.min(560, requested));
+  } catch (_) {
+    return 400;
+  }
+}
+
+function applyEpisodeMetaToGrid(metaList = []) {
+  const grid = ui.grid;
+  if (!grid || !Array.isArray(metaList) || metaList.length === 0) return;
+
+  metaList.forEach((meta) => {
+    const rawPath = meta?.path || "";
+    if (!rawPath) return;
+    const key = rawPath.normalize("NFC");
+    const card = grid.querySelector(`[data-path="${cssEscapeValue(key)}"]`);
+    if (!card) return;
+
+    const epNo = Number(meta?.episode);
+    const epLabel = Number.isFinite(epNo) ? `Episode ${String(epNo).padStart(2, "0")}` : "";
+    const titleEl = card.querySelector(".card-title");
+    const subtitleEl = card.querySelector(".card-subtitle");
+    const eyebrowEl = card.querySelector(".card-eyebrow");
+
+    if (titleEl) {
+      if (meta?.title) titleEl.textContent = epLabel ? `${epLabel} · ${meta.title}` : meta.title;
+      else if (epLabel) titleEl.textContent = epLabel;
+    }
+    if (subtitleEl && meta?.summary) subtitleEl.textContent = String(meta.summary);
+    if (eyebrowEl && epLabel) eyebrowEl.textContent = epLabel.toUpperCase();
+  });
+
+  // Keep in-memory state aligned so subsequent interactions reuse enriched values.
+  const byPath = new Map(metaList.map((m) => [String(m.path || "").normalize("NFC"), m]));
+  state.library = (state.library || []).map((item) => {
+    const key = String(item?.path || "").normalize("NFC");
+    const m = byPath.get(key);
+    if (!m) return item;
+    return {
+      ...item,
+      meta_episode: m.episode ?? item.meta_episode,
+      meta_title: m.title || item.meta_title,
+      meta_summary: m.summary || item.meta_summary,
+      meta_aired: m.aired || item.meta_aired,
+      meta_thumb: m.thumb || item.meta_thumb,
+    };
+  });
+}
+
+async function enrichEpisodeMetaForCurrentFolder(folderPath, sourceId, reqSeq) {
+  if (!folderPath) return;
+  const source = normalizeSourceId(sourceId);
+  const cacheKey = `${source}:${folderPath}`;
+
+  let metaList = state.episodeMetaCache.get(cacheKey);
+  if (!metaList) {
+    const params = new URLSearchParams({
+      path: folderPath,
+      source_id: source,
+    });
+    const data = await gdsFetch(`episode_meta?${params.toString()}`);
+    if (!data || data.ret !== "success") return;
+    metaList = data.list || [];
+    state.episodeMetaCache.set(cacheKey, metaList);
+  }
+
+  if (reqSeq !== state.episodeMetaReqSeq) return; // stale response guard
+  applyEpisodeMetaToGrid(metaList);
 }
 
 async function applyNativeQualityProfile(profile, silent = false) {
@@ -170,15 +356,16 @@ async function recreateNativePlayerAfterResize(reason = "fullscreen") {
     console.error(`[NATIVE-RECREATE] failed (${reason})`, err);
   } finally {
     state.nativeRecreating = false;
+    const releaseDelay = String(reason).includes("fullscreen") ? 420 : 300;
     if (ui.premiumOsc) {
       setTimeout(() => {
-        if (state.isNativeActive && !state.nativeRecreating) {
+        if (state.isNativeActive && !state.nativeRecreating && !state.nativeFullscreenTransition) {
           ui.premiumOsc.classList.remove("hidden");
         }
         setNativeTransitionMask(false);
-      }, 250);
+      }, releaseDelay);
     } else {
-      setTimeout(() => setNativeTransitionMask(false), 250);
+      setTimeout(() => setNativeTransitionMask(false), releaseDelay);
     }
   }
 }
@@ -187,6 +374,15 @@ function setNativeTransitionMask(active) {
   document.body.classList.toggle("native-recreate-active", !!active);
   document.documentElement.classList.toggle("native-recreate-active", !!active);
   if (ui.premiumOsc && active) ui.premiumOsc.classList.add("hidden");
+}
+
+async function prefitNativeContainerForFullscreen(invoke, targetFs) {
+  if (!invoke || !state.isNativeActive) return;
+  const settleDelays = targetFs ? [0, 90, 190] : [0, 70, 150];
+  for (const delay of settleDelays) {
+    if (delay > 0) await new Promise((r) => setTimeout(r, delay));
+    await invoke("resize_native_player", {}).catch(() => {});
+  }
 }
 
 // [NEW] Shared logic for checking/selecting subs and updating badge with retry
@@ -663,7 +859,7 @@ async function gdsFetch(endpoint, options = {}) {
   const separator = url.includes("?") ? "&" : "?";
   const finalUrl = `${url}${separator}apikey=${state.apiKey}`;
 
-  console.log(`[GDS-API] Calling (${method}): ${url}`);
+  dlog(`[GDS-API] Calling (${method}): ${url}`);
 
   // Tauri HTTP Plugin Logic
   const tauriHttp =
@@ -679,31 +875,32 @@ async function gdsFetch(endpoint, options = {}) {
       method,
       headers: options.headers || {},
       body: options.body,
+      signal: options.signal,
     };
 
     // 만약 tauriPlugin이 있다면 그것을 먼저 시도
     if (tauriPlugin && tauriPlugin.fetch) {
       try {
-        console.log(`[GDS-API] Trying Tauri Plugin (${method})...`);
+        dlog(`[GDS-API] Trying Tauri Plugin (${method})...`);
         const resp = await tauriPlugin.fetch(finalUrl, fetchOptions);
         const data = await resp.json();
-        console.log(`[GDS-API] Tauri Plugin Success:`, data);
+        dlog(`[GDS-API] Tauri Plugin Success:`, data);
         return data;
       } catch (perr) {
-        console.warn(
+        dwarn(
           "[GDS-API] Tauri Plugin HTTP failed:",
           perr.message || perr,
         );
       }
     }
 
-    console.log(`[GDS-API] Falling back to Browser Fetch (${method})...`);
+    dlog(`[GDS-API] Falling back to Browser Fetch (${method})...`);
     const response = await fetch(finalUrl, fetchOptions);
     if (!response.ok) {
       throw new Error(`HTTP Error: ${response.status} ${response.statusText}`);
     }
     const data = await response.json();
-    console.log(`[GDS-API] Success (${method}):`, endpoint);
+    dlog(`[GDS-API] Success (${method}):`, endpoint);
     return data;
   } catch (e) {
     console.error("[GDS-API] Fetch Error:", e);
@@ -738,6 +935,8 @@ async function loadLibrary(forceRefresh = false, isAppend = false) {
   const grid = ui.grid;
   const heroSection = ui.heroSection;
   if (!grid) return;
+  const freshRequestId = !isAppend ? ++state.freshRequestSeq : state.freshRequestSeq;
+  const isStaleFreshRequest = () => !isAppend && freshRequestId !== state.freshRequestSeq;
 
   if (!isAppend) showLoader();
 
@@ -751,9 +950,19 @@ async function loadLibrary(forceRefresh = false, isAppend = false) {
     state.offset = 0;
     state.hasMore = true;
     state.isLoadingMore = false;
-    state.library = []; // Clear current library state reference
+    // Keep previous library visible during fetch to reduce flash/flicker.
     state.seenPaths.clear(); // Reset deduplication set
     state.isFirstFreshLoadDone = false;
+    state.appendStallCount = 0;
+    state.terminalProbeDone = false;
+    state.lastAppendRequestAt = 0;
+    state.scrollLoadArmed = false;
+    state.autoFillTriggered = false;
+    state.episodeMetaReqSeq += 1; // invalidate pending episode-meta updates
+    if (state.freshAbortController) {
+      try { state.freshAbortController.abort(); } catch (_) {}
+    }
+    state.freshAbortController = new AbortController();
   } else {
     if (!state.hasMore || state.isLoadingMore || !state.isFirstFreshLoadDone) return;
     state.isLoadingMore = true;
@@ -799,11 +1008,16 @@ async function loadLibrary(forceRefresh = false, isAppend = false) {
     }
   } */  
   if (!isAppend) {
-    // Show skeletons immediately (even if cache exists, we want to look fresh)
+    // Show skeletons only on first paint or explicit force-refresh.
+    // For normal category/folder transitions, keep previous cards until fresh payload arrives.
+    const shouldShowSkeleton =
+      forceRefresh || !state.isFirstFreshLoadDone || state.library.length === 0 || grid.children.length === 0;
+    if (shouldShowSkeleton) {
     grid.innerHTML = Array(6)
       .fill('<div class="card skeleton"></div>')
       .join("");
-    if (heroSection) heroSection.style.display = "none";
+      if (heroSection) heroSection.style.display = "none";
+    }
   }
 
 
@@ -817,13 +1031,16 @@ async function loadLibrary(forceRefresh = false, isAppend = false) {
       limit: state.limit.toString(),
       offset: actualOffset.toString(),
       sort_by: state.sortBy,
-      sort_order: state.sortOrder
+      sort_order: state.sortOrder,
+      source_id: String(state.sourceId ?? 0),
     };
+    const requestSignal = !isAppend ? state.freshAbortController?.signal : undefined;
 
-    console.log(`[LOAD] Fetching: isAppend=${isAppend}, offset=${actualOffset}, category=${state.category}`);
+      dlog(`[LOAD] Fetching: isAppend=${isAppend}, offset=${actualOffset}, category=${state.category}`);
 
     // FETCH LOGIC
     let currentList = [];
+    let serverBatchSize = 0;
 
     // [OTT HUB] Logic Refinement: Hub Mode vs Folder Mode
     const isHubRoot = ["VIDEO/국내TV", "VIDEO/국내TV/드라마", "VIDEO/국내TV/예능", "VIDEO/해외TV", "VIDEO/영화"].some(p => state.currentPath && (state.currentPath === p || state.currentPath.startsWith(p + "/"))) && (state.pathStack.length <= 1);
@@ -838,20 +1055,21 @@ async function loadLibrary(forceRefresh = false, isAppend = false) {
         path: state.currentPath,
         recursive: "true",
         is_dir: "true",
-        has_metadata: "true", // [NEW] Server-side filtering for performance
         limit: "100",          // [FIX] No longer need 1000
         ...commonParams 
       });
       
-      data = await gdsFetch(`search?${params.toString()}`);
+      data = await gdsFetch(`search?${params.toString()}`, { signal: requestSignal });
+      if (isStaleFreshRequest()) return;
       if (data.ret === "success") {
         const rawList = data.data || data.list || data.items || [];
+        serverBatchSize = rawList.length;
         
         // [SEASON FILTER] Hide subfolders like "Season 1" from the main hub
         const seasonRegex = /Season|시즌|S\d+/i;
         currentList = rawList.filter(item => {
-          // Rule 1: Must be a directory with metadata
-          if (!item.is_dir || !item.meta_id) return false;
+          // Rule 1: Must be a directory
+          if (!item.is_dir) return false;
           // Rule 2: Exclude index folders (already handled by has_metadata but double check)
           if (item.name.length <= 2 && !item.meta_poster) return false; 
           // Rule 3: Exclude Season folders
@@ -872,9 +1090,11 @@ async function loadLibrary(forceRefresh = false, isAppend = false) {
         ...commonParams 
       });
       
-      data = await gdsFetch(`list?${params.toString()}`);
+      data = await gdsFetch(`list?${params.toString()}`, { signal: requestSignal });
+      if (isStaleFreshRequest()) return;
       if (data.ret === "success") {
         currentList = data.data || data.items || data.list || [];
+        serverBatchSize = currentList.length;
         console.log(`[OTT-HUB] Folder items: ${currentList.length}`);
       }
     } else if (isFolderCategory && isAtRoot && !state.query) {
@@ -883,14 +1103,15 @@ async function loadLibrary(forceRefresh = false, isAppend = false) {
         query: "",
         is_dir: "true",
         recursive: "true",
-        has_metadata: "true", // [NEW] Discovery optimization
         ...commonParams
       });
       // [FIXED] FlashPlex is VIDEO-only app
       params.append("category", state.category || "tv_show,movie,animation");
-      data = await gdsFetch(`search?${params.toString()}`);
+      data = await gdsFetch(`search?${params.toString()}`, { signal: requestSignal });
+      if (isStaleFreshRequest()) return;
 
       const rawList = data.list || data.data || [];
+      serverBatchSize = rawList.length;
       
       const seasonRegex = /Season|시즌|S\d+/i;
       const excludedRoots = ['READING', 'DATA', 'MUSIC', '책', '만화', 'YES24 북클럽'];
@@ -899,7 +1120,7 @@ async function loadLibrary(forceRefresh = false, isAppend = false) {
           const nameUpper = (i.name || "").toUpperCase();
           if (excludedRoots.includes(nameUpper)) return false;
           if (seasonRegex.test(i.name)) return false; // Hide seasons in hub
-          return i.is_dir && i.meta_id; // Standard OTT check
+          return i.is_dir;
       });
 
       if (!isAppend) {
@@ -919,15 +1140,17 @@ async function loadLibrary(forceRefresh = false, isAppend = false) {
       });
       // [FIXED] FlashPlex is VIDEO-only app
       params.append("category", state.category || "tv_show,movie,animation");
-      data = await gdsFetch(`search?${params.toString()}`);
+      data = await gdsFetch(`search?${params.toString()}`, { signal: requestSignal });
+      if (isStaleFreshRequest()) return;
       if (data.ret === "success") {
         currentList = data.list || data.data || [];
+        serverBatchSize = currentList.length;
       }
     }
 
     if (data && data.ret === "success") {
       // [META-DEBUG] Quick visibility check: does server actually return meta fields?
-      if (!isAppend && state.currentPath) {
+      if (!isAppend && state.currentPath && DEBUG_LOG) {
         const pathParts = String(state.currentPath).split("/").filter(Boolean);
         const parentPath =
           (state.pathStack && state.pathStack.length > 1
@@ -946,29 +1169,51 @@ async function loadLibrary(forceRefresh = false, isAppend = false) {
           has_meta_poster: !!it?.meta_poster,
           has_poster: !!it?.poster,
         }));
-        console.log("[META-DEBUG] path:", state.currentPath);
+        dlog("[META-DEBUG] path:", state.currentPath);
         if (parentPath) {
-          console.log("[META-DEBUG] parentPath:", parentPath);
-          console.log("[META-DEBUG] parentMeta(cache):", {
+          dlog("[META-DEBUG] parentPath:", parentPath);
+          dlog("[META-DEBUG] parentMeta(cache):", {
             title: parentMeta?.title || parentMeta?.meta_title || parentMeta?.name || "",
             has_meta_poster: !!parentMeta?.meta_poster,
             has_poster: !!parentMeta?.poster,
             meta_summary_len: (parentMeta?.meta_summary || "").length,
           });
         } else {
-          console.log("[META-DEBUG] parentPath: <none>");
+          dlog("[META-DEBUG] parentPath: <none>");
         }
-        console.table(metaProbe);
+        dlog("[META-DEBUG] probe:", metaProbe);
       }
 
       state.isLoadingMore = false;
       let finalItems = currentList;
 
-      // Pagination Check
-      if (finalItems.length < state.limit) {
-        state.hasMore = false;
+      // Pagination check should use server batch size before client-side filtering/dedup.
+      const effectiveBatchSize = Number.isFinite(serverBatchSize) && serverBatchSize >= 0
+        ? serverBatchSize
+        : currentList.length;
+      const totalHint = Number(data?.count ?? data?.total ?? data?.total_count);
+      const hasMoreHint = typeof data?.has_more === "boolean" ? data.has_more : null;
+      // Many GDS endpoints behave as page-window offsets (0,100,200...),
+      // so advance by requested limit rather than returned batch length.
+      const nextOffset = actualOffset + state.limit;
+
+      if (hasMoreHint !== null) {
+        // Most reliable when server provides explicit paging flag.
+        state.hasMore = hasMoreHint;
+      } else {
+        // API `count` is inconsistent across endpoints (sometimes page-size, sometimes total).
+        // Keep paging on fixed windows until an empty page is returned.
+        state.hasMore = effectiveBatchSize > 0;
       }
-      state.offset += finalItems.length;
+      if (!state.hasMore && effectiveBatchSize > 0 && !state.terminalProbeDone) {
+        state.hasMore = true;
+        state.terminalProbeDone = true;
+        dlog("[PAGING] Terminal probe enabled (one extra page check).");
+      }
+      state.offset = nextOffset;
+      dlog(
+        `[PAGING] offset=${actualOffset} batch=${effectiveBatchSize} next=${state.offset} total=${Number.isFinite(totalHint) ? totalHint : "n/a"} hasMore=${state.hasMore}`,
+      );
 
       // Update State Library
       if (isAppend) {
@@ -998,7 +1243,7 @@ async function loadLibrary(forceRefresh = false, isAppend = false) {
         const key = getDedupKey(i, isCatRoot);
 
         if (state.seenPaths.has(key)) {
-            console.log(`[DEDUP] Grouping/Skipping duplicate: ${key} (Name: ${i.name})`);
+            dlog(`[DEDUP] Grouping/Skipping duplicate: ${key} (Name: ${i.name})`);
             return false;
         }
         state.seenPaths.add(key);
@@ -1072,22 +1317,65 @@ async function loadLibrary(forceRefresh = false, isAppend = false) {
         }
       }
 
-      renderFolderContextPanel(displayItems);
+      if (!isAppend) renderFolderContextPanel(displayItems);
       renderGrid(grid, displayItems, isFolderCategory, isAppend);
+
+      // Folder view: enrich episode cards from show.yaml metadata (progressive, no full rerender).
+      if (!isAppend && state.currentPath) {
+        const reqSeq = ++state.episodeMetaReqSeq;
+        const targetPath = state.currentPath;
+        enrichEpisodeMetaForCurrentFolder(targetPath, state.sourceId, reqSeq).catch((e) => {
+          dlog("[EP_META] enrich skipped:", e?.message || e);
+        });
+      }
 
       // [FIX] Ensure scroll is at top after rendering first page
       if (!isAppend && state.currentView === "library") {
         const container = document.querySelector(".content-container");
         if (container) container.scrollTop = 0;
       }
+
+      // If first batch doesn't fill viewport, trigger one append automatically.
+      if (!isAppend && state.hasMore && state.isFirstFreshLoadDone) {
+        const container = document.querySelector(".content-container");
+        if (container && !state.autoFillTriggered && container.scrollHeight <= container.clientHeight + 120) {
+          dlog(`[SCROLL:auto-fill] Loading more items... offset=${state.offset}`);
+          setTimeout(() => maybeLoadMore("auto-fill"), 120);
+        }
+      }
+
+      if (isAppend) {
+        const appendedCount = displayItems.length;
+        if (appendedCount === 0 && state.hasMore) {
+          state.appendStallCount += 1;
+          if (state.appendStallCount <= 2) {
+            dlog(
+              `[PAGING:stall] Empty append batch after filtering/dedup. retry=${state.appendStallCount} offset=${state.offset}`,
+            );
+            // Avoid immediate retry storms; user scroll/sentinel will trigger next fetch.
+            state.lastAppendRequestAt = Date.now();
+          } else {
+            dwarn("[PAGING:stall] Reached retry cap; stopping auto-append retries.");
+            state.hasMore = false;
+          }
+        } else {
+          state.appendStallCount = 0;
+        }
+
+      }
     } else {
       throw new Error(data ? data.ret : "Fetch failed");
     }
   } catch (err) {
+    if (err?.name === "AbortError") {
+      console.log("[LOAD] Request aborted (superseded by newer request).");
+      return;
+    }
     console.error("[LOAD] Fetch Error:", err);
     ui.statusDot.className = "status-dot error";
     renderFolderContextPanel([]);
   } finally {
+    if (isStaleFreshRequest()) return;
     hideLoader();
     state.isLoadingMore = false;
     state.isFreshLoading = false;
@@ -1281,7 +1569,7 @@ function renderFolderContextPanel(items = []) {
     firstFolder?.meta_poster || firstFolder?.poster ||
     firstMedia?.meta_poster || firstMedia?.poster || (
     mediaPath
-      ? `${state.serverUrl}/gds_dviewer/normal/thumbnail?bpath=${toUrlSafeBase64(mediaPath)}&source_id=${firstMedia?.source_id || 0}&w=960&apikey=${state.apiKey}`
+      ? `${state.serverUrl}/gds_dviewer/normal/thumbnail?bpath=${toUrlSafeBase64(mediaPath)}&source_id=${normalizeSourceId(firstMedia?.source_id)}&w=960&apikey=${state.apiKey}`
       : `${state.serverUrl}/gds_dviewer/static/img/no_poster.png`
   );
   const summary = (
@@ -1357,19 +1645,36 @@ function setupSortUI() {
 }
 
 function setupInfiniteScroll() {
-  const container = document.querySelector(".content-container"); // Verify this selector in index.html, usually body or main wrapper
-  if (!container) return;
+  const container = document.querySelector(".content-container");
+  if (!container || container.dataset.infiniteBound === "1") return;
+  let scrollTicking = false;
 
-  container.addEventListener('scroll', () => {
-    const { scrollTop, scrollHeight, clientHeight } = container;
-    // Check if near bottom (300px threshold)
+  const checkAndLoadMore = (scrollTop, scrollHeight, clientHeight, source) => {
+    // Arm infinite loading after any real scroll event on the container.
+    state.scrollLoadArmed = true;
     if (scrollHeight - scrollTop <= clientHeight + 300) {
-      if (state.hasMore && !state.isLoadingMore && state.isFirstFreshLoadDone) {
-        console.log(`[SCROLL] Loading more items... offset=${state.offset}`);
-        loadLibrary(false, true); // forceRefresh=false, isAppend=true
-      }
+      maybeLoadMore(source);
     }
-  });
+  };
+
+  container.dataset.infiniteBound = "1";
+  // Arm on common user interactions even when scrollTop 변화가 작을 때를 대비.
+  container.addEventListener("wheel", () => { state.scrollLoadArmed = true; }, { passive: true });
+  container.addEventListener("touchmove", () => { state.scrollLoadArmed = true; }, { passive: true });
+  container.addEventListener("keydown", () => { state.scrollLoadArmed = true; });
+  container.addEventListener(
+    "scroll",
+    () => {
+      if (scrollTicking) return;
+      scrollTicking = true;
+      requestAnimationFrame(() => {
+        const { scrollTop, scrollHeight, clientHeight } = container;
+        checkAndLoadMore(scrollTop, scrollHeight, clientHeight, "container");
+        scrollTicking = false;
+      });
+    },
+    { passive: true }
+  );
 }
 
 function renderGrid(container, items, isFolderCategory = false, isAppend = false) {
@@ -1417,6 +1722,8 @@ function renderGrid(container, items, isFolderCategory = false, isAppend = false
   };
 
   const newCards = [];
+  const fragment = document.createDocumentFragment();
+  const adaptiveThumbWidth = getAdaptiveThumbnailWidth(container);
   items.forEach((item, index) => {
     // [NEW] Robust Deduplication check in the grid itself
     // Key MUST match the logic in loadLibrary deduplication
@@ -1424,7 +1731,7 @@ function renderGrid(container, items, isFolderCategory = false, isAppend = false
     const itemKey = getDedupKey(item, isCatRoot);
 
     if (isAppend && existingKeys.has(itemKey)) {
-        console.warn("[GRID] skipping duplicate item:", itemKey);
+        dwarn("[GRID] skipping duplicate item:", itemKey);
         return; 
     }
     if (isAppend) existingKeys.add(itemKey);
@@ -1446,13 +1753,11 @@ function renderGrid(container, items, isFolderCategory = false, isAppend = false
         poster: item.poster || "",
         year: item.year || item.album_info?.release_date || "",
         album_info: item.album_info || null,
-        source_id: item.source_id || 0,
+        source_id: Number(normalizeSourceId(item.source_id)),
       });
     }
     const baseCardClass = `card atv-card ${isFolder ? "is-folder" : "is-file"}`;
-    card.className = isAppend
-      ? `${baseCardClass} batch-hidden`
-      : `${baseCardClass} card-loading`;
+    card.className = isAppend ? baseCardClass : `${baseCardClass} card-loading`;
 
     // [MOD] Filename Cleaning for Premium Look
     let displayTitle = item.title || item.name;
@@ -1499,10 +1804,10 @@ function renderGrid(container, items, isFolderCategory = false, isAppend = false
         const category = item.category || "other";
         if (["video", "animation", "music_video"].includes(category)) {
           const bpath = toUrlSafeBase64(item.path || "");
-          poster = `${state.serverUrl}/gds_dviewer/normal/thumbnail?bpath=${bpath}&source_id=${item.source_id || 0}&w=400&apikey=${state.apiKey}`;
+          poster = `${state.serverUrl}/gds_dviewer/normal/thumbnail?bpath=${bpath}&source_id=${normalizeSourceId(item.source_id)}&w=${adaptiveThumbWidth}&apikey=${state.apiKey}`;
         } else if (item.category === "audio") {
           const bpath = toUrlSafeBase64(item.path || "");
-          poster = `${state.serverUrl}/gds_dviewer/normal/album_art?bpath=${bpath}&source_id=${item.source_id || 0}&apikey=${state.apiKey}`;
+          poster = `${state.serverUrl}/gds_dviewer/normal/album_art?bpath=${bpath}&source_id=${normalizeSourceId(item.source_id)}&apikey=${state.apiKey}`;
         }
       }
     }
@@ -1602,61 +1907,58 @@ function renderGrid(container, items, isFolderCategory = false, isAppend = false
     } else {
       card.addEventListener("click", () => playVideo(item));
     }
-    container.appendChild(card);
+    fragment.appendChild(card);
     newCards.push(card);
   });
+  if (newCards.length > 0) container.appendChild(fragment);
 
   if (window.lucide) lucide.createIcons();
 
   // [BATCH REVEAL + PLACEHOLDER] Keep cards visible first, then reveal viewport images together.
   if (newCards.length > 0) {
-    const revealBatch = () => {
-      newCards.forEach((card) => card.classList.remove("batch-hidden"));
-    };
+    if (!isAppend) {
+      requestAnimationFrame(() => {
+        const contentContainer = document.querySelector(".content-container");
+        const rootRect = contentContainer
+          ? contentContainer.getBoundingClientRect()
+          : { top: 0, bottom: window.innerHeight || 900 };
+        const viewportBuffer = 80;
 
-    if (isAppend) {
-      requestAnimationFrame(revealBatch);
-    } else {
-      const contentContainer = document.querySelector(".content-container");
-      const gridStyle = window.getComputedStyle(container);
-      const colsRaw = (gridStyle.gridTemplateColumns || "").trim();
-      const colCount = Math.max(
-        1,
-        colsRaw && colsRaw !== "none"
-          ? colsRaw.split(/\s+/).length
-          : 1,
-      );
+        const cardsWithImages = newCards
+          .map((card) => ({ card, img: card.querySelector("img.card-poster") }))
+          .filter(({ img }) => !!img);
+        const cardsWithoutImage = newCards.filter((card) => !card.querySelector("img.card-poster"));
 
-      const firstCard = newCards[0];
-      const cardHeight =
-        (firstCard && firstCard.getBoundingClientRect().height) || 320;
-      const viewportHeight =
-        (contentContainer && contentContainer.clientHeight) || window.innerHeight || 800;
-      const estimatedRows = Math.max(2, Math.ceil(viewportHeight / Math.max(cardHeight, 1)) + 1);
-      const preloadCount = Math.min(newCards.length, colCount * estimatedRows);
-      const cardsWithImages = newCards
-        .map((card) => ({ card, img: card.querySelector("img.card-poster") }))
-        .filter(({ img }) => !!img);
+        // Non-image cards should not stay in loading state.
+        cardsWithoutImage.forEach((card) => card.classList.remove("card-loading"));
 
-      const batchTargets = cardsWithImages.slice(0, preloadCount);
-      const deferredTargets = cardsWithImages.slice(preloadCount);
+        const batchTargets = [];
+        const deferredTargets = [];
+        cardsWithImages.forEach(({ card, img }) => {
+          const r = card.getBoundingClientRect();
+          const isInViewportBand =
+            r.bottom >= rootRect.top - viewportBuffer &&
+            r.top <= rootRect.bottom + viewportBuffer;
+          if (isInViewportBand) batchTargets.push({ card, img });
+          else deferredTargets.push({ card, img });
+        });
 
-      // Below-the-fold cards can reveal individually when each image is ready.
-      deferredTargets.forEach(({ card, img }) => {
-        if (img.complete) {
-          card.classList.remove("card-loading");
+        // Below-the-fold cards can reveal individually when each image is ready.
+        deferredTargets.forEach(({ card, img }) => {
+          if (img.complete) {
+            card.classList.remove("card-loading");
+            return;
+          }
+          const revealOne = () => card.classList.remove("card-loading");
+          img.addEventListener("load", revealOne, { once: true });
+          img.addEventListener("error", revealOne, { once: true });
+        });
+
+        if (batchTargets.length === 0) {
+          newCards.forEach((card) => card.classList.remove("card-loading"));
           return;
         }
-        const revealOne = () => card.classList.remove("card-loading");
-        img.addEventListener("load", revealOne, { once: true });
-        img.addEventListener("error", revealOne, { once: true });
-      });
 
-      if (batchTargets.length === 0) {
-        requestAnimationFrame(() => {
-          newCards.forEach((card) => card.classList.remove("card-loading"));
-        });
-      } else {
         const waitForImgs = batchTargets.map(({ img }) => {
           const waitDecode = () => {
             if (typeof img.decode === "function") {
@@ -1665,9 +1967,7 @@ function renderGrid(container, items, isFolderCategory = false, isAppend = false
             return Promise.resolve();
           };
 
-          if (img.complete) {
-            return waitDecode();
-          }
+          if (img.complete) return waitDecode();
 
           return new Promise((resolve) => {
             const onDone = () => waitDecode().finally(resolve);
@@ -1679,12 +1979,10 @@ function renderGrid(container, items, isFolderCategory = false, isAppend = false
         Promise.race([
           Promise.all(waitForImgs),
           new Promise((resolve) => setTimeout(resolve, 3800)),
-        ]).then(() =>
-          requestAnimationFrame(() => {
-            batchTargets.forEach(({ card }) => card.classList.remove("card-loading"));
-          }),
-        );
-      }
+        ]).then(() => {
+          batchTargets.forEach(({ card }) => card.classList.remove("card-loading"));
+        });
+      });
     }
   }
 
@@ -1696,6 +1994,9 @@ function renderGrid(container, items, isFolderCategory = false, isAppend = false
     const firstCard = container.querySelector(".card");
     if (firstCard) firstCard.focus({ preventScroll: true });
   }
+
+  // Keep bottom sentinel active even when scroll events are inconsistent.
+  ensureInfiniteSentinel(container);
 }
 
 // Search Logic
@@ -2362,7 +2663,7 @@ function playVideo(item) {
     if (window.tlog) window.tlog("[PLAY] Folder detected, resolving first video...");
     const bpath = toUrlSafeBase64(item.path || "");
     // [FIX] Use existing list_directory API instead of non-existent 'playlist'
-    const endpoint = `explorer/list?bpath=${bpath}&source_id=${item.source_id || 0}&limit=50&apikey=${state.apiKey}`;
+    const endpoint = `explorer/list?bpath=${bpath}&source_id=${normalizeSourceId(item.source_id)}&limit=50&apikey=${state.apiKey}`;
     
     if (window.tlog) window.tlog(`[PLAY] Fetching folder contents: ${endpoint}`);
     
@@ -2462,8 +2763,8 @@ function playVideo(item) {
   const bpath = toUrlSafeBase64(cleanPath);
   const encodedPath = encodeURIComponent(cleanPath);
 
-  let streamUrl = `${state.serverUrl}/gds_dviewer/normal/stream?bpath=${bpath}&source_id=${item.source_id || 0}&apikey=${state.apiKey}`;
-  const subtitleUrl = bpath ? `${state.serverUrl}/gds_dviewer/normal/external_subtitle?bpath=${bpath}&source_id=${item.source_id || 0}&apikey=${state.apiKey}` : null;
+  let streamUrl = `${state.serverUrl}/gds_dviewer/normal/stream?bpath=${bpath}&source_id=${normalizeSourceId(item.source_id)}&apikey=${state.apiKey}`;
+  const subtitleUrl = bpath ? `${state.serverUrl}/gds_dviewer/normal/external_subtitle?bpath=${bpath}&source_id=${normalizeSourceId(item.source_id)}&apikey=${state.apiKey}` : null;
 
   const extension = (cleanPath || "").split(".").pop().toLowerCase();
   console.log("[PLAY] Extension Detected:", extension);
@@ -2545,7 +2846,7 @@ function playVideo(item) {
             checkAndSelectSubtitles();
             
             // [NEW] Use native_log for terminal visibility
-            const videoInfoUrl = `${state.serverUrl}/gds_dviewer/normal/get_video_info?bpath=${bpath}&source_id=${item.source_id || 0}&apikey=${state.apiKey}`;
+            const videoInfoUrl = `${state.serverUrl}/gds_dviewer/normal/get_video_info?bpath=${bpath}&source_id=${normalizeSourceId(item.source_id)}&apikey=${state.apiKey}`;
             if (window.tlog) window.tlog(`[SUB] Fetching video info: ${videoInfoUrl}`);
             
             fetch(videoInfoUrl)
@@ -2648,7 +2949,7 @@ function startWebPlayback(item, streamUrl, isAudio = false) {
     const bpath = toUrlSafeBase64(item.path || "");
     const albumArtUrl =
       item.meta_poster ||
-      `${state.serverUrl}/gds_dviewer/normal/album_art?bpath=${bpath}&source_id=${item.source_id || 0}&apikey=${state.apiKey}`;
+      `${state.serverUrl}/gds_dviewer/normal/album_art?bpath=${bpath}&source_id=${normalizeSourceId(item.source_id)}&apikey=${state.apiKey}`;
     ui.audioPoster.src = albumArtUrl;
     ui.playerBg.style.backgroundImage = `url(${albumArtUrl})`;
     ui.playerBg.style.display = "block";
@@ -2659,7 +2960,7 @@ function startWebPlayback(item, streamUrl, isAudio = false) {
 
     // Add Subtitles
     const bpath = toUrlSafeBase64(item.path || "");
-    const subtitleUrl = `${state.serverUrl}/gds_dviewer/normal/external_subtitle?bpath=${bpath}&source_id=${item.source_id || 0}&apikey=${state.apiKey}`;
+    const subtitleUrl = `${state.serverUrl}/gds_dviewer/normal/external_subtitle?bpath=${bpath}&source_id=${normalizeSourceId(item.source_id)}&apikey=${state.apiKey}`;
     const track = document.createElement("track");
     Object.assign(track, {
       kind: "subtitles",
@@ -2757,7 +3058,7 @@ async function initHeroCarousel() {
       sort_order: "desc",
       recursive: "true",
       has_metadata: "true", 
-      source_id: "-1", 
+      source_id: String(state.sourceId ?? 0),
       apikey: state.apiKey
     });
 
@@ -2833,7 +3134,7 @@ function renderHeroSlides(items, container) {
         imgUrl = `${state.serverUrl}/gds_dviewer/normal/proxy?url=${encodeURIComponent(rawImgUrl)}&apikey=${state.apiKey}`;
     } else {
         const bpath = toUrlSafeBase64(item.path || "");
-        imgUrl = `${state.serverUrl}/gds_dviewer/normal/thumbnail?bpath=${bpath}&source_id=${item.source_id || 0}&w=1080&apikey=${state.apiKey}`;
+        imgUrl = `${state.serverUrl}/gds_dviewer/normal/thumbnail?bpath=${bpath}&source_id=${normalizeSourceId(item.source_id)}&w=1080&apikey=${state.apiKey}`;
     }
     slide.style.background = `center center / cover no-repeat url("${imgUrl}")`;
 
@@ -2845,7 +3146,7 @@ function renderHeroSlides(items, container) {
 
     slide.innerHTML = `
       <img src="${imgUrl}" class="hero-img" alt="${displayTitle}"
-           onload="this.closest('.hero-slide').style.background='center center / cover no-repeat url(${imgUrl})'; console.log('[HERO] Image loaded: ${displayTitle}')"
+           onload="this.closest('.hero-slide').style.background='center center / cover no-repeat url(${imgUrl})'"
            onerror="console.error('[HERO] Image failed to load: ${displayTitle}'); this.src='${heroFallback}'; this.closest('.hero-slide').style.background='center center / cover no-repeat url(${heroFallback})'">
       <div class="hero-overlay"></div>
       <div class="hero-content">
@@ -3283,27 +3584,26 @@ function setupPremiumOSC() {
 
   bind(ui.btnOscFullscreen, "Fullscreen", async (e) => {
     e.stopPropagation();
+    if (state.nativeFullscreenTransition) return;
     const invoke = getTauriInvoke();
     const applyWindowFullscreenClass = (isFs) => {
       document.body.classList.toggle("window-fullscreen", !!isFs);
       document.documentElement.classList.toggle("window-fullscreen", !!isFs);
     };
-    const scheduleNativeResize = () => {
-      if (!state.isNativeActive || !invoke) return;
-      [0, 120, 450].forEach((delay) => {
-        setTimeout(() => {
-          invoke("resize_native_player", {}).catch((err) => {
-            console.error("[PLAYER] resize_native_player failed:", err);
-          });
-        }, delay);
-      });
-    };
     try {
+      state.nativeFullscreenTransition = true;
       // [FIX] Use explicit fullscreen state set (more reliable than toggle on macOS).
       if (invoke) {
         setNativeTransitionMask(true);
         const currentFs = await invoke("native_get_fullscreen").catch(() => false);
         const targetFs = !currentFs;
+
+        // Pre-size once before parent fullscreen transition to reduce first jump.
+        if (state.isNativeActive) {
+          await invoke("resize_native_player", {}).catch(() => {});
+          await new Promise((r) => setTimeout(r, 70));
+        }
+
         await invoke("native_set_fullscreen", { fullscreen: targetFs });
         await new Promise((r) => setTimeout(r, 180));
 
@@ -3315,10 +3615,11 @@ function setupPremiumOSC() {
         applyWindowFullscreenClass(targetFs);
 
         console.log("[PLAYER] Native Fullscreen Set:", targetFs);
-        scheduleNativeResize();
-        // Single deterministic flow: after parent fullscreen settles, recreate once.
+        // 1) Pre-fit embedded container on the new parent bounds.
+        await prefitNativeContainerForFullscreen(invoke, targetFs);
+        // 2) Recreate once after bounds are stabilized.
         if (state.isNativeActive) {
-          await new Promise((r) => setTimeout(r, targetFs ? 220 : 140));
+          await new Promise((r) => setTimeout(r, targetFs ? 140 : 120));
           await recreateNativePlayerAfterResize(targetFs ? "fullscreen-enter" : "fullscreen-exit");
         } else {
           setTimeout(() => setNativeTransitionMask(false), 160);
@@ -3333,6 +3634,11 @@ function setupPremiumOSC() {
       if (!document.fullscreenElement) document.documentElement.requestFullscreen().catch(console.error);
       else if (document.exitFullscreen) document.exitFullscreen();
       applyWindowFullscreenClass(!!document.fullscreenElement);
+    } finally {
+      // Keep a short guard window to avoid accidental double-toggle during transition settle.
+      setTimeout(() => {
+        state.nativeFullscreenTransition = false;
+      }, 260);
     }
   });
 
@@ -3346,9 +3652,13 @@ function setupPremiumOSC() {
     const syncNativeResize = () => {
       const inv = getTauriInvoke();
       if (!state.isNativeActive || !inv) return;
-      inv("resize_native_player", {}).catch((err) => {
-        console.error("[PLAYER] Resize sync failed:", err);
-      });
+      if (state.nativeRecreating || state.nativeFullscreenTransition) return;
+      if (nativeResizeDebounceTimer) clearTimeout(nativeResizeDebounceTimer);
+      nativeResizeDebounceTimer = setTimeout(() => {
+        inv("resize_native_player", {}).catch((err) => {
+          console.error("[PLAYER] Resize sync failed:", err);
+        });
+      }, 280);
     };
     const onNativeFullscreenChange = () => {
       syncNativeResize();
