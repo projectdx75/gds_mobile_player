@@ -19,10 +19,37 @@ FRAMEWORKS_DIR="$APP_PATH/Contents/Frameworks"
 mkdir -p "$FRAMEWORKS_DIR"
 
 # Find libmpv in homebrew
-LIBMPV_SOURCE="/opt/homebrew/opt/mpv/lib/libmpv.2.dylib"
+ARCH="$(uname -m)"
+if [ "$ARCH" = "x86_64" ]; then
+    CANDIDATES=(
+        "/usr/local/opt/mpv/lib/libmpv.2.dylib"
+        "/opt/homebrew/opt/mpv/lib/libmpv.2.dylib"
+    )
+else
+    CANDIDATES=(
+        "/opt/homebrew/opt/mpv/lib/libmpv.2.dylib"
+        "/usr/local/opt/mpv/lib/libmpv.2.dylib"
+    )
+fi
 
-if [ ! -f "$LIBMPV_SOURCE" ]; then
-    echo "[EMBED] ERROR: libmpv not found at $LIBMPV_SOURCE"
+if command -v brew >/dev/null 2>&1; then
+    BREW_PREFIX="$(brew --prefix mpv 2>/dev/null || true)"
+    if [ -n "$BREW_PREFIX" ]; then
+        CANDIDATES+=("$BREW_PREFIX/lib/libmpv.2.dylib")
+    fi
+fi
+
+LIBMPV_SOURCE=""
+for candidate in "${CANDIDATES[@]}"; do
+    if [ -f "$candidate" ]; then
+        LIBMPV_SOURCE="$candidate"
+        break
+    fi
+done
+
+if [ -z "$LIBMPV_SOURCE" ]; then
+    echo "[EMBED] ERROR: libmpv not found in expected paths:"
+    printf '  - %s\n' "${CANDIDATES[@]}"
     echo "[EMBED] Please install mpv using: brew install mpv"
     exit 1
 fi
@@ -42,7 +69,7 @@ cp "$LIBMPV_SOURCE" "$LIBMPV_DEST"
 echo "[EMBED] Copying dependencies..."
 
 # Get list of dependencies (excluding libmpv itself)
-DEPS=$(otool -L "$LIBMPV_SOURCE" | awk '/opt\/homebrew/ && !/libmpv/ {print $1}')
+DEPS=$(otool -L "$LIBMPV_SOURCE" | awk '!/libmpv/ && ($1 ~ /^\/opt\/homebrew\// || $1 ~ /^\/usr\/local\//) {print $1}')
 
 for dep in $DEPS; do
     if [ -f "$dep" ]; then
@@ -78,7 +105,7 @@ echo "[EMBED] Updating dylib references in $BINARY"
 
 # Change libmpv reference to use @executable_path
 install_name_tool -change \
-    "/opt/homebrew/opt/mpv/lib/libmpv.2.dylib" \
+    "$LIBMPV_SOURCE" \
     "@executable_path/../Frameworks/libmpv.2.dylib" \
     "$BINARY"
 

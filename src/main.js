@@ -47,6 +47,9 @@ const state = {
   episodeMetaReqSeq: 0,
   episodeMetaCache: new Map(),
   nativeFullscreenTransition: false,
+  nativeArch: "unknown",
+  fullscreenEnterRepairAttempted: false,
+  lastFullscreenToggleAt: 0,
 };
 
 // Platform Detection
@@ -146,6 +149,20 @@ function getTauriInvoke() {
     };
   }
   return invoke;
+}
+
+async function detectNativeArch() {
+  const invoke = getTauriInvoke();
+  if (!invoke) return;
+  try {
+    const arch = await invoke("native_get_arch");
+    if (typeof arch === "string" && arch.length > 0) {
+      state.nativeArch = arch;
+      console.log("[STARTUP] Native arch:", arch);
+    }
+  } catch (err) {
+    console.warn("[STARTUP] native_get_arch failed:", err);
+  }
 }
 
 function normalizeQualityProfile(profile) {
@@ -385,6 +402,61 @@ async function prefitNativeContainerForFullscreen(invoke, targetFs) {
   }
 }
 
+async function stabilizeNativeFullscreenResize(invoke, targetFs) {
+  if (!invoke || !state.isNativeActive) return;
+  // macOS fullscreen animation settles late on some Intel setups.
+  // Keep Intel very short to avoid visible bounce during transition.
+  const isIntel = state.nativeArch === "x86_64";
+  const settleDelays = isIntel
+    ? (targetFs ? [120, 280] : [80, 180])
+    : (targetFs ? [0, 130, 280, 460, 700, 980] : [0, 100, 220, 360, 560]);
+  for (const delay of settleDelays) {
+    if (delay > 0) await new Promise((r) => setTimeout(r, delay));
+    await invoke("resize_native_player", {}).catch(() => {});
+  }
+}
+
+async function waitForNativeFullscreenState(invoke, targetFs, timeoutMs = 1400) {
+  const start = Date.now();
+  while (Date.now() - start < timeoutMs) {
+    const current = await invoke("native_get_fullscreen").catch(() => null);
+    if (current === targetFs) return true;
+    await new Promise((r) => setTimeout(r, 80));
+  }
+  return false;
+}
+
+async function maybeRecreateOnFullscreenExitIntel(invoke) {
+  if (!invoke || !state.isNativeActive) return;
+  if (state.nativeArch !== "x86_64") return;
+  await new Promise((r) => setTimeout(r, 260));
+  const snap = await invoke("get_mpv_state").catch(() => null);
+  const osdW = Number(snap?.osd_width ?? -1);
+  const expectedW = Math.round((window.innerWidth || 0) * (window.devicePixelRatio || 1));
+  if (osdW > 0 && expectedW > 0 && Math.abs(osdW - expectedW) > 280) {
+    console.warn("[PLAYER] Intel fullscreen-exit osd mismatch -> recreate once", { osdW, expectedW });
+    await recreateNativePlayerAfterResize("fullscreen-exit-intel-fix");
+    await invoke("resize_native_player", {}).catch(() => {});
+  }
+}
+
+async function maybeRecreateOnFullscreenEnterIntel(invoke) {
+  if (!invoke || !state.isNativeActive) return;
+  if (state.nativeArch !== "x86_64") return;
+  if (state.fullscreenEnterRepairAttempted) return;
+  state.fullscreenEnterRepairAttempted = true;
+
+  await new Promise((r) => setTimeout(r, 320));
+  const snap = await invoke("get_mpv_state").catch(() => null);
+  const osdW = Number(snap?.osd_width ?? -1);
+  const expectedW = Math.round((window.innerWidth || 0) * (window.devicePixelRatio || 1));
+  if (osdW > 0 && expectedW > 0 && Math.abs(osdW - expectedW) > 420) {
+    console.warn("[PLAYER] Intel fullscreen-enter osd mismatch -> recreate once", { osdW, expectedW });
+    await recreateNativePlayerAfterResize("fullscreen-enter-intel-fix");
+    await invoke("resize_native_player", {}).catch(() => {});
+  }
+}
+
 // [NEW] Shared logic for checking/selecting subs and updating badge with retry
 async function checkAndSelectSubtitles(retries = 4) {
   const invoke = getTauriInvoke();
@@ -586,6 +658,7 @@ window.addEventListener("DOMContentLoaded", () => {
   }
 
   initElements();
+  detectNativeArch();
   if (window.lucide) lucide.createIcons();
 
   // Register robust global listeners
@@ -3531,6 +3604,8 @@ function setupPremiumOSC() {
   // Bind Buttons
   const bind = (el, name, fn) => {
     if (el) {
+      if (el.__flashplexOscBound) return;
+      el.__flashplexOscBound = true;
       console.log(`[INIT] Binding OSC button: ${name}`);
       el.addEventListener("click", (e) => {
         console.log(`[OSC-CLICK] ${name} clicked`);
@@ -3585,6 +3660,12 @@ function setupPremiumOSC() {
   bind(ui.btnOscFullscreen, "Fullscreen", async (e) => {
     e.stopPropagation();
     if (state.nativeFullscreenTransition) return;
+    const now = Date.now();
+    if (now - (state.lastFullscreenToggleAt || 0) < 1800) {
+      console.warn("[PLAYER] Fullscreen click ignored (cooldown)");
+      return;
+    }
+    state.lastFullscreenToggleAt = now;
     const invoke = getTauriInvoke();
     const applyWindowFullscreenClass = (isFs) => {
       document.body.classList.toggle("window-fullscreen", !!isFs);
@@ -3604,23 +3685,44 @@ function setupPremiumOSC() {
           await new Promise((r) => setTimeout(r, 70));
         }
 
-        await invoke("native_set_fullscreen", { fullscreen: targetFs });
-        await new Promise((r) => setTimeout(r, 180));
-
-        const afterFs = await invoke("native_get_fullscreen").catch(() => currentFs);
-        if (afterFs !== targetFs) {
-          console.warn("[PLAYER] Fullscreen first attempt mismatch. Retrying once...");
-          await invoke("native_set_fullscreen", { fullscreen: targetFs });
+        await invoke("native_set_fullscreen", { fullscreen: targetFs }).catch(() => {});
+        const reached = await waitForNativeFullscreenState(invoke, targetFs, 1500);
+        if (!reached) console.warn("[PLAYER] set_fullscreen timed out.");
+        const finalFs = await invoke("native_get_fullscreen").catch(() => currentFs);
+        applyWindowFullscreenClass(finalFs);
+        if (!reached || finalFs !== targetFs) {
+          console.warn("[PLAYER] Fullscreen state mismatch after request", { targetFs, finalFs });
         }
-        applyWindowFullscreenClass(targetFs);
+        // Embedded Intel path: keep mpv windowed and only resize container.
+        if (state.nativeArch === "x86_64") {
+          await invoke("native_set_mpv_fullscreen", { fullscreen: false }).catch(() => {});
+        } else {
+          await invoke("native_set_mpv_fullscreen", { fullscreen: !!finalFs }).catch(() => {});
+        }
+        await stabilizeNativeFullscreenResize(invoke, finalFs);
 
-        console.log("[PLAYER] Native Fullscreen Set:", targetFs);
+        console.log("[PLAYER] Native Fullscreen Set:", finalFs);
         // 1) Pre-fit embedded container on the new parent bounds.
-        await prefitNativeContainerForFullscreen(invoke, targetFs);
+        if (state.nativeArch !== "x86_64") {
+          await prefitNativeContainerForFullscreen(invoke, targetFs);
+        }
         // 2) Recreate once after bounds are stabilized.
+        // Intel Macs are more stable with resize-only during fullscreen transitions.
         if (state.isNativeActive) {
           await new Promise((r) => setTimeout(r, targetFs ? 140 : 120));
-          await recreateNativePlayerAfterResize(targetFs ? "fullscreen-enter" : "fullscreen-exit");
+          if (state.nativeArch === "x86_64") {
+            if (targetFs) {
+              console.log("[PLAYER] Intel fullscreen-enter: resize-only");
+              await invoke("resize_native_player", {}).catch(() => {});
+            } else {
+              console.log("[PLAYER] Intel fullscreen-exit: resize + conditional recreate");
+              state.fullscreenEnterRepairAttempted = false;
+              await invoke("resize_native_player", {}).catch(() => {});
+              await maybeRecreateOnFullscreenExitIntel(invoke).catch(() => {});
+            }
+          } else {
+            await recreateNativePlayerAfterResize(targetFs ? "fullscreen-enter" : "fullscreen-exit");
+          }
         } else {
           setTimeout(() => setNativeTransitionMask(false), 160);
         }
@@ -3630,15 +3732,14 @@ function setupPremiumOSC() {
     } catch (err) {
       console.error("[PLAYER] Native Fullscreen Error:", err);
       setNativeTransitionMask(false);
-      // Fallback to DOM fullscreen if native fails
-      if (!document.fullscreenElement) document.documentElement.requestFullscreen().catch(console.error);
-      else if (document.exitFullscreen) document.exitFullscreen();
-      applyWindowFullscreenClass(!!document.fullscreenElement);
+      // Do not fallback to DOM fullscreen in desktop app.
+      // Mixing DOM + native fullscreen causes immediate bounce on macOS.
     } finally {
-      // Keep a short guard window to avoid accidental double-toggle during transition settle.
+      setNativeTransitionMask(false);
+      // Keep guard window long enough to cover macOS fullscreen animation settle.
       setTimeout(() => {
         state.nativeFullscreenTransition = false;
-      }, 260);
+      }, 900);
     }
   });
 
@@ -3661,13 +3762,17 @@ function setupPremiumOSC() {
       }, 280);
     };
     const onNativeFullscreenChange = () => {
+      if (state.nativeFullscreenTransition) return;
       syncNativeResize();
       const inv = getTauriInvoke();
       if (inv) {
         inv("native_get_fullscreen")
           .then((isFs) => {
             applyWindowFullscreenClass(isFs);
-            inv("native_set_mpv_fullscreen", { fullscreen: !!isFs }).catch(() => {});
+            const mpvFs = state.nativeArch === "x86_64" ? false : !!isFs;
+            return inv("native_set_mpv_fullscreen", { fullscreen: mpvFs })
+              .catch(() => {})
+              .then(() => stabilizeNativeFullscreenResize(inv, !!isFs));
           })
           .catch(() => {});
       } else {

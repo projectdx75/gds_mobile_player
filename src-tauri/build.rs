@@ -1,6 +1,46 @@
 use std::env;
 use std::path::PathBuf;
 
+fn push_unique(paths: &mut Vec<PathBuf>, candidate: PathBuf) {
+    if !paths.iter().any(|p| p == &candidate) {
+        paths.push(candidate);
+    }
+}
+
+fn preferred_homebrew_prefixes() -> Vec<PathBuf> {
+    if env::consts::ARCH == "x86_64" {
+        vec![PathBuf::from("/usr/local"), PathBuf::from("/opt/homebrew")]
+    } else {
+        vec![PathBuf::from("/opt/homebrew"), PathBuf::from("/usr/local")]
+    }
+}
+
+fn detect_homebrew_lib_dirs() -> Vec<PathBuf> {
+    let mut dirs: Vec<PathBuf> = Vec::new();
+
+    if let Some(prefix) = env::var_os("HOMEBREW_PREFIX") {
+        let lib_dir = PathBuf::from(prefix).join("lib");
+        if lib_dir.exists() {
+            push_unique(&mut dirs, lib_dir);
+        }
+    }
+
+    for prefix in preferred_homebrew_prefixes() {
+        let lib_dir = prefix.join("lib");
+        if lib_dir.exists() {
+            push_unique(&mut dirs, lib_dir);
+        }
+    }
+
+    if dirs.is_empty() {
+        for prefix in preferred_homebrew_prefixes() {
+            push_unique(&mut dirs, prefix.join("lib"));
+        }
+    }
+
+    dirs
+}
+
 fn main() {
     #[cfg(target_os = "macos")]
     {
@@ -10,10 +50,14 @@ fn main() {
         println!("cargo:warning=MPV_LINK_MODE={}", link_mode);
         let lib_dir = manifest_dir.join("lib");
         let framework_search_path = lib_dir.join("Libmpv.xcframework/macos-arm64_x86_64");
+        let brew_lib_dirs = detect_homebrew_lib_dirs();
 
         if link_mode == "system" {
             // Quick diagnostic mode: link against Homebrew libmpv dylib.
-            let homebrew_lib = PathBuf::from("/opt/homebrew/lib");
+            let homebrew_lib = brew_lib_dirs
+                .first()
+                .cloned()
+                .unwrap_or_else(|| PathBuf::from("/opt/homebrew/lib"));
             println!("cargo:warning=Linking against system libmpv from: {}", homebrew_lib.display());
             println!("cargo:rustc-link-search=native={}", homebrew_lib.display());
             println!("cargo:rustc-link-lib=dylib=mpv");
@@ -48,7 +92,14 @@ fn main() {
         let lib_deps_dir = manifest_dir.join("lib_deps");
         println!("cargo:rustc-link-search=native={}", lib_deps_dir.display());
         println!("cargo:rustc-link-search=native={}", lib_dir.display());
+        for path in &brew_lib_dirs {
+            println!("cargo:warning=Using Homebrew lib search path: {}", path.display());
+            println!("cargo:rustc-link-search=native={}", path.display());
+        }
         if link_mode != "system" {
+            // Link Vulkan loader first (libvulkan), then MoltenVK ICD.
+            // On Intel macOS this resolves vk* symbols referenced by Libmpv.
+            println!("cargo:rustc-link-lib=dylib=vulkan");
             println!("cargo:rustc-link-lib=dylib=MoltenVK");
         }
         

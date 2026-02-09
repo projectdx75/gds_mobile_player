@@ -161,17 +161,24 @@ async fn launch_mpv_player(
         // --- Dynamic MoltenVK ICD Detection ---
         let m1_lib = "/opt/homebrew/lib/libMoltenVK.dylib";
         let intel_lib = "/usr/local/lib/libMoltenVK.dylib";
-        
-        // Pick the existing library path
-        let actual_lib = if std::path::Path::new(m1_lib).exists() {
-            m1_lib
-        } else if std::path::Path::new(intel_lib).exists() {
-            intel_lib
+        let lib_candidates = if std::env::consts::ARCH == "x86_64" {
+            [intel_lib, m1_lib]
         } else {
-            // Fallback or log error
-            println!("[WARN] libMoltenVK.dylib not found in standard Homebrew paths.");
-            m1_lib // Default to M1 path as placeholder
+            [m1_lib, intel_lib]
         };
+
+        // Pick an existing library path, preferring the current CPU architecture.
+        let actual_lib = lib_candidates
+            .iter()
+            .copied()
+            .find(|path| std::path::Path::new(path).exists())
+            .unwrap_or_else(|| {
+                println!(
+                    "[WARN] libMoltenVK.dylib not found in standard Homebrew paths for arch {}.",
+                    std::env::consts::ARCH
+                );
+                lib_candidates[0]
+            });
 
         // Create a temporary ICD JSON content
         let icd_json = serde_json::json!({
@@ -188,9 +195,15 @@ async fn launch_mpv_player(
             let _ = file.write_all(icd_json.to_string().as_bytes());
         }
 
-        // Set the environment variable to our dynamic ICD
-        std::env::set_var("VK_ICD_FILENAMES", icd_temp_path);
-        println!("[INVOKE] Using Dynamic ICD: {} -> {}", icd_temp_path, actual_lib);
+        // Set the environment variable to our dynamic ICD only on Apple Silicon path.
+        // Intel path is forced to OpenGL and should not touch Vulkan/MoltenVK.
+        if std::env::consts::ARCH != "x86_64" {
+            std::env::set_var("VK_ICD_FILENAMES", icd_temp_path);
+            println!("[INVOKE] Using Dynamic ICD: {} -> {}", icd_temp_path, actual_lib);
+        } else {
+            std::env::remove_var("VK_ICD_FILENAMES");
+            println!("[INVOKE] Intel path: VK_ICD_FILENAMES cleared (OpenGL-only)");
+        }
         // --------------------------------------
         
         let try_init_mpv = |wid_raw: usize, wid_kind: &str, profile: &str| -> Result<Mpv, String> {
@@ -206,6 +219,30 @@ async fn launch_mpv_player(
                 if let Err(e) = init.set_option("wid", wid_i64) {
                     println!("[ERROR] Init wid ({}) failed: {}", wid_kind, e);
                     return Err(e);
+                }
+
+                // Intel safety path: hard-force OpenGL/cocoa and avoid Vulkan/MoltenVK.
+                // This prevents NSView delegate crash from vkCreateMetalSurfaceEXT.
+                if std::env::consts::ARCH == "x86_64" {
+                    if let Err(e) = init.set_option("vo", "gpu") {
+                        println!("[ERROR] Init vo: {}", e);
+                        return Err(e);
+                    }
+                    if let Err(e) = init.set_option("gpu-context", "cocoa") {
+                        println!("[WARN] Init gpu-context=cocoa failed: {}", e);
+                        // For NSView path, require cocoa context to avoid Vulkan route.
+                        if profile.starts_with("nsview") {
+                            return Err(e);
+                        }
+                    }
+                    if let Err(e) = init.set_option("hwdec", "videotoolbox") { println!("[ERROR] Init hwdec: {}", e); }
+                    let _ = init.set_option("keepaspect-window", "no");
+                    let _ = init.set_option("input-default-bindings", "no");
+                    let _ = init.set_option("input-vo-keyboard", "no");
+                    let _ = init.set_option("osc", "no");
+                    let _ = init.set_option("terminal", "yes");
+                    println!("[INVOKE] Intel forced MPV profile: vo=gpu + opengl/cocoa (no Vulkan)");
+                    return Ok(());
                 }
                 
                 // 2. Set VO and Context profile
@@ -229,6 +266,9 @@ async fn launch_mpv_player(
                     }
                     "nsview-gpu" => {
                         if let Err(e) = init.set_option("vo", "gpu") { println!("[ERROR] Init vo: {}", e); }
+                        if std::env::consts::ARCH == "x86_64" {
+                            let _ = init.set_option("gpu-api", "opengl");
+                        }
                         let _ = init.set_option("gpu-context", "cocoa");
                         println!("[INVOKE] MPV GPU profile: gpu + cocoa (legacy fallback)");
                     }
@@ -280,13 +320,39 @@ async fn launch_mpv_player(
             })
         };
 
-        // Default to Layer WID for stability.
-        // NSView WID can be tested explicitly by setting:
-        //   MPV_WID_EXPERIMENT=nsview
-        // because this path can crash in MoltenVK with selector mismatch.
-        let wid_experiment = std::env::var("MPV_WID_EXPERIMENT").unwrap_or_default();
-        let (mpv, using_layer_wid) = if wid_experiment == "nsview" {
-            if let Ok(m) = try_init_mpv(nsview_wid_raw, "NSView", "nsview-metal") {
+        // Default behavior:
+        // - Intel(x86_64): prefer NSView path (OpenGL/cocoa), fallback to Layer.
+        // - Apple Silicon: default Layer path, NSView only when explicitly requested.
+        // Override behavior with:
+        //   MPV_WID_EXPERIMENT=nsview  -> force NSView path
+        //   MPV_WID_EXPERIMENT=layer   -> force Layer path
+        let wid_experiment = std::env::var("MPV_WID_EXPERIMENT")
+            .unwrap_or_default()
+            .to_lowercase();
+        let arch = std::env::consts::ARCH;
+        let prefer_nsview = if wid_experiment == "layer" {
+            false
+        } else if wid_experiment == "nsview" {
+            true
+        } else {
+            arch == "x86_64"
+        };
+
+        let (mpv, using_layer_wid) = if prefer_nsview {
+            if arch == "x86_64" {
+                // Intel: avoid MoltenVK path on NSView to prevent NSView delegate crash.
+                if let Ok(m) = try_init_mpv(nsview_wid_raw, "NSView", "nsview-opengl") {
+                    println!("[INVOKE] Selected WID path: NSView + opengl/cocoa (intel)");
+                    (m, false)
+                } else if let Ok(m) = try_init_mpv(nsview_wid_raw, "NSView", "nsview-gpu") {
+                    println!("[INVOKE] Selected WID path: NSView + gpu/cocoa (intel fallback)");
+                    (m, false)
+                } else {
+                    let m = try_init_mpv(layer_wid_raw, "Layer", "layer-fallback")?;
+                    println!("[INVOKE] Intel NSView path failed -> fallback Layer");
+                    (m, true)
+                }
+            } else if let Ok(m) = try_init_mpv(nsview_wid_raw, "NSView", "nsview-metal") {
                 println!("[INVOKE] Selected WID path: NSView + metal/cocoa (experimental)");
                 (m, false)
             } else if let Ok(m) = try_init_mpv(nsview_wid_raw, "NSView", "nsview-opengl") {
@@ -297,7 +363,7 @@ async fn launch_mpv_player(
                 (m, false)
             } else {
                 let m = try_init_mpv(layer_wid_raw, "Layer", "layer-fallback")?;
-                println!("[INVOKE] NSView experimental path failed -> fallback Layer");
+                println!("[INVOKE] NSView preferred path failed -> fallback Layer");
                 (m, true)
             }
         } else {
@@ -770,6 +836,11 @@ fn native_set_fullscreen(app: tauri::AppHandle, fullscreen: bool) -> Result<(), 
 }
 
 #[tauri::command(rename_all = "snake_case")]
+fn native_get_arch() -> String {
+    std::env::consts::ARCH.to_string()
+}
+
+#[tauri::command(rename_all = "snake_case")]
 fn native_start_drag(app: tauri::AppHandle) -> Result<(), String> {
     use tauri::Manager;
     let (tx, rx) = std::sync::mpsc::channel::<Result<(), String>>();
@@ -793,7 +864,6 @@ pub fn run() {
         .plugin(tauri_plugin_http::init())
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_drag::init())
-        .plugin(tauri_plugin_libmpv::init())
         .invoke_handler(tauri::generate_handler![
             launch_mpv_player,
             close_native_player,
@@ -801,6 +871,7 @@ pub fn run() {
             native_toggle_fullscreen,
             native_get_fullscreen,
             native_set_fullscreen,
+            native_get_arch,
             native_start_drag,
             native_play_pause,
             native_seek,

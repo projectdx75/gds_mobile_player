@@ -1094,7 +1094,7 @@ checksum = "5baebc0774151f905a1a2cc41989300b1e6fbb29aff0ceffa1064fdd3088d582"
 
 [[package]]
 name = "flashplex"
-version = "1.1.0"
+version = "1.1.1"
 dependencies = [
  "block",
  "chrono",
@@ -1112,7 +1112,6 @@ dependencies = [
  "tauri-build",
  "tauri-plugin-drag",
  "tauri-plugin-http",
- "tauri-plugin-libmpv",
  "tauri-plugin-opener",
  "urlencoding",
 ]
@@ -2124,7 +2123,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6e9ec52138abedcc58dc17a7c6c0c00a2bdb4f3427c7f63fa97fd0d859155caf"
 dependencies = [
  "gtk-sys",
- "libloading 0.7.4",
+ "libloading",
  "once_cell",
 ]
 
@@ -2142,16 +2141,6 @@ checksum = "b67380fd3b2fbe7527a606e18729d21c6f3951633d0500574c4dc22d2d638b9f"
 dependencies = [
  "cfg-if",
  "winapi",
-]
-
-[[package]]
-name = "libloading"
-version = "0.8.9"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d7c4b02199fee7c5d21a5ae7d8cfa79a6ef5bb2fc834d6e9058e89c825efdc55"
-dependencies = [
- "cfg-if",
- "windows-link 0.2.1",
 ]
 
 [[package]]
@@ -4328,26 +4317,6 @@ dependencies = [
  "tokio",
  "url",
  "urlpattern",
-]
-
-[[package]]
-name = "tauri-plugin-libmpv"
-version = "0.3.2"
-source = "git+https://github.com/nini22P/tauri-plugin-libmpv?branch=main#5da4e044c276245dcfd8a279310e5106394a0679"
-dependencies = [
- "base64 0.22.1",
- "indexmap 2.13.0",
- "libc",
- "libloading 0.8.9",
- "log",
- "once_cell",
- "raw-window-handle",
- "scopeguard",
- "serde",
- "serde_json",
- "tauri",
- "tauri-plugin",
- "thiserror 2.0.18",
 ]
 
 [[package]]
