@@ -50,6 +50,7 @@ const state = {
   nativeArch: "unknown",
   fullscreenEnterRepairAttempted: false,
   lastFullscreenToggleAt: 0,
+  domesticVirtualCategory: "방송중",
 };
 
 // Platform Detection
@@ -91,6 +92,21 @@ function maybeLoadMore(reason = "observer") {
     dlog(`[SCROLL:${reason}] Loading more items... offset=${state.offset}`);
     loadLibrary(false, true);
   }
+}
+
+function getCurrentFolderName(path) {
+  const parts = String(path || "").split("/").filter(Boolean);
+  return parts[parts.length - 1] || "";
+}
+
+function isIndexBucketFolder(path) {
+  const name = getCurrentFolderName(path).trim();
+  if (!name) return false;
+  if (name.toUpperCase() === "0Z") return true;
+  if (/^[가-힣]$/.test(name)) return true;
+  if (/^[A-Z]$/i.test(name)) return true;
+  if (/^[0-9]$/.test(name)) return true;
+  return false;
 }
 
 function getInfiniteScrollRoot() {
@@ -180,6 +196,60 @@ function cssEscapeValue(value) {
   const str = String(value ?? "");
   if (window.CSS && typeof window.CSS.escape === "function") return window.CSS.escape(str);
   return str.replace(/["\\]/g, "\\$&");
+}
+
+function parseMtimeToEpoch(v) {
+  if (!v) return 0;
+  const raw = String(v).trim();
+  if (!raw) return 0;
+  const ts = Date.parse(raw.replace(" ", "T"));
+  return Number.isFinite(ts) ? ts : 0;
+}
+
+function tvShowPriorityScore(item) {
+  const name = String(item?.name || "").toLowerCase();
+  const path = String(item?.path || "").toLowerCase();
+  const hay = `${name} ${path}`;
+
+  // 0 is highest priority.
+  if (hay.includes("방송중") || hay.includes("방영중") || hay.includes("on air") || hay.includes("airing")) return 0;
+  if (hay.includes("신작") || hay.includes("최신")) return 1;
+  if (hay.includes("완결") || hay.includes("종영") || hay.includes("방영종료") || hay.includes("ended")) return 3;
+  return 2;
+}
+
+function isBucketOnlyDirectoryList(items = []) {
+  if (!Array.isArray(items) || items.length === 0) return false;
+  return items.every((it) => !!it?.is_dir && isIndexBucketFolder(it.path || it.name));
+}
+
+function matchesDomesticVirtualCategory(item, selected) {
+  const name = String(item?.name || "").toLowerCase();
+  const path = String(item?.path || "").toLowerCase();
+  const hay = `${name} ${path}`;
+  const has = (kw) => hay.includes(String(kw).toLowerCase());
+
+  if (selected === "방송중") return has("방송중") || has("방영중") || has("on air") || has("airing");
+  if (selected === "완결") return !has("방송중") && !has("방영중") && !has("on air") && !has("airing");
+  // Path prefix guard is applied in caller; keep these categories permissive.
+  if (selected === "드라마") return true;
+  if (selected === "예능") return true;
+  if (selected === "다큐") return true;
+  if (selected === "시사") return true;
+  if (selected === "뉴스") return true;
+  if (selected === "기타") {
+    const majorHints = ["/드라마", " 드라마", "drama", "/예능", " 예능", "variety", "/다큐", " 다큐", "documentary", "/시사", " 시사", "/뉴스", " 뉴스", "news"];
+    return !majorHints.some((kw) => has(kw));
+  }
+  return true;
+}
+
+function normalizePathForCompare(pathValue) {
+  return String(pathValue || "")
+    .normalize("NFC")
+    .replace(/\\/g, "/")
+    .replace(/^\/+/, "")
+    .toLowerCase();
 }
 
 function getAdaptiveThumbnailWidth(container) {
@@ -505,6 +575,52 @@ async function checkAndSelectSubtitles(retries = 4) {
     return hasSelection;
   } catch (e) {
     console.error("[SUB] Auto-check failed:", e);
+  }
+}
+
+
+async function resolveBestSubtitleForAndroid(item, bpath, fallbackUrl) {
+  try {
+    const videoInfoUrl = `${state.serverUrl}/gds_dviewer/normal/get_video_info?bpath=${bpath}&source_id=${normalizeSourceId(item.source_id)}&apikey=${state.apiKey}`;
+    if (window.tlog) window.tlog(`[SUB-ANDROID] Fetching video info: ${videoInfoUrl}`);
+    const res = await fetch(videoInfoUrl).then((r) => r.json());
+    const tracks = res?.data?.subtitles || [];
+
+    const toFullUrl = (s) => {
+      if (!s?.url) return null;
+      if (s.url.startsWith('http')) return s.url;
+      const u = `${state.serverUrl}${s.url}`;
+      return u.includes('apikey=') ? u : `${u}${u.includes('?') ? '&' : '?'}apikey=${state.apiKey}`;
+    };
+
+    const isKo = (s) => {
+      const lang = String(s?.lang || s?.language || '').toLowerCase();
+      const title = String(s?.title || '').toLowerCase();
+      return lang === 'ko' || lang === 'kor' || lang.startsWith('ko-') || lang.startsWith('ko_') ||
+        title.includes('korean') || title.includes('한국어') || title.includes('.ko');
+    };
+
+    const sidecars = tracks.filter((t) => t?.type === 'sidecar');
+    const embedded = tracks.filter((t) => t?.type !== 'sidecar');
+
+    // mpv-like preference: sidecar Korean -> sidecar any -> embedded Korean -> fallback external endpoint
+    const best =
+      sidecars.find(isKo) ||
+      sidecars[0] ||
+      embedded.find(isKo) ||
+      null;
+
+    const bestUrl = toFullUrl(best);
+    if (bestUrl) {
+      if (window.tlog) window.tlog(`[SUB-ANDROID] Selected subtitle: ${best?.title || best?.lang || 'unknown'}`);
+      return bestUrl;
+    }
+
+    if (window.tlog) window.tlog('[SUB-ANDROID] No explicit subtitle URL from tracks, using fallback endpoint');
+    return fallbackUrl;
+  } catch (e) {
+    console.warn('[SUB-ANDROID] resolve failed, using fallback subtitle URL', e);
+    return fallbackUrl;
   }
 }
 
@@ -842,22 +958,62 @@ function setupTabs() {
 }
 
 const categorySubMenus = {
-  tv_show: ["국내", "해외", "다큐", "뉴스", "교양", "예능", "시사", "음악", "데일리"],
+  tv_show: ["국내", "해외", "다큐멘터리", "뉴스", "교양", "예능", "시사", "음악", "데일리"],
   movie: ["한국영화", "외국영화", "고전영화", "액션", "스릴러", "코미디"],
   animation: ["TV 애니", "극장판", "OVA", "라프텔"]
 };
+const domesticVirtualCategories = ["방송중", "완결", "드라마", "예능", "다큐멘터리", "교양", "시사", "뉴스", "데일리", "음악", "기타"];
+const domesticVirtualPathMap = {
+  "방송중": "VIDEO/방송중",
+  "완결": "VIDEO/국내TV",
+  "드라마": "VIDEO/국내TV/드라마",
+  "예능": "VIDEO/국내TV/예능",
+  "다큐": "VIDEO/국내TV/다큐멘터리",
+  "다큐멘터리": "VIDEO/국내TV/다큐멘터리",
+  "교양": "VIDEO/국내TV/교양",
+  "시사": "VIDEO/국내TV/시사",
+  "뉴스": "VIDEO/국내TV/뉴스",
+  "데일리": "VIDEO/국내TV/데일리",
+  "음악": "VIDEO/국내TV/음악",
+  "기타": "VIDEO/국내TV"
+};
+const tvShowPathMap = {
+  "국내": "VIDEO/국내TV",
+  "해외": "VIDEO/해외TV",
+  "드라마": "VIDEO/국내TV/드라마",
+  "예능": "VIDEO/국내TV/예능",
+  "다큐": "VIDEO/국내TV/다큐멘터리",
+  "다큐멘터리": "VIDEO/국내TV/다큐멘터리",
+  "뉴스": "VIDEO/국내TV/뉴스",
+  "교양": "VIDEO/국내TV/교양",
+  "시사": "VIDEO/국내TV/시사",
+  "음악": "VIDEO/국내TV/음악",
+  "데일리": "VIDEO/국내TV/데일리"
+};
+let lastFocusedBeforeCategoryMenu = null;
+
+function closeCategorySubMenu() {
+  const overlay = document.getElementById("category-menu-overlay");
+  if (!overlay) return false;
+  overlay.classList.remove("active");
+  setTimeout(() => overlay.remove(), 300);
+  if (lastFocusedBeforeCategoryMenu && typeof lastFocusedBeforeCategoryMenu.focus === "function") {
+    setTimeout(() => lastFocusedBeforeCategoryMenu.focus(), 80);
+  }
+  return true;
+}
 
 function showCategorySubMenu(category, tabEl) {
   const subItems = categorySubMenus[category];
   if (!subItems) return;
 
   // Remove existing
-  const existing = document.getElementById("category-menu-overlay");
-  if (existing) existing.remove();
+  closeCategorySubMenu();
 
   const overlay = document.createElement("div");
   overlay.id = "category-menu-overlay";
   overlay.className = "category-menu-overlay";
+  overlay.setAttribute("aria-modal", "true");
   
   let menuHtml = `
     <div class="category-menu-content">
@@ -871,15 +1027,24 @@ function showCategorySubMenu(category, tabEl) {
   menuHtml += `</div>`;
   overlay.innerHTML = menuHtml;
   document.body.appendChild(overlay);
+  lastFocusedBeforeCategoryMenu = document.activeElement instanceof HTMLElement ? document.activeElement : null;
 
   // Animate in
-  setTimeout(() => overlay.classList.add("active"), 10);
+  setTimeout(() => {
+    overlay.classList.add("active");
+    const first = overlay.querySelector(".category-option.active") || overlay.querySelector(".category-option");
+    if (first && typeof first.focus === "function") first.focus();
+  }, 10);
+
+  overlay.querySelectorAll(".category-option").forEach(opt => {
+    opt.tabIndex = 0;
+    opt.setAttribute("role", "button");
+  });
 
   // Handlers
   overlay.onclick = (e) => {
     if (e.target === overlay) {
-        overlay.classList.remove("active");
-        setTimeout(() => overlay.remove(), 300);
+        closeCategorySubMenu();
     }
   };
 
@@ -888,17 +1053,45 @@ function showCategorySubMenu(category, tabEl) {
         const q = opt.dataset.query;
         console.log(`[NAV] Sub-category selected: ${q} in ${category}`);
         
-        // [FIXED] TV show sub-categories use path navigation
+        // [TV SHOW] Prefer server-driven domestic endpoint for consistent behavior.
         if (category === 'tv_show') {
-          const pathMap = {
-            '국내': 'VIDEO/국내TV',
-            '드라마': 'VIDEO/국내TV/드라마',
-            '해외': 'VIDEO/해외TV',
-            '': ''  // "전체" clears path
-          };
-          state.currentPath = pathMap[q] || '';
-          state.pathStack = state.currentPath ? [state.currentPath] : [];
-          state.query = '';
+          const domesticMenuSet = new Set([
+            "국내",
+            "방송중",
+            "완결",
+            "드라마",
+            "예능",
+            "다큐",
+            "다큐멘터리",
+            "교양",
+            "시사",
+            "뉴스",
+            "데일리",
+            "음악",
+            "기타"
+          ]);
+          if (!q) {
+            state.currentPath = "";
+            state.pathStack = [];
+            state.query = "";
+            state.domesticVirtualCategory = "방송중";
+          } else if (domesticMenuSet.has(q)) {
+            // Force domestic virtual root so loadLibrary() always calls `series_domestic`.
+            state.currentPath = "VIDEO/국내TV";
+            state.pathStack = ["VIDEO/국내TV"];
+            state.query = "";
+            state.domesticVirtualCategory = (q === "국내") ? "방송중" : (q === "다큐" ? "다큐멘터리" : q);
+          } else if (tvShowPathMap[q]) {
+            state.currentPath = tvShowPathMap[q];
+            state.pathStack = [tvShowPathMap[q]];
+            state.query = "";
+            state.domesticVirtualCategory = q === "국내" ? "방송중" : "";
+          } else {
+            // Fallback for unmapped labels: keep tv_show root path clear and filter by query.
+            state.currentPath = "";
+            state.pathStack = [];
+            state.query = q;
+          }
         } else {
           state.query = q;
           state.currentPath = '';
@@ -910,8 +1103,7 @@ function showCategorySubMenu(category, tabEl) {
         
         loadLibrary(true);
         
-        overlay.classList.remove("active");
-        setTimeout(() => overlay.remove(), 300);
+        closeCategorySubMenu();
     };
   });
 }
@@ -933,6 +1125,10 @@ async function gdsFetch(endpoint, options = {}) {
   const finalUrl = `${url}${separator}apikey=${state.apiKey}`;
 
   dlog(`[GDS-API] Calling (${method}): ${url}`);
+  console.log(`[GDS-FULL-URL] (${method}) ${finalUrl}`);
+  if (endpoint.includes("series_domestic")) {
+    console.log(`[SERIES_DOMESTIC_URL] ${finalUrl}`);
+  }
 
   // Tauri HTTP Plugin Logic
   const tauriHttp =
@@ -1016,8 +1212,10 @@ async function loadLibrary(forceRefresh = false, isAppend = false) {
   // [Pagination] Reset or Check
   if (!isAppend) {
     if (state.isFreshLoading) {
-      console.warn("[LOAD] Concurrent fresh load blocked");
-      return;
+      console.warn("[LOAD] Concurrent fresh load detected; aborting previous request and continuing.");
+      if (state.freshAbortController) {
+        try { state.freshAbortController.abort(); } catch (_) {}
+      }
     }
     state.isFreshLoading = true;
     state.offset = 0;
@@ -1116,9 +1314,54 @@ async function loadLibrary(forceRefresh = false, isAppend = false) {
     let serverBatchSize = 0;
 
     // [OTT HUB] Logic Refinement: Hub Mode vs Folder Mode
-    const isHubRoot = ["VIDEO/국내TV", "VIDEO/국내TV/드라마", "VIDEO/국내TV/예능", "VIDEO/해외TV", "VIDEO/영화"].some(p => state.currentPath && (state.currentPath === p || state.currentPath.startsWith(p + "/"))) && (state.pathStack.length <= 1);
+    const HUB_ROOT_PATHS = ["VIDEO/국내TV", "VIDEO/국내TV/드라마", "VIDEO/국내TV/예능", "VIDEO/해외TV", "VIDEO/영화"];
+    const isTopHubPath = HUB_ROOT_PATHS.includes(state.currentPath);
+    const pathDepth = String(state.currentPath || "").split("/").filter(Boolean).length;
+    // Keep TV/Series in strict folder mode to preserve expected hierarchy.
+    // Use hub(flatten) only for non-tv_show curated paths.
+    const isHubRoot =
+      !!state.currentPath &&
+      state.category !== "tv_show" &&
+      isTopHubPath &&
+      pathDepth >= 3 &&
+      !isIndexBucketFolder(state.currentPath);
     
-    if (state.currentPath && isHubRoot) {
+    const isDomesticVirtualRoot = state.category === "tv_show" && state.currentPath === "VIDEO/국내TV";
+
+    if (isDomesticVirtualRoot) {
+      if (!isAppend) renderSubCategoryChips([]);
+      const selected = state.domesticVirtualCategory || "방송중";
+      const params = new URLSearchParams({
+        bucket: selected,
+        limit: String(state.limit),
+        offset: String(actualOffset),
+        sort_by: state.sortBy,
+        sort_order: state.sortOrder,
+        source_id: String(state.sourceId ?? 0),
+      });
+      // Debug: print full URL so it can be called directly from browser/curl.
+      let __base = (state.serverUrl || "").trim();
+      if (!/^https?:\/\//i.test(__base)) __base = `http://${__base}`;
+      __base = __base.replace(/\/$/, "");
+      console.log(`[SERIES_DOMESTIC_URL] ${__base}/gds_dviewer/normal/series_domestic?${params.toString()}&apikey=${state.apiKey}`);
+      const responses = [await gdsFetch(`series_domestic?${params.toString()}`, { signal: requestSignal })];
+      if (isStaleFreshRequest()) return;
+
+      const allRaw = responses
+        .filter((r) => r && r.ret === "success")
+        .flatMap((r) => r.data || r.items || r.list || []);
+      serverBatchSize = allRaw.length;
+
+      // Keep first response semantics for paging hints below.
+      data = {
+        ret: "success",
+        list: allRaw,
+        count: allRaw.length,
+        has_more: false,
+      };
+
+      currentList = allRaw;
+    } else if (state.currentPath && isHubRoot) {
       // [MODE: HUB] Flattened discovery view
       console.log(`[OTT-HUB] Entering Hub Mode for: ${state.currentPath}`);
       if (!isAppend) renderSubCategoryChips([]);
@@ -1143,8 +1386,8 @@ async function loadLibrary(forceRefresh = false, isAppend = false) {
         currentList = rawList.filter(item => {
           // Rule 1: Must be a directory
           if (!item.is_dir) return false;
-          // Rule 2: Exclude index folders (already handled by has_metadata but double check)
-          if (item.name.length <= 2 && !item.meta_poster) return false; 
+          // Rule 2: Exclude bucket/index folders regardless of metadata.
+          if (isIndexBucketFolder(item.path || item.name)) return false;
           // Rule 3: Exclude Season folders
           if (seasonRegex.test(item.name)) return false;
           return true;
@@ -1168,6 +1411,33 @@ async function loadLibrary(forceRefresh = false, isAppend = false) {
       if (data.ret === "success") {
         currentList = data.data || data.items || data.list || [];
         serverBatchSize = currentList.length;
+
+        // TV series UX: if a folder only exposes 가나다/0Z index buckets, switch to
+        // recursive aggregate list so users see title cards instead of explorer buckets.
+        if (state.category === "tv_show" && isBucketOnlyDirectoryList(currentList)) {
+          console.log(`[TV-COMPOSITE] Bucket-only list detected. Switching to aggregated mode: ${state.currentPath}`);
+          const aggParams = new URLSearchParams({
+            query: "",
+            path: state.currentPath,
+            recursive: "true",
+            is_dir: "true",
+            ...commonParams,
+          });
+          const aggData = await gdsFetch(`search?${aggParams.toString()}`, { signal: requestSignal });
+          if (isStaleFreshRequest()) return;
+          if (aggData.ret === "success") {
+            const aggRaw = aggData.data || aggData.items || aggData.list || [];
+            serverBatchSize = aggRaw.length;
+            const seasonRegex = /Season|시즌|S\d+/i;
+            currentList = aggRaw.filter((item) => {
+              if (!item?.is_dir) return false;
+              if (isIndexBucketFolder(item.path || item.name)) return false;
+              if (seasonRegex.test(item.name || "")) return false;
+              return true;
+            });
+          }
+        }
+
         console.log(`[OTT-HUB] Folder items: ${currentList.length}`);
       }
     } else if (isFolderCategory && isAtRoot && !state.query) {
@@ -1357,6 +1627,34 @@ async function loadLibrary(forceRefresh = false, isAppend = false) {
         return true;
       });
 
+      // Domestic root cleanup: hide utility folders such as "업로드".
+      if (state.category === "tv_show" && state.currentPath === "VIDEO/국내TV") {
+        displayItems = displayItems.filter((i) => {
+          const n = String(i?.name || "").trim().toLowerCase();
+          return n !== "업로드" && n !== "upload";
+        });
+      }
+
+      // TV list ordering: prioritize "currently airing" groups first.
+      if (state.category === "tv_show") {
+        displayItems = [...displayItems].sort((a, b) => {
+          const pa = tvShowPriorityScore(a);
+          const pb = tvShowPriorityScore(b);
+          if (pa !== pb) return pa - pb;
+
+          // Keep directories first for navigability.
+          if (!!a.is_dir !== !!b.is_dir) return a.is_dir ? -1 : 1;
+
+          // Then prefer recent updates.
+          const ta = parseMtimeToEpoch(a.mtime);
+          const tb = parseMtimeToEpoch(b.mtime);
+          if (ta !== tb) return tb - ta;
+
+          // Stable fallback by name.
+          return String(a.name || "").localeCompare(String(b.name || ""), "ko");
+        });
+      }
+
       if (state.category === 'movie' && !state.currentPath) {
         if (!isAppend) {
           const indexFolders = displayItems.filter(i => i.is_dir && i.name.length === 1);
@@ -1365,7 +1663,7 @@ async function loadLibrary(forceRefresh = false, isAppend = false) {
         displayItems = displayItems.filter(i => !(i.is_dir && i.name.length === 1));
       } else if (state.category === 'tv_show' && !state.currentPath) {
         if (!isAppend) {
-           renderSubCategoryChips(['드라마', '예능', '다큐', '시사', '애니', '뉴스']);
+           renderSubCategoryChips(['드라마', '예능', '다큐멘터리', '시사', '애니', '뉴스']);
         }
       } else if (!isFolderCategory && !state.currentPath && !isAppend) {
         renderSubCategoryChips(null);
@@ -1480,6 +1778,7 @@ function renderSubCategoryChips(folders) {
   homeChip.onclick = () => {
     state.currentPath = "";
     state.pathStack = [];
+    state.domesticVirtualCategory = "방송중";
     loadLibrary();
   };
   chipContainer.appendChild(homeChip);
@@ -1493,9 +1792,30 @@ function renderSubCategoryChips(folders) {
     backChip.onclick = () => {
       state.pathStack.pop();
       state.currentPath = state.pathStack[state.pathStack.length - 1] || "";
+      if (!state.currentPath) state.domesticVirtualCategory = "방송중";
       loadLibrary();
     };
     chipContainer.appendChild(backChip);
+  }
+
+  if (state.category === "tv_show" && state.currentPath === "VIDEO/국내TV") {
+    domesticVirtualCategories.forEach((label) => {
+      const chip = document.createElement("div");
+      chip.className = "chip";
+      chip.tabIndex = 0;
+      chip.setAttribute("role", "button");
+      if ((state.domesticVirtualCategory || "방송중") === label) chip.classList.add("active");
+      chip.innerText = label;
+      chip.onclick = () => {
+        if (state.domesticVirtualCategory === label) return;
+        state.domesticVirtualCategory = label;
+        state.offset = 0;
+        state.library = [];
+        state.seenPaths = new Set();
+        loadLibrary(true);
+      };
+      chipContainer.appendChild(chip);
+    });
   }
 
   // Index Folders chips if passed
@@ -1513,6 +1833,8 @@ function renderSubCategoryChips(folders) {
       keywords.forEach(keyword => {
         const chip = document.createElement("div");
         chip.className = "chip";
+        chip.tabIndex = 0;
+        chip.setAttribute("role", "button");
         if (state.currentPath === pathMap[keyword]) chip.classList.add('active');
         chip.innerText = keyword;
         chip.onclick = () => {
@@ -1531,6 +1853,8 @@ function renderSubCategoryChips(folders) {
         indexFolders.forEach(idxFolder => {
           const chip = document.createElement("div");
           chip.className = "chip";
+          chip.tabIndex = 0;
+          chip.setAttribute("role", "button");
           chip.innerText = idxFolder.name;
           chip.onclick = () => {
             state.pathStack.push(idxFolder.path);
@@ -1573,6 +1897,8 @@ function renderSubCategoryChips(folders) {
     visibleCrumbs.forEach(({ label, path }) => {
       const breadcrumb = document.createElement("div");
       breadcrumb.className = "chip";
+      breadcrumb.tabIndex = 0;
+      breadcrumb.setAttribute("role", "button");
       breadcrumb.innerText = label;
       breadcrumb.onclick = () => {
         state.currentPath = path;
@@ -1599,7 +1925,7 @@ function renderFolderContextPanel(items = []) {
   const panel = document.getElementById("folder-context-panel");
   if (!panel) return;
 
-  if (!state.currentPath) {
+  if (!state.currentPath || isIndexBucketFolder(state.currentPath)) {
     panel.classList.add("hidden");
     panel.innerHTML = "";
     return;
@@ -1754,6 +2080,10 @@ function renderGrid(container, items, isFolderCategory = false, isAppend = false
   if (!isAppend) {
     container.innerHTML = "";
   }
+  const removeEmptyState = () => {
+    const emptyEl = container.querySelector(".grid-empty-state");
+    if (emptyEl) emptyEl.remove();
+  };
   const existingKeys = isAppend
     ? new Set(
         Array.from(container.querySelectorAll("[data-path]"))
@@ -1772,12 +2102,14 @@ function renderGrid(container, items, isFolderCategory = false, isAppend = false
   }
 
   if ((!items || items.length === 0) && !isAppend) {
+    removeEmptyState();
     container.innerHTML +=
-      '<div style="grid-column: 1/-1; text-align:center; padding:40px; color:var(--text-secondary)">No items found.</div>';
+      '<div class="grid-empty-state" style="grid-column: 1/-1; text-align:center; padding:40px; color:var(--text-secondary)">No items found.</div>';
     return;
   }
 
   if (!items) return; // Nothing to append
+  removeEmptyState();
 
   const getBasename = (p) => {
     if (!p) return "";
@@ -1937,6 +2269,13 @@ function renderGrid(container, items, isFolderCategory = false, isAppend = false
     const tagsHtml = tags.length > 0 
         ? `<div class="card-tags">${tags.map(t => `<span class="card-tag ${t==='4K'||t==='2160P'?'accent':''}">${t}</span>`).join('')}</div>`
         : '<div class="card-tags"></div>';
+    const hay = `${normalizePathForCompare(item.path || "")} ${String(item.name || "").toLowerCase()} ${String(item.status || "").toLowerCase()}`;
+    const isOnAir =
+      hay.includes("방송중") ||
+      hay.includes("방영중") ||
+      hay.includes("on air") ||
+      hay.includes("airing");
+    const onAirBadgeHtml = isOnAir ? `<span class="card-status-badge on-air">방송중</span>` : "";
 
     if (usePlaceholder) {
       const icon = isFolder
@@ -1950,6 +2289,7 @@ function renderGrid(container, items, isFolderCategory = false, isAppend = false
           <span>${isFolder ? "Folder" : item.category || "Media"}</span>
         </div>
         <div class="card-info">
+          <div class="card-topline">${onAirBadgeHtml}</div>
           <div class="card-eyebrow">${mediaLabel}${yearTag ? ` · ${yearTag}` : ""}</div>
           <div class="card-title">${displayTitle}</div>
           ${tagsHtml}
@@ -1962,6 +2302,7 @@ function renderGrid(container, items, isFolderCategory = false, isAppend = false
         <div class="card-poster-skeleton"></div>
         <img class="card-poster" src="${poster}" alt="${item.name}" loading="${imgLoading}" onerror="this.onerror=null; this.src='${noPoster}'">
         <div class="card-info">
+          <div class="card-topline">${onAirBadgeHtml}</div>
           <div class="card-eyebrow">${mediaLabel}${yearTag ? ` · ${yearTag}` : ""}</div>
           <div class="card-title">${displayTitle}</div>
           ${tagsHtml}
@@ -2631,6 +2972,23 @@ function closePlayer() {
   document.body.classList.remove("player-active");
 }
 
+function hideWebOscForAndroidExo() {
+  // Android ExoPlayer path should never leave web/native-desktop OSC visible.
+  if (ui.playerOverlay) ui.playerOverlay.classList.remove("active");
+  if (ui.customControls) {
+    ui.customControls.classList.add("hidden");
+    ui.customControls.style.display = "none";
+  }
+  if (ui.playerHeader) ui.playerHeader.style.display = "none";
+  if (ui.premiumOsc) {
+    ui.premiumOsc.classList.add("hidden");
+    ui.premiumOsc.style.display = "none";
+  }
+  document.body.classList.remove("player-active");
+  document.body.classList.remove("native-player-active");
+  document.documentElement.classList.remove("native-player-active");
+}
+
 function startNativeStatePolling() {
   if (nativeStatePollTimer) return;
   const invoke = getTauriInvoke();
@@ -2774,6 +3132,7 @@ function playVideo(item) {
 
   // 1. Show Overlay & Setup Metadata
   if (ui.playerOverlay) ui.playerOverlay.classList.add("active");
+  document.body.classList.add("player-active");
   const cleanTitle = displayTitle;
   if (ui.playerTitle) ui.playerTitle.textContent = cleanTitle + " (Loading...)";
 
@@ -2848,6 +3207,39 @@ function playVideo(item) {
   const isAudio =
     item.category === "audio" || ["flac", "mp3", "m4a"].includes(extension);
 
+  // Android: route all non-audio video playback to native ExoPlayer for consistent UI/remote behavior.
+  if (isAndroid && !isAudio) {
+    console.log("[PLAYBACK] Checking Native ExoPlayer Bridge...", extension);
+    if (window.PlayerBridge && window.PlayerBridge.openExoPlayer) {
+      console.log("[PLAYBACK] Resolving subtitles for Native ExoPlayer:", cleanTitle);
+
+      // Android-only: ensure web OSC/UI is fully hidden before opening native ExoPlayer.
+      hideWebOscForAndroidExo();
+      state.isNativeActive = false;
+
+      resolveBestSubtitleForAndroid(item, bpath, subtitleUrl).then((resolvedSubtitleUrl) => {
+        console.log("[PLAYBACK] Triggering Native ExoPlayer for:", cleanTitle, "subtitle:", resolvedSubtitleUrl);
+        window.PlayerBridge.openExoPlayer(
+          cleanTitle,
+          streamUrl,
+          resolvedSubtitleUrl,
+          state.subtitleSize,
+          state.subtitlePos,
+        );
+      }).catch(() => {
+        window.PlayerBridge.openExoPlayer(
+          cleanTitle,
+          streamUrl,
+          subtitleUrl,
+          state.subtitleSize,
+          state.subtitlePos,
+        );
+      });
+      return;
+    } else {
+      console.warn("[PLAYBACK] PlayerBridge not available, falling back to web/native MPV path.");
+    }
+  }
 
 
   // Tauri v2 invoke access detection
@@ -3288,12 +3680,34 @@ function renderFavorites() {
 }
 
 window.handleAndroidBack = function () {
-  const playerOverlay =
-    document.getElementById("premium-osc") ||
-    document.getElementById("player-overlay");
+  if (closeCategorySubMenu()) return "handled";
+  const qualityOverlay = document.getElementById("quality-menu-overlay");
+  if (qualityOverlay) {
+    qualityOverlay.remove();
+    return "handled";
+  }
+  const subtitleOverlay = document.getElementById("subtitle-menu-overlay");
+  if (subtitleOverlay) {
+    subtitleOverlay.remove();
+    return "handled";
+  }
+  const sortOverlay = document.getElementById("sort-menu-overlay");
+  if (sortOverlay && !sortOverlay.classList.contains("hidden")) {
+    sortOverlay.classList.add("hidden");
+    return "handled";
+  }
 
   // 1. If native player is active (check UI state)
   if (state.isNativeActive) {
+    closePlayer();
+    return "handled";
+  }
+
+  // 1.5 If web/native player overlay is visible, close player first.
+  const overlayActive =
+    !!(ui && ui.playerOverlay && ui.playerOverlay.classList.contains("active")) ||
+    !!document.querySelector("#player-overlay.active, #premium-osc.active");
+  if (overlayActive) {
     closePlayer();
     return "handled";
   }
@@ -3317,6 +3731,11 @@ function setupRemoteNavigation() {
   window.addEventListener("keydown", (e) => {
     const key = e.key;
     const current = document.activeElement;
+    const categoryMenuOverlay = document.getElementById("category-menu-overlay");
+    const itemOverlay = document.querySelector(".item-options-overlay.active");
+    const activeOverlay = (categoryMenuOverlay && categoryMenuOverlay.classList.contains("active"))
+      ? categoryMenuOverlay
+      : itemOverlay;
 
     // DEBUG: Log all keys to see what the remote sends
     console.log(
@@ -3330,10 +3749,40 @@ function setupRemoteNavigation() {
 
     // Handle Enter/Select
     if (key === "Enter") {
+      const playerOverlay = ui.playerOverlay;
+      const isPlayerActive =
+        playerOverlay && playerOverlay.classList.contains("active");
+
+      // While player is active, first Enter should wake OSC/controls instead of clicking background cards.
+      if (isPlayerActive) {
+        const nativeOscHidden =
+          !!(state.isNativeActive && ui.premiumOsc && ui.premiumOsc.classList.contains("hidden"));
+        const webControlsHidden =
+          !!(!state.isNativeActive && ui.customControls && ui.customControls.classList.contains("hidden"));
+
+        if (nativeOscHidden || webControlsHidden) {
+          document.dispatchEvent(new MouseEvent("mousemove", { bubbles: true }));
+          e.preventDefault();
+          e.stopPropagation();
+          return;
+        }
+      }
+
+      // If menu overlay is open, trap Enter within overlay before any click-through.
+      if (activeOverlay && !activeOverlay.contains(current)) {
+        const first = activeOverlay.querySelector('[tabindex="0"], button, .category-option, .sort-option, [data-qprofile]');
+        if (first && typeof first.focus === "function") first.focus();
+        e.preventDefault();
+        e.stopPropagation();
+        return;
+      }
+
       if (current && current !== document.body) {
         console.log("[REMOTE] Enter on:", current);
         current.click();
       }
+      e.preventDefault();
+      e.stopPropagation();
       return;
     }
 
@@ -3353,10 +3802,17 @@ function setupRemoteNavigation() {
       window.handleAndroidBack();
       e.preventDefault();
       e.stopPropagation();
+      return;
     }
 
     // Spatial Navigation Logic
     if (["ArrowUp", "ArrowDown", "ArrowLeft", "ArrowRight"].includes(key)) {
+      if (activeOverlay) {
+        e.preventDefault();
+        moveFocus(key, activeOverlay);
+        return;
+      }
+
       const playerOverlay = ui.playerOverlay;
       const isPlayerActive =
         playerOverlay && playerOverlay.classList.contains("active");
@@ -3405,7 +3861,26 @@ function setupRemoteNavigation() {
 
       console.log("[REMOTE] Moving focus:", key);
       e.preventDefault();
-      moveFocus(key);
+      const moved = moveFocus(key);
+      if (!moved && (key === "ArrowDown" || key === "ArrowUp")) {
+        const container = document.querySelector(".content-container");
+        if (container) {
+          const delta = key === "ArrowDown" ? 220 : -220;
+          container.scrollBy({ top: delta, behavior: e.repeat ? "auto" : "smooth" });
+          state.scrollLoadArmed = true;
+          console.log(`[REMOTE] No focus target. Scrolling container: ${delta}`);
+        }
+      }
+    }
+
+    // If a modal menu is open, force Enter to act within the menu first.
+    if (key === "Enter" && activeOverlay) {
+      if (!activeOverlay.contains(current)) {
+        const first = activeOverlay.querySelector('[tabindex="0"], button, .category-option, .sort-option, [data-qprofile]');
+        if (first && typeof first.focus === "function") first.focus();
+      }
+      e.preventDefault();
+      return;
     }
   });
 
@@ -3417,17 +3892,20 @@ function setupRemoteNavigation() {
   }, 1000);
 }
 
-function moveFocus(direction) {
+function moveFocus(direction, scopeRoot = document) {
   const current = document.activeElement;
   const focusables = Array.from(
-    document.querySelectorAll(
-      'button, input, [tabindex="0"], .card, .tab, .nav-item:not(.active-placeholder)',
+    scopeRoot.querySelectorAll(
+      'button, input, [tabindex="0"], .card, .tab, .chip, .nav-item:not(.active-placeholder), .category-option, .sort-option, [data-qprofile]',
     ),
   ).filter((el) => el.offsetWidth > 0 && el.offsetHeight > 0);
 
-  if (!current || current === document.body) {
-    if (focusables.length > 0) focusables[0].focus();
-    return;
+  if (!current || current === document.body || (scopeRoot !== document && !scopeRoot.contains(current))) {
+    if (focusables.length > 0) {
+      focusables[0].focus();
+      return true;
+    }
+    return false;
   }
 
   const currentRect = current.getBoundingClientRect();
@@ -3436,12 +3914,19 @@ function moveFocus(direction) {
     y: currentRect.top + currentRect.height / 2,
   };
 
-  const findBestCandidate = (penalty) => {
+  const isCurrentInBottomNav = !!current.closest('.bottom-nav');
+  const isCurrentInGrid = !!current.closest('#library-grid, #search-results');
+  const gridFocusables = focusables.filter((el) => !!el.closest('#library-grid, #search-results'));
+
+  const findBestCandidate = (list, penalty, allowBottomNav = true) => {
     let bestCandidate = null;
     let minDistance = Infinity;
 
-    focusables.forEach((candidate) => {
+    list.forEach((candidate) => {
       if (candidate === current) return;
+
+      const isCandidateBottomNav = !!candidate.closest('.bottom-nav');
+      if (!allowBottomNav && isCandidateBottomNav) return;
 
       const candidateRect = candidate.getBoundingClientRect();
       const candidateCenter = {
@@ -3452,64 +3937,107 @@ function moveFocus(direction) {
       const dx = candidateCenter.x - currentCenter.x;
       const dy = candidateCenter.y - currentCenter.y;
 
-      // Directional Filtering
       let isCorrectDirection = false;
-      if (direction === "ArrowUp") isCorrectDirection = dy < -1;
-      if (direction === "ArrowDown") isCorrectDirection = dy > 1;
-      if (direction === "ArrowLeft") isCorrectDirection = dx < -1;
-      if (direction === "ArrowRight") isCorrectDirection = dx > 1;
+      if (direction === 'ArrowUp') isCorrectDirection = dy < -1;
+      if (direction === 'ArrowDown') isCorrectDirection = dy > 1;
+      if (direction === 'ArrowLeft') isCorrectDirection = dx < -1;
+      if (direction === 'ArrowRight') isCorrectDirection = dx > 1;
+      if (!isCorrectDirection) return;
 
-      if (isCorrectDirection) {
-        // Distance Metric with penalty for perpendicular movement
-        const dist =
-          direction.includes("ArrowUp") || direction.includes("ArrowDown")
-            ? Math.abs(dy) + Math.abs(dx) * penalty
-            : Math.abs(dx) + Math.abs(dy) * penalty;
+      const dist =
+        direction.includes('ArrowUp') || direction.includes('ArrowDown')
+          ? Math.abs(dy) + Math.abs(dx) * penalty
+          : Math.abs(dx) + Math.abs(dy) * penalty;
 
-        if (dist < minDistance) {
-          minDistance = dist;
-          bestCandidate = candidate;
-        }
+      if (dist < minDistance) {
+        minDistance = dist;
+        bestCandidate = candidate;
       }
     });
+
     return bestCandidate;
   };
 
-  // 1. Try with strict alignment (stay in column/row)
-  let target = findBestCandidate(8);
+  const ensureVisibleInContainer = (el) => {
+    const container = document.querySelector('.content-container');
+    if (!container || !el) return;
 
-  // 2. Try with relaxed alignment (if trapped)
-  if (!target) {
-    target = findBestCandidate(1);
+    const crect = container.getBoundingClientRect();
+    const erect = el.getBoundingClientRect();
+    const header = document.querySelector('.glass-header');
+    const sticky = document.querySelector('.view-header');
+    const bottomNav = document.querySelector('.bottom-nav');
+
+    const topInset = (header?.offsetHeight || 0) + (sticky?.offsetHeight || 0) + 16;
+    const bottomInset = (bottomNav?.offsetHeight || 0) + 16;
+
+    const visibleTop = crect.top + topInset;
+    const visibleBottom = crect.bottom - bottomInset;
+
+    if (erect.top < visibleTop) {
+      container.scrollBy({ top: erect.top - visibleTop, behavior: 'smooth' });
+    } else if (erect.bottom > visibleBottom) {
+      container.scrollBy({ top: erect.bottom - visibleBottom, behavior: 'smooth' });
+    }
+  };
+
+  let target = null;
+
+  // When navigating inside grid with UP/DOWN, keep focus inside grid first.
+  if (isCurrentInGrid && (direction === 'ArrowUp' || direction === 'ArrowDown')) {
+    target = findBestCandidate(gridFocusables, 8, true) || findBestCandidate(gridFocusables, 1, true);
+
+    // At top of grid + ArrowUp: prefer smooth scroll up instead of jumping to top tabs.
+    if (!target && direction === 'ArrowUp') {
+      const container = document.querySelector('.content-container');
+      if (container) {
+        container.scrollBy({ top: -220, behavior: 'smooth' });
+        state.scrollLoadArmed = true;
+      }
+      console.log('[REMOTE] Grid ArrowUp with no grid target: keep in list/scroll only');
+      return false;
+    }
+
+    // At end of grid + ArrowDown: allow falling to bottom nav.
+    if (!target && direction === 'ArrowDown') {
+      target = findBestCandidate(focusables, 1, true);
+    }
+  } else {
+    // Default behavior outside grid.
+    const preferNonBottomDown = direction === 'ArrowDown' && !isCurrentInBottomNav;
+
+    target = findBestCandidate(focusables, 8, !preferNonBottomDown)
+      || findBestCandidate(focusables, 1, !preferNonBottomDown);
+
+    if (!target && preferNonBottomDown) {
+      target = document.querySelector('#library-grid .card, #search-results .card');
+    }
+
+    if (!target && preferNonBottomDown) {
+      target = findBestCandidate(focusables, 1, true);
+    }
   }
 
-  // 3. FINAL PANIC ESCAPE: If stuck in bottom nav, jump to library content
-  if (!target && direction === "ArrowUp" && current.closest(".bottom-nav")) {
-    console.log(
-      "[REMOTE] Panic escape from bottom nav: Jumping to first content item",
-    );
-    // Try to find the most relevant "Up" target
-    target = document.querySelector(".card, .tab.active, .tab, #search-input");
+  if (!target && direction === 'ArrowUp' && current.closest('.bottom-nav')) {
+    console.log('[REMOTE] Panic escape from bottom nav: Jumping to first content item');
+    target = document.querySelector('.card, .chip, #search-input, .tab.active, .tab');
   }
 
-  // Double check Target logic for Player
-  if (
-    !target &&
-    direction === "ArrowDown" &&
-    current.closest(".player-header")
-  ) {
+  if (!target && direction === 'ArrowDown' && current.closest('.player-header')) {
     target =
-      document.getElementById("btn-center-play") ||
-      document.getElementById("progress-slider");
+      document.getElementById('btn-center-play') ||
+      document.getElementById('progress-slider');
   }
 
   if (target) {
-    console.log("[REMOTE] Success: Moving focus to", target);
+    console.log('[REMOTE] Success: Moving focus to', target);
     target.focus();
-    target.scrollIntoView({ behavior: "smooth", block: "center" });
-  } else {
-    console.warn("[REMOTE] No focusable candidate found for:", direction);
+    ensureVisibleInContainer(target);
+    return true;
   }
+
+  console.warn('[REMOTE] No focusable candidate found for:', direction);
+  return false;
 }
 
 // Utils

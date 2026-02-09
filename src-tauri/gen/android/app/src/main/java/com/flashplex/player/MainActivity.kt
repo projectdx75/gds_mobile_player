@@ -1,14 +1,17 @@
 package com.flashplex.player
 
-import android.os.Bundle
 import android.content.Intent
+import android.os.Bundle
+import android.view.KeyEvent
 import android.webkit.JavascriptInterface
 import android.webkit.WebView
+import android.widget.Toast
 import androidx.activity.enableEdgeToEdge
 import java.io.File
 
 class MainActivity : TauriActivity() {
   private var mainWebView: WebView? = null
+  private var lastBackPressedAt: Long = 0L
 
   override fun onCreate(savedInstanceState: Bundle?) {
     enableEdgeToEdge()
@@ -18,7 +21,7 @@ class MainActivity : TauriActivity() {
   override fun onWebViewCreate(webView: WebView) {
     super.onWebViewCreate(webView)
     this.mainWebView = webView
-    
+
     webView.addJavascriptInterface(object {
       @JavascriptInterface
       fun openExoPlayer(title: String, url: String, subtitleUrl: String?, subtitleSize: Double, subtitlePos: Double) {
@@ -43,18 +46,58 @@ class MainActivity : TauriActivity() {
     }, "PlayerBridge")
   }
 
-  override fun onKeyDown(keyCode: Int, event: android.view.KeyEvent?): Boolean {
-    if (keyCode == android.view.KeyEvent.KEYCODE_BACK) {
-      // Direct call to JS for centralized navigation control
-      mainWebView?.evaluateJavascript("if(window.handleAndroidBack) { window.handleAndroidBack(); } else { console.log('handeback missing'); }", null)
+  private fun dispatchBackToWebAndMaybeExit() {
+    val web = mainWebView
+    if (web == null) {
+      handleDoubleBackExit()
+      return
+    }
+
+    val js = """
+      (function() {
+        try {
+          if (window.handleAndroidBack) {
+            return window.handleAndroidBack();
+          }
+        } catch (e) {}
+        return "default";
+      })();
+    """.trimIndent()
+
+    web.evaluateJavascript(js) { rawResult ->
+      val action = rawResult
+        ?.trim()
+        ?.removePrefix("\"")
+        ?.removeSuffix("\"")
+        ?.ifBlank { "default" }
+        ?: "default"
+
+      if (action == "default") {
+        handleDoubleBackExit()
+      }
+    }
+  }
+
+  private fun handleDoubleBackExit() {
+    val now = System.currentTimeMillis()
+    if (now - lastBackPressedAt < 2000L) {
+      finishAffinity()
+    } else {
+      lastBackPressedAt = now
+      Toast.makeText(this, "한 번 더 누르면 종료됩니다.", Toast.LENGTH_SHORT).show()
+    }
+  }
+
+  override fun onKeyDown(keyCode: Int, event: KeyEvent?): Boolean {
+    if (keyCode == KeyEvent.KEYCODE_BACK) {
+      dispatchBackToWebAndMaybeExit()
       return true
     }
     return super.onKeyDown(keyCode, event)
   }
 
-  // Also override onBackPressed for modern Android versions
   @Deprecated("Deprecated in Java")
   override fun onBackPressed() {
-    mainWebView?.evaluateJavascript("if(window.handleAndroidBack) { window.handleAndroidBack(); }", null)
+    dispatchBackToWebAndMaybeExit()
   }
 }

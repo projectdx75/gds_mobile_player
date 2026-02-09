@@ -1,23 +1,34 @@
 use std::sync::{Arc, Mutex};
+#[cfg(target_os = "macos")]
 use libmpv2::Mpv;
+#[cfg(target_os = "macos")]
 use cocoa::base::id;
+#[cfg(target_os = "macos")]
 use cocoa::foundation::NSRect;
+#[cfg(target_os = "macos")]
 use objc::{msg_send, sel, sel_impl, class};
 use serde_json;
 use tauri_plugin_http::reqwest;
 
 // Helper struct to hold Mpv instance
+#[cfg(target_os = "macos")]
 struct MpvInstance {
     mpv: Mpv,
     container_view: usize, // Store container to remove on close
     using_layer_wid: bool, // true: CAMetalLayer wid, false: NSView wid
 }
 
+#[cfg(target_os = "macos")]
 unsafe impl Send for MpvInstance {}
+#[cfg(target_os = "macos")]
 unsafe impl Sync for MpvInstance {}
 
 #[allow(dead_code)]
+#[cfg(target_os = "macos")]
 struct MpvState(Arc<Mutex<Option<MpvInstance>>>);
+#[allow(dead_code)]
+#[cfg(not(target_os = "macos"))]
+struct MpvState(Arc<Mutex<Option<()>>>);
 
 use std::io::Write;
 
@@ -27,6 +38,7 @@ fn log_to_file(msg: &str) {
     }
 }
 
+#[cfg(target_os = "macos")]
 fn apply_quality_profile(mpv: &Mpv, profile: &str) -> String {
     let normalized = match profile {
         "quality" => "quality",
@@ -413,6 +425,14 @@ async fn launch_mpv_player(
 
 #[tauri::command(rename_all = "snake_case")]
 fn native_sub_add(state: tauri::State<'_, MpvState>, url: String, title: Option<String>) -> Result<(), String> {
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = (state, url, title);
+        return Err("native_sub_add is only supported on macOS/mpv".to_string());
+    }
+
+    #[cfg(target_os = "macos")]
+    {
     let lock = state.0.lock().map_err(|e| e.to_string())?;
     if let Some(ref instance) = *lock {
         let args: &[&str] = if let Some(ref t) = title {
@@ -426,10 +446,19 @@ fn native_sub_add(state: tauri::State<'_, MpvState>, url: String, title: Option<
     } else {
         Err("Player not active".to_string())
     }
+    }
 }
 
 #[tauri::command(rename_all = "snake_case")]
 fn native_sub_reload(state: tauri::State<'_, MpvState>) -> Result<(), String> {
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = state;
+        return Err("native_sub_reload is only supported on macOS/mpv".to_string());
+    }
+
+    #[cfg(target_os = "macos")]
+    {
     let lock = state.0.lock().map_err(|e| e.to_string())?;
     if let Some(ref instance) = *lock {
         // Re-scan tracks by toggling or just let frontend re-fetch
@@ -437,6 +466,7 @@ fn native_sub_reload(state: tauri::State<'_, MpvState>) -> Result<(), String> {
         Ok(())
     } else {
         Err("Player not active".to_string())
+    }
     }
 }
 
@@ -605,6 +635,25 @@ async fn search_gds(query: String, server_url: String, api_key: String, category
 
 #[tauri::command(rename_all = "snake_case")]
 fn get_mpv_state(state: tauri::State<'_, MpvState>) -> Result<serde_json::Value, String> {
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = state;
+        return Ok(serde_json::json!({
+            "position": 0.0,
+            "duration": 0.0,
+            "pause": true,
+            "hwdec": "no",
+            "sid": -1,
+            "volume": 100,
+            "osd_width": -1,
+            "osd_height": -1,
+            "out_width": -1,
+            "out_height": -1
+        }));
+    }
+
+    #[cfg(target_os = "macos")]
+    {
     let lock = state.0.lock().map_err(|e| e.to_string())?;
     if let Some(ref inst) = *lock {
         let pos = inst.mpv.get_property::<f64>("time-pos").unwrap_or(0.0);
@@ -643,30 +692,57 @@ fn get_mpv_state(state: tauri::State<'_, MpvState>) -> Result<serde_json::Value,
             "out_height": -1
         }))
     }
+    }
 }
 
 #[tauri::command(rename_all = "snake_case")]
 fn native_play_pause(state: tauri::State<'_, MpvState>, pause: bool) -> Result<(), String> {
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = (state, pause);
+        return Ok(());
+    }
+
+    #[cfg(target_os = "macos")]
+    {
     let lock = state.0.lock().map_err(|e| e.to_string())?;
     if let Some(ref instance) = *lock {
         instance.mpv.set_property("pause", pause).map_err(|e| e.to_string())?;
     }
     Ok(())
+    }
 }
 
 #[tauri::command(rename_all = "snake_case")]
 fn native_seek(state: tauri::State<'_, MpvState>, seconds: f64) -> Result<(), String> {
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = (state, seconds);
+        return Ok(());
+    }
+
+    #[cfg(target_os = "macos")]
+    {
     let lock = state.0.lock().map_err(|e| e.to_string())?;
     if let Some(ref instance) = *lock {
         let _ = Mpv::command(&instance.mpv, "seek", &[&seconds.to_string(), "absolute"]);
     }
     Ok(())
+    }
 }
 
 
 
 #[tauri::command(rename_all = "snake_case")]
 fn get_subtitle_tracks(state: tauri::State<'_, MpvState>) -> Result<serde_json::Value, String> {
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = state;
+        return Ok(serde_json::json!([]));
+    }
+
+    #[cfg(target_os = "macos")]
+    {
     let lock = state.0.lock().map_err(|e| e.to_string())?;
     if let Some(ref instance) = *lock {
         let count = instance.mpv.get_property::<i64>("track-list/count").unwrap_or(0);
@@ -706,10 +782,19 @@ fn get_subtitle_tracks(state: tauri::State<'_, MpvState>) -> Result<serde_json::
     } else {
         Ok(serde_json::json!([]))
     }
+    }
 }
 
 #[tauri::command(rename_all = "snake_case")]
 fn set_subtitle_track(state: tauri::State<'_, MpvState>, sid: i64) -> Result<(), String> {
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = (state, sid);
+        return Ok(());
+    }
+
+    #[cfg(target_os = "macos")]
+    {
     let lock = state.0.lock().map_err(|e| e.to_string())?;
     if let Some(ref instance) = *lock {
         // sid=0 usually means disabled in some contexts, but MPV uses specific IDs.
@@ -728,10 +813,19 @@ fn set_subtitle_track(state: tauri::State<'_, MpvState>, sid: i64) -> Result<(),
         }
     }
     Ok(())
+    }
 }
 
 #[tauri::command(rename_all = "snake_case")]
 fn set_subtitle_style(state: tauri::State<'_, MpvState>, scale: Option<f64>, pos: Option<i64>) -> Result<(), String> {
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = (state, scale, pos);
+        return Ok(());
+    }
+
+    #[cfg(target_os = "macos")]
+    {
     let lock = state.0.lock().map_err(|e| e.to_string())?;
     if let Some(ref instance) = *lock {
         if let Some(s) = scale {
@@ -742,19 +836,41 @@ fn set_subtitle_style(state: tauri::State<'_, MpvState>, scale: Option<f64>, pos
         }
     }
     Ok(())
+    }
 }
 
 #[tauri::command(rename_all = "snake_case")]
 fn native_set_volume(state: tauri::State<'_, MpvState>, volume: i64) -> Result<(), String> {
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = (state, volume);
+        return Ok(());
+    }
+
+    #[cfg(target_os = "macos")]
+    {
     let lock = state.0.lock().map_err(|e| e.to_string())?;
     if let Some(ref instance) = *lock {
         instance.mpv.set_property("volume", volume).map_err(|e| e.to_string())?;
     }
     Ok(())
+    }
 }
 
 #[tauri::command(rename_all = "snake_case")]
 fn set_quality_profile(state: tauri::State<'_, MpvState>, profile: String) -> Result<String, String> {
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = state;
+        return Ok(match profile.as_str() {
+            "quality" => "quality".to_string(),
+            "smooth" => "smooth".to_string(),
+            _ => "balanced".to_string(),
+        });
+    }
+
+    #[cfg(target_os = "macos")]
+    {
     let lock = state.0.lock().map_err(|e| e.to_string())?;
     if let Some(ref instance) = *lock {
         Ok(apply_quality_profile(&instance.mpv, profile.as_str()))
@@ -765,15 +881,25 @@ fn set_quality_profile(state: tauri::State<'_, MpvState>, profile: String) -> Re
             _ => "balanced".to_string(),
         })
     }
+    }
 }
 
 #[tauri::command(rename_all = "snake_case")]
 fn native_set_mpv_fullscreen(state: tauri::State<'_, MpvState>, fullscreen: bool) -> Result<(), String> {
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = (state, fullscreen);
+        return Ok(());
+    }
+
+    #[cfg(target_os = "macos")]
+    {
     let lock = state.0.lock().map_err(|e| e.to_string())?;
     if let Some(ref instance) = *lock {
         let _ = instance.mpv.set_property("fullscreen", fullscreen);
     }
     Ok(())
+    }
 }
 
 #[tauri::command(rename_all = "snake_case")]
@@ -788,6 +914,14 @@ fn native_log(msg: String) {
 
 #[tauri::command(rename_all = "snake_case")]
 fn native_toggle_fullscreen(app: tauri::AppHandle) -> Result<(), String> {
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = app;
+        return Err("native_toggle_fullscreen is only supported on macOS".to_string());
+    }
+
+    #[cfg(target_os = "macos")]
+    {
     use tauri::Manager;
     let (tx, rx) = std::sync::mpsc::channel::<Result<(), String>>();
     let app_for_main = app.clone();
@@ -801,6 +935,7 @@ fn native_toggle_fullscreen(app: tauri::AppHandle) -> Result<(), String> {
     })
     .map_err(|e| e.to_string())?;
     rx.recv().map_err(|_| "fullscreen result channel closed".to_string())?
+    }
 }
 
 #[tauri::command(rename_all = "snake_case")]
@@ -821,6 +956,15 @@ fn native_get_fullscreen(app: tauri::AppHandle) -> Result<bool, String> {
 
 #[tauri::command(rename_all = "snake_case")]
 fn native_set_fullscreen(app: tauri::AppHandle, fullscreen: bool) -> Result<(), String> {
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = app;
+        let _ = fullscreen;
+        return Err("native_set_fullscreen is only supported on macOS".to_string());
+    }
+
+    #[cfg(target_os = "macos")]
+    {
     use tauri::Manager;
     let (tx, rx) = std::sync::mpsc::channel::<Result<(), String>>();
     let app_for_main = app.clone();
@@ -833,6 +977,7 @@ fn native_set_fullscreen(app: tauri::AppHandle, fullscreen: bool) -> Result<(), 
     })
     .map_err(|e| e.to_string())?;
     rx.recv().map_err(|_| "set fullscreen channel closed".to_string())?
+    }
 }
 
 #[tauri::command(rename_all = "snake_case")]
@@ -842,6 +987,14 @@ fn native_get_arch() -> String {
 
 #[tauri::command(rename_all = "snake_case")]
 fn native_start_drag(app: tauri::AppHandle) -> Result<(), String> {
+    #[cfg(not(any(target_os = "macos", target_os = "windows", target_os = "linux")))]
+    {
+        let _ = app;
+        return Err("native_start_drag is not supported on this platform".to_string());
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
+    {
     use tauri::Manager;
     let (tx, rx) = std::sync::mpsc::channel::<Result<(), String>>();
     let app_for_main = app.clone();
@@ -854,16 +1007,16 @@ fn native_start_drag(app: tauri::AppHandle) -> Result<(), String> {
     })
     .map_err(|e| e.to_string())?;
     rx.recv().map_err(|_| "drag result channel closed".to_string())?
+    }
 }
 
-#[cfg_attr(mobile, tauri::mobile_entry_point)]
+#[cfg_attr(any(target_os = "android", target_os = "ios"), tauri::mobile_entry_point)]
 pub fn run() {
     println!("\n\n!!! GDS MOBILE PLAYER - NEW BUILD LOADED !!!\n\n");
-    tauri::Builder::default()
+    let mut builder = tauri::Builder::default()
         .manage(MpvState(Arc::new(Mutex::new(None))))
         .plugin(tauri_plugin_http::init())
         .plugin(tauri_plugin_opener::init())
-        .plugin(tauri_plugin_drag::init())
         .invoke_handler(tauri::generate_handler![
             launch_mpv_player,
             close_native_player,
@@ -888,7 +1041,13 @@ pub fn run() {
             search_gds,
             ping,
             get_mpv_state
-        ])
-        .run(tauri::generate_context!())
+        ]);
+
+    #[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
+    {
+        builder = builder.plugin(tauri_plugin_drag::init());
+    }
+
+    builder.run(tauri::generate_context!())
         .expect("error while running tauri application");
 }

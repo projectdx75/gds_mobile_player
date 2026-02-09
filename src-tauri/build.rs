@@ -42,8 +42,14 @@ fn detect_homebrew_lib_dirs() -> Vec<PathBuf> {
 }
 
 fn main() {
-    #[cfg(target_os = "macos")]
-    {
+    tauri_build::build();
+
+    let target_os = env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
+    if target_os != "macos" {
+        // Android/iOS/Linux/Windows targets must not receive macOS framework linker flags.
+        return;
+    }
+
         println!("cargo:rerun-if-env-changed=MPV_LINK_MODE");
         let manifest_dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap());
         let link_mode = env::var("MPV_LINK_MODE").unwrap_or_else(|_| "framework".to_string());
@@ -151,5 +157,4 @@ fn main() {
         // [FIX] Explicitly link Swift Compatibility libraries required by Libmpv.framework
         println!("cargo:rustc-link-lib=static=swiftCompatibility56");
         println!("cargo:rustc-link-lib=static=swiftCompatibilityConcurrency");
-    }
 }

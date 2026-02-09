@@ -1020,6 +1020,16 @@ body.native-recreate-active #premium-osc {
   font-size: 11px;
   font-weight: 600;
   letter-spacing: 0.02em;
+  opacity: 0;
+  transform: translateY(-4px) scale(0.98);
+  transition: opacity 0.18s ease, transform 0.18s ease;
+}
+
+#stable-drag-bar:hover .drag-grip-hint,
+.glass-header:hover #stable-drag-bar .drag-grip-hint,
+.glass-header:focus-within #stable-drag-bar .drag-grip-hint {
+  opacity: 1;
+  transform: translateY(0) scale(1);
 }
 
 .drag-grip-hint i {
@@ -1552,6 +1562,13 @@ body.native-player-active .bottom-nav {
   opacity: 0;
   pointer-events: none;
   transition: opacity 0.5s ease;
+}
+
+body.player-active .glass-header,
+body.player-active .view-header {
+  opacity: 0;
+  pointer-events: none !important;
+  transition: opacity 0.25s ease;
 }
 
 body.native-player-active .glass-header {
@@ -2700,6 +2717,29 @@ body.appletv-skin .card.atv-card .card-info::before {
   pointer-events: none;
   background: linear-gradient(180deg, rgba(6, 9, 16, 0) 0%, rgba(7, 12, 24, 0.78) 52%, rgba(7, 12, 24, 0.92) 100%);
   z-index: -1;
+}
+
+body.appletv-skin .card-topline {
+  display: flex;
+  align-items: center;
+  justify-content: flex-start;
+  min-height: 18px;
+  margin-bottom: 4px;
+}
+
+body.appletv-skin .card-status-badge.on-air {
+  display: inline-flex;
+  align-items: center;
+  padding: 2px 8px;
+  border-radius: 999px;
+  font-size: 0.64rem;
+  font-weight: 800;
+  letter-spacing: 0.05em;
+  color: #fff;
+  border: 1px solid rgba(255, 149, 149, 0.7);
+  background: linear-gradient(135deg, rgba(255, 69, 69, 0.95), rgba(198, 26, 26, 0.92));
+  box-shadow: 0 4px 14px rgba(178, 28, 28, 0.35);
+  text-transform: uppercase;
 }
 
 body.appletv-skin .card-eyebrow {
