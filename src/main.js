@@ -51,6 +51,21 @@ const state = {
   fullscreenEnterRepairAttempted: false,
   lastFullscreenToggleAt: 0,
   domesticVirtualCategory: "방송중",
+  moviePreviewOffset: 0,
+  moviePreviewHasMore: true,
+  moviePreviewLoading: false,
+  moviePreviewSeenKeys: new Set(),
+  moviePreviewItemMap: new Map(),
+  animationRailOffset: 0,
+  animationRailHasMore: true,
+  animationRailLoading: false,
+  animationRailSeenKeys: new Set(),
+  dramaRailOffset: 0,
+  dramaRailHasMore: true,
+  dramaRailLoading: false,
+  dramaRailSeenKeys: new Set(),
+  dramaPreviewCache: new Map(),
+  previewAutoplayUnlocked: false,
 };
 
 // Platform Detection
@@ -65,6 +80,154 @@ let nativeStatePollTimer = null;
 let infiniteObserver = null;
 let observedInfiniteSentinel = null;
 let nativeResizeDebounceTimer = null;
+let moviePreviewHoverTimer = null;
+let activeMoviePreviewCard = null;
+let pendingPreviewRequest = null;
+let moviePreviewScrollTimer = null;
+let moviePreviewAutoSlideTimer = null;
+let moviePreviewUserInteracting = false;
+const MOVIE_PREVIEW_DELAY_MS = 2000;
+const PREVIEW_PLAYABLE_EXTS = new Set(["mp4", "m4v", "webm"]);
+const PREVIEW_SOURCE_EXTS = new Set(["mp4", "m4v", "webm", "mkv", "avi", "mov", "ts"]);
+const PREVIEW_RANDOM_SEEK_MIN_RATIO = 0.12;
+const PREVIEW_RANDOM_SEEK_MAX_RATIO = 0.72;
+let animationRailAutoSlideTimer = null;
+let dramaRailAutoSlideTimer = null;
+let dramaRailUserInteracting = false;
+
+function unlockPreviewAutoplay() {
+  if (state.previewAutoplayUnlocked) return;
+  state.previewAutoplayUnlocked = true;
+  console.log("[PREVIEW] autoplay unlocked by user interaction");
+  if (pendingPreviewRequest) {
+    const { card, item } = pendingPreviewRequest;
+    pendingPreviewRequest = null;
+    scheduleMoviePreviewPlayback(card, item, true);
+  }
+}
+
+function getPathExtension(pathValue) {
+  const raw = String(pathValue || "");
+  const idx = raw.lastIndexOf(".");
+  if (idx < 0) return "";
+  return raw.slice(idx + 1).toLowerCase();
+}
+
+function getParentPath(pathValue) {
+  const raw = String(pathValue || "").replace(/\\/g, "/");
+  const idx = raw.lastIndexOf("/");
+  if (idx <= 0) return "";
+  return raw.slice(0, idx);
+}
+
+function splitPathSegments(pathValue) {
+  return String(pathValue || "")
+    .replace(/\\/g, "/")
+    .split("/")
+    .filter(Boolean);
+}
+
+function cleanMediaTitle(rawTitle) {
+  return String(rawTitle || "")
+    .replace(/\.(mkv|mp4|avi|srt|ass|m4v|webm|ts)$/i, "")
+    .replace(/[._]/g, " ")
+    .trim();
+}
+
+function normalizeWorkTitle(rawTitle) {
+  return cleanMediaTitle(rawTitle)
+    .toUpperCase()
+    .replace(/\b(2160P|1080P|720P|4K|UHD|HDR|DV|HEVC|X265|X264|H\.?265|H\.?264|WEB[\s\-]?DL|BLURAY|AAC|DDP?5?\.?1|ATMOS|KOR|JPN|ENG)\b/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function isGenericAnimeBucket(name) {
+  const n = String(name || "").toLowerCase();
+  const generic = new Set([
+    "video", "ani", "anime", "animation", "애니", "애니메이션",
+    "라프텔", "laftel", "방영중", "완결", "신작", "최신",
+    "tv", "극장판", "더빙", "자막", "고전", "기타",
+  ]);
+  return generic.has(n) || n.length <= 1;
+}
+
+function isSeasonLikeName(name) {
+  const n = String(name || "").toLowerCase();
+  return /^s\d{1,2}$/.test(n) ||
+    /^season\s*\d+/.test(n) ||
+    /^시즌\s*\d+/.test(n) ||
+    n === "specials" ||
+    n === "ova";
+}
+
+function extractEpisodeLabel(item) {
+  const fileName = String(item?.name || item?.title || "");
+  const fromMeta = Number(item?.meta_episode);
+  if (Number.isFinite(fromMeta)) return `EP ${String(fromMeta).padStart(2, "0")}`;
+
+  const sxe = fileName.match(/S(\d{1,2})E(\d{1,3})/i);
+  if (sxe) return `S${sxe[1].padStart(2, "0")}E${sxe[2].padStart(2, "0")}`;
+
+  const ep = fileName.match(/(?:EP?|E|제)\s*\.?(\d{1,3})(?:화)?/i);
+  if (ep) return `EP ${String(ep[1]).padStart(2, "0")}`;
+  return "";
+}
+
+function extractEpisodeNumber(item) {
+  const fromMeta = Number(item?.meta_episode);
+  if (Number.isFinite(fromMeta)) return fromMeta;
+  const fileName = String(item?.name || item?.title || "");
+  const sxe = fileName.match(/S(\d{1,2})E(\d{1,3})/i);
+  if (sxe) return Number(sxe[2]);
+  const ep = fileName.match(/(?:EP?|E|제)\s*\.?(\d{1,3})(?:화)?/i);
+  if (ep) return Number(ep[1]);
+  return -1;
+}
+
+function inferSeriesTitleFromFileName(item) {
+  const base = cleanMediaTitle(item?.meta_title || item?.title || item?.name || "Untitled");
+  return base
+    .replace(/\bS\d{1,2}E\d{1,3}\b/ig, " ")
+    .replace(/\b(?:EP?|E|제)\s*\.?\d{1,3}(?:화)?\b/ig, " ")
+    .replace(/\b(2160P|1080P|720P|4K|UHD|HDR|HEVC|X265|X264|WEB[\s\-]?DL|BLURAY|AAC|DDP?5?\.?1|ATMOS)\b/ig, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function resolveAnimeSeriesMeta(item) {
+  const segs = splitPathSegments(item?.path || "");
+  if (segs.length === 0) {
+    return { seriesPath: "", seriesTitle: cleanMediaTitle(item?.meta_title || item?.title || item?.name || "Untitled") };
+  }
+
+  // Walk upward from file parent and pick first meaningful folder as series anchor.
+  let folderIdx = Math.max(0, segs.length - 2);
+  while (folderIdx > 0) {
+    const name = segs[folderIdx];
+    if (!isSeasonLikeName(name) && !isGenericAnimeBucket(name)) break;
+    folderIdx -= 1;
+  }
+
+  const chosen = segs[folderIdx] || "";
+  const chosenIsGeneric = isGenericAnimeBucket(chosen) || chosen.toLowerCase() === "video";
+  const fallbackTitle = inferSeriesTitleFromFileName(item);
+  const seriesTitle = cleanMediaTitle(chosenIsGeneric ? (fallbackTitle || chosen || "Untitled") : chosen);
+  const prefixPath = "/" + segs.slice(0, Math.max(1, folderIdx + 1)).join("/");
+  // If folder bucket is too generic, include inferred title in key path to avoid collapsing all titles.
+  const seriesPath = chosenIsGeneric ? `${prefixPath}::${seriesTitle}` : prefixPath;
+  return { seriesPath, seriesTitle };
+}
+
+function seekPreviewVideoRandom(video) {
+  if (!video || !Number.isFinite(video.duration) || video.duration <= 1.5) return;
+  const minT = Math.max(0.3, video.duration * PREVIEW_RANDOM_SEEK_MIN_RATIO);
+  const maxT = Math.max(minT + 0.2, video.duration * PREVIEW_RANDOM_SEEK_MAX_RATIO);
+  const target = minT + Math.random() * (maxT - minT);
+  try {
+    video.currentTime = Math.min(Math.max(0.25, target), Math.max(0.4, video.duration - 0.35));
+  } catch (_) {}
+}
 
 function isNearListBottom(extra = 220) {
   const container = document.querySelector(".content-container");
@@ -637,6 +800,12 @@ function initElements() {
       },
       grid: document.getElementById("library-grid"),
       heroSection: document.querySelector(".hero-section"),
+      moviePreviewRail: document.getElementById("movie-preview-rail"),
+      moviePreviewTrack: document.getElementById("movie-preview-track"),
+      animationRail: document.getElementById("animation-rail"),
+      animationTrack: document.getElementById("animation-track"),
+      dramaRail: document.getElementById("drama-rail"),
+      dramaTrack: document.getElementById("drama-track"),
       searchInput: document.getElementById("search-input"),
       navItems: document.querySelectorAll(".nav-item"),
       categoryTabs: document.querySelectorAll(".tab"),
@@ -778,6 +947,10 @@ window.addEventListener("DOMContentLoaded", () => {
   if (window.lucide) lucide.createIcons();
 
   // Register robust global listeners
+  document.addEventListener("keydown", unlockPreviewAutoplay, { once: true });
+  document.addEventListener("mousedown", unlockPreviewAutoplay, { once: true });
+  document.addEventListener("touchstart", unlockPreviewAutoplay, { once: true });
+
   document.addEventListener("click", (e) => {
     const navItem = e.target.closest(".nav-item");
     if (navItem && navItem.dataset.view) {
@@ -798,6 +971,9 @@ window.addEventListener("DOMContentLoaded", () => {
     setupButtons();
     setupSettings();
     setupRemoteNavigation();
+    setupMoviePreviewRail();
+    setupAnimationRail();
+    setupDramaRail();
     setupPremiumOSC();
   } catch (err) {
     console.error("[STARTUP] Setup error:", err);
@@ -898,6 +1074,9 @@ function switchView(viewName) {
     // Use setTimeout to ensure DOM is fully rendered
     setTimeout(() => initHeroCarousel(), 50);
   } else {
+    setMoviePreviewRailVisible(false);
+    setAnimationRailVisible(false);
+    setDramaRailVisible(false);
     // [NEW] Kill hero timer if not in library
     if (heroTimer) {
       console.log("[PLAYER] Leaving library, stopping hero timer");
@@ -1686,6 +1865,25 @@ async function loadLibrary(forceRefresh = false, isAppend = false) {
             setTimeout(() => initHeroCarousel(), 40);
           }
         }
+      }
+
+      const shouldShowMoviePreviewRail =
+        state.currentView === "library" &&
+        !state.currentPath &&
+        state.category !== "favorites";
+      setMoviePreviewRailVisible(shouldShowMoviePreviewRail);
+      if (shouldShowMoviePreviewRail && !isAppend) {
+        loadMoviePreviewRail(false).catch(() => {});
+      }
+      const shouldShowAnimationRail = shouldShowMoviePreviewRail;
+      setAnimationRailVisible(shouldShowAnimationRail);
+      if (shouldShowAnimationRail && !isAppend) {
+        loadAnimationRail(false).catch(() => {});
+      }
+      const shouldShowDramaRail = shouldShowMoviePreviewRail;
+      setDramaRailVisible(shouldShowDramaRail);
+      if (shouldShowDramaRail && !isAppend) {
+        loadDramaRail(false).catch(() => {});
       }
 
       if (!isAppend) renderFolderContextPanel(displayItems);
@@ -2539,6 +2737,895 @@ function toUrlSafeBase64(str) {
   }
 }
 
+function getStreamUrlFromItem(item) {
+  if (!item || !item.path) return "";
+  let cleanPath = String(item.path).normalize("NFC");
+  if (cleanPath && !cleanPath.startsWith("/")) cleanPath = "/" + cleanPath;
+  const bpath = toUrlSafeBase64(cleanPath);
+  if (!bpath) return "";
+  return `${state.serverUrl}/gds_dviewer/normal/stream?bpath=${bpath}&source_id=${normalizeSourceId(item.source_id)}&apikey=${state.apiKey}`;
+}
+
+async function resolvePlayablePreviewItem(item) {
+  if (!item) return null;
+  const ext = getPathExtension(item.path);
+  if (!item.is_dir) {
+    if (PREVIEW_PLAYABLE_EXTS.has(ext)) return item;
+    // File itself is not web-playable (e.g. mkv). Try sibling files in its parent.
+    const parentPath = getParentPath(item.path || "");
+    if (!parentPath) return null;
+    item = { ...item, is_dir: true, path: parentPath };
+  }
+
+  const cacheKey = `${normalizeSourceId(item.source_id)}:${String(item.path || "")}`;
+  if (state.dramaPreviewCache.has(cacheKey)) {
+    return state.dramaPreviewCache.get(cacheKey);
+  }
+
+  try {
+    const sourceId = normalizeSourceId(item.source_id);
+    const queue = [{ path: String(item.path || ""), depth: 0 }];
+    const candidates = [];
+    const visited = new Set();
+
+    while (queue.length > 0 && candidates.length === 0) {
+      const cur = queue.shift();
+      if (!cur || !cur.path) continue;
+      const norm = normalizePathForCompare(cur.path);
+      if (visited.has(norm)) continue;
+      visited.add(norm);
+
+      const bpath = toUrlSafeBase64(cur.path);
+      if (!bpath) continue;
+      const endpoint = `explorer/list?bpath=${bpath}&source_id=${sourceId}&limit=80&apikey=${state.apiKey}`;
+      const data = await gdsFetch(endpoint);
+      const list = data?.list || data?.data || data?.items || [];
+      list.forEach((child) => {
+        if (!child || !child.path) return;
+        if (child.is_dir) {
+          // Some libraries only contain season/episode subfolders at first level.
+          if (cur.depth < 2) queue.push({ path: String(child.path), depth: cur.depth + 1 });
+          return;
+        }
+        const cext = getPathExtension(child.path);
+        if (PREVIEW_SOURCE_EXTS.has(cext)) candidates.push(child);
+      });
+    }
+
+    const candidate = candidates.sort((a, b) => {
+      const epA = extractEpisodeNumber(a);
+      const epB = extractEpisodeNumber(b);
+      if (epA !== epB) return epB - epA; // higher episode first
+
+      const tsA = parseMtimeToEpoch(a?.mtime);
+      const tsB = parseMtimeToEpoch(b?.mtime);
+      if (tsA !== tsB) return tsB - tsA; // newer first
+
+      return String(b?.name || "").localeCompare(String(a?.name || ""));
+    })[0] || null;
+    state.dramaPreviewCache.set(cacheKey, candidate);
+    return candidate;
+  } catch (_) {
+    state.dramaPreviewCache.set(cacheKey, null);
+    return null;
+  }
+}
+
+async function handleDramaCardPreview(card, item) {
+  if (!card || !item) return;
+  const stillActive = () => card.matches(":hover") || card === document.activeElement || card.contains(document.activeElement);
+  console.log("[DRAMA-PREVIEW] resolving preview source:", item?.path || item?.name || "");
+  const previewItem = await resolvePlayablePreviewItem(item);
+  if (!previewItem) {
+    console.warn("[DRAMA-PREVIEW] no playable preview item:", item?.path || item?.name || "");
+    return;
+  }
+  console.log("[DRAMA-PREVIEW] resolved preview source:", previewItem?.path || previewItem?.name || "");
+  const resolvedExt = getPathExtension(previewItem?.path || "");
+  if (!PREVIEW_PLAYABLE_EXTS.has(resolvedExt)) {
+    console.warn("[DRAMA-PREVIEW] resolved source is non-web-playable ext:", resolvedExt || "<none>");
+  }
+  if (!stillActive()) return;
+  scheduleMoviePreviewPlayback(card, previewItem, true);
+}
+
+function getPosterUrlFromItem(item, width = 640) {
+  const noPoster = `${state.serverUrl}/gds_dviewer/static/img/no_poster.png`;
+  if (!item) return noPoster;
+  if (item.meta_poster) {
+    return `${state.serverUrl}/gds_dviewer/normal/proxy?url=${encodeURIComponent(item.meta_poster)}&apikey=${state.apiKey}`;
+  }
+  const bpath = toUrlSafeBase64(item.path || "");
+  if (!bpath) return noPoster;
+  return `${state.serverUrl}/gds_dviewer/normal/thumbnail?bpath=${bpath}&source_id=${normalizeSourceId(item.source_id)}&w=${width}&apikey=${state.apiKey}`;
+}
+
+function stopMoviePreviewPlayback() {
+  if (moviePreviewHoverTimer) {
+    clearTimeout(moviePreviewHoverTimer);
+    moviePreviewHoverTimer = null;
+  }
+  if (!activeMoviePreviewCard) return;
+  const video = activeMoviePreviewCard.querySelector(".movie-preview-video");
+  if (video) {
+    try {
+      video.pause();
+      video.currentTime = 0;
+    } catch (_) {}
+  }
+  activeMoviePreviewCard.classList.remove("previewing");
+  activeMoviePreviewCard = null;
+}
+
+function scheduleMoviePreviewPlayback(card, item, immediate = false) {
+  if (!card || !item) return;
+  if (card.dataset.previewEnabled !== "1") return;
+  stopMoviePreviewPlayback();
+  const run = () => {
+    const video = card.querySelector(".movie-preview-video");
+    if (!video) return;
+    // Desktop webview: muted preview is usually allowed without explicit unlock.
+    if (!state.previewAutoplayUnlocked && isDesktop) {
+      state.previewAutoplayUnlocked = true;
+    }
+    if (!state.previewAutoplayUnlocked) {
+      pendingPreviewRequest = { card, item };
+      console.log("[PREVIEW] blocked: autoplay not unlocked");
+      return;
+    }
+    const streamUrl = getStreamUrlFromItem(item);
+    if (!streamUrl) {
+      console.warn("[PREVIEW] blocked: empty stream url", item?.path || item?.name || "");
+      return;
+    }
+    console.log("[PREVIEW] attempt:", item?.path || item?.name || "", streamUrl);
+
+    card.classList.add("previewing");
+    video.muted = true;
+    video.defaultMuted = true;
+    video.volume = 0;
+    // Rebind source each attempt to avoid stuck states in WebView media pipeline.
+    try {
+      video.pause();
+    } catch (_) {}
+    video.src = streamUrl;
+    video.load();
+    if (video.readyState >= 1) {
+      seekPreviewVideoRandom(video);
+    } else {
+      video.addEventListener("loadedmetadata", () => {
+        seekPreviewVideoRandom(video);
+      }, { once: true });
+    }
+    let settled = false;
+    video.addEventListener("loadedmetadata", () => {
+      console.log("[PREVIEW] event loadedmetadata:", {
+        path: item?.path || item?.name || "",
+        duration: Number(video.duration || 0),
+      });
+    }, { once: true });
+    video.addEventListener("canplay", () => {
+      console.log("[PREVIEW] event canplay:", item?.path || item?.name || "");
+    }, { once: true });
+    video.addEventListener("waiting", () => {
+      console.log("[PREVIEW] event waiting:", item?.path || item?.name || "");
+    }, { once: true });
+    video.addEventListener("stalled", () => {
+      console.warn("[PREVIEW] event stalled:", item?.path || item?.name || "");
+    }, { once: true });
+    video.addEventListener("playing", () => {
+      settled = true;
+      console.log("[PREVIEW] event playing:", item?.path || item?.name || "");
+    }, { once: true });
+    video.addEventListener("error", () => {
+      settled = true;
+      const mediaErr = video.error;
+      console.warn("[PREVIEW] event error:", {
+        code: mediaErr?.code || 0,
+        message: mediaErr?.message || "",
+        path: item?.path || item?.name || "",
+      });
+    }, { once: true });
+    setTimeout(() => {
+      if (settled) return;
+      const bufferedEnd = video.buffered && video.buffered.length > 0
+        ? Number(video.buffered.end(video.buffered.length - 1) || 0)
+        : 0;
+      console.warn("[PREVIEW] no-start timeout:", {
+        path: item?.path || item?.name || "",
+        readyState: video.readyState,
+        networkState: video.networkState,
+        currentSrc: video.currentSrc || "",
+        bufferedEnd,
+      });
+    }, 2500);
+
+    let playResult;
+    try {
+      playResult = video.play();
+    } catch (err) {
+      card.classList.remove("previewing");
+      console.warn("[PREVIEW] video play threw:", err?.message || err);
+      return;
+    }
+
+    if (playResult && typeof playResult.then === "function") {
+      playResult.then(() => {
+        console.log("[PREVIEW] play started:", item?.path || item?.name || "");
+      }).catch((err) => {
+        card.classList.remove("previewing");
+        const name = String(err?.name || "").toLowerCase();
+        const msg = String(err?.message || err || "").toLowerCase();
+        // Frequent/expected failures: avoid noisy warnings.
+        if (name.includes("abort") || msg.includes("aborted")) return;
+        if (name.includes("notallowed") || msg.includes("not allowed")) {
+          pendingPreviewRequest = { card, item };
+          return;
+        }
+        if (name.includes("notsupported") || msg.includes("not supported")) {
+          card.dataset.previewEnabled = "0";
+          return;
+        }
+        console.warn("[PREVIEW] video play failed:", err?.message || err);
+      });
+    } else {
+      // Some WebViews do not return a Promise from play().
+      console.log("[PREVIEW] play() returned non-promise:", item?.path || item?.name || "");
+    }
+    activeMoviePreviewCard = card;
+  };
+
+  if (immediate) {
+    run();
+  } else {
+    moviePreviewHoverTimer = setTimeout(run, MOVIE_PREVIEW_DELAY_MS);
+  }
+}
+
+function setMoviePreviewRailVisible(active) {
+  if (!ui.moviePreviewRail) return;
+  ui.moviePreviewRail.classList.toggle("hidden", !active);
+  if (!active) {
+    stopMoviePreviewAutoSlide();
+    stopMoviePreviewPlayback();
+    if (moviePreviewScrollTimer) {
+      clearTimeout(moviePreviewScrollTimer);
+      moviePreviewScrollTimer = null;
+    }
+    pendingPreviewRequest = null;
+    if (ui.moviePreviewTrack) ui.moviePreviewTrack.innerHTML = "";
+    state.moviePreviewOffset = 0;
+    state.moviePreviewHasMore = true;
+    state.moviePreviewSeenKeys.clear();
+    state.moviePreviewItemMap.clear();
+  } else {
+    startMoviePreviewAutoSlide();
+  }
+}
+
+function setAnimationRailVisible(active) {
+  if (!ui.animationRail) return;
+  ui.animationRail.classList.toggle("hidden", !active);
+  if (!active) {
+    stopAnimationRailAutoSlide();
+    if (ui.animationTrack) ui.animationTrack.innerHTML = "";
+    state.animationRailOffset = 0;
+    state.animationRailHasMore = true;
+    state.animationRailSeenKeys.clear();
+  } else {
+    startAnimationRailAutoSlide();
+  }
+}
+
+function setDramaRailVisible(active) {
+  if (!ui.dramaRail) return;
+  ui.dramaRail.classList.toggle("hidden", !active);
+  if (!active) {
+    stopDramaRailAutoSlide();
+    if (ui.dramaTrack) ui.dramaTrack.innerHTML = "";
+    state.dramaRailOffset = 0;
+    state.dramaRailHasMore = true;
+    state.dramaRailSeenKeys.clear();
+  } else {
+    startDramaRailAutoSlide();
+  }
+}
+
+function stopMoviePreviewAutoSlide() {
+  if (moviePreviewAutoSlideTimer) {
+    clearInterval(moviePreviewAutoSlideTimer);
+    moviePreviewAutoSlideTimer = null;
+  }
+}
+
+function startMoviePreviewAutoSlide() {
+  const track = ui.moviePreviewTrack;
+  if (!track) return;
+  stopMoviePreviewAutoSlide();
+  moviePreviewAutoSlideTimer = setInterval(() => {
+    if (!ui.moviePreviewRail || ui.moviePreviewRail.classList.contains("hidden")) return;
+    if (moviePreviewUserInteracting) return;
+    const cards = track.querySelectorAll(".movie-preview-card");
+    if (!cards || cards.length < 2) return;
+
+    const firstCard = cards[0];
+    const step = Math.max(180, Math.round(firstCard.getBoundingClientRect().width + 12));
+    const nearEnd = track.scrollLeft + track.clientWidth >= track.scrollWidth - step - 16;
+    if (nearEnd) {
+      track.scrollTo({ left: 0, behavior: "smooth" });
+    } else {
+      track.scrollBy({ left: step, behavior: "smooth" });
+    }
+  }, 4200);
+}
+
+function stopAnimationRailAutoSlide() {
+  if (animationRailAutoSlideTimer) {
+    clearInterval(animationRailAutoSlideTimer);
+    animationRailAutoSlideTimer = null;
+  }
+}
+
+function startAnimationRailAutoSlide() {
+  const track = ui.animationTrack;
+  if (!track) return;
+  stopAnimationRailAutoSlide();
+  animationRailAutoSlideTimer = setInterval(() => {
+    if (!ui.animationRail || ui.animationRail.classList.contains("hidden")) return;
+    const cards = track.querySelectorAll(".movie-preview-card");
+    if (!cards || cards.length < 2) return;
+    const firstCard = cards[0];
+    const step = Math.max(180, Math.round(firstCard.getBoundingClientRect().width + 12));
+    const nearEnd = track.scrollLeft + track.clientWidth >= track.scrollWidth - step - 16;
+    if (nearEnd) track.scrollTo({ left: 0, behavior: "smooth" });
+    else track.scrollBy({ left: step, behavior: "smooth" });
+  }, 4600);
+}
+
+function stopDramaRailAutoSlide() {
+  if (dramaRailAutoSlideTimer) {
+    clearInterval(dramaRailAutoSlideTimer);
+    dramaRailAutoSlideTimer = null;
+  }
+}
+
+function startDramaRailAutoSlide() {
+  const track = ui.dramaTrack;
+  if (!track) return;
+  stopDramaRailAutoSlide();
+  dramaRailAutoSlideTimer = setInterval(() => {
+    if (!ui.dramaRail || ui.dramaRail.classList.contains("hidden")) return;
+    const active = document.activeElement;
+    const focusInside = !!(active && track.contains(active));
+    if (dramaRailUserInteracting || track.matches(":hover") || focusInside) return;
+    const cards = track.querySelectorAll(".movie-preview-card");
+    if (!cards || cards.length < 2) return;
+    const firstCard = cards[0];
+    const step = Math.max(180, Math.round(firstCard.getBoundingClientRect().width + 12));
+    const nearEnd = track.scrollLeft + track.clientWidth >= track.scrollWidth - step - 16;
+    if (nearEnd) track.scrollTo({ left: 0, behavior: "smooth" });
+    else track.scrollBy({ left: step, behavior: "smooth" });
+  }, 5000);
+}
+
+function getLeftmostVisiblePreviewCard() {
+  const track = ui.moviePreviewTrack;
+  return getLeftmostVisibleCardInTrack(track);
+}
+
+function getLeftmostVisibleCardInTrack(track) {
+  if (!track) return null;
+  const cards = Array.from(track.querySelectorAll(".movie-preview-card"));
+  if (cards.length === 0) return null;
+  const tr = track.getBoundingClientRect();
+  const visible = cards.filter((card) => {
+    const r = card.getBoundingClientRect();
+    return r.right > tr.left + 6 && r.left < tr.right - 6;
+  });
+  if (visible.length === 0) return cards[0] || null;
+  visible.sort((a, b) => a.getBoundingClientRect().left - b.getBoundingClientRect().left);
+  return visible[0] || null;
+}
+
+function isLeftmostCardInTrack(card, track) {
+  if (!card || !track) return false;
+  const leftmost = getLeftmostVisibleCardInTrack(track);
+  markLeftAnchorCard(track, leftmost);
+  return !!leftmost && leftmost === card;
+}
+
+function markLeftAnchorCard(trackEl, cardEl) {
+  if (!trackEl) return;
+  const cards = trackEl.querySelectorAll(".movie-preview-card");
+  cards.forEach((c) => c.classList.remove("is-left-anchor"));
+  if (cardEl) cardEl.classList.add("is-left-anchor");
+}
+
+function canRunMoviePreviewNow() {
+  const track = ui.moviePreviewTrack;
+  if (!track) return false;
+  const active = document.activeElement;
+  const focusInside = !!(active && track.contains(active));
+  return moviePreviewUserInteracting || focusInside;
+}
+
+function triggerLeftmostMoviePreview() {
+  const track = ui.moviePreviewTrack;
+  const card = getLeftmostVisiblePreviewCard();
+  markLeftAnchorCard(track, card);
+  if (!canRunMoviePreviewNow()) return;
+  if (!card) return;
+  if (card.dataset.previewEnabled !== "1") return;
+  const key = card.dataset.previewKey || "";
+  const item = state.moviePreviewItemMap.get(key);
+  if (!item) return;
+  scheduleMoviePreviewPlayback(card, item);
+}
+
+async function loadMoviePreviewRail(append = false) {
+  if (!ui.moviePreviewRail || !ui.moviePreviewTrack) return;
+  if (!!state.currentPath) return;
+  if (state.moviePreviewLoading) return;
+  if (append && !state.moviePreviewHasMore) return;
+
+  state.moviePreviewLoading = true;
+  try {
+    const params = new URLSearchParams({
+      query: "",
+      category: "movie",
+      is_dir: "false",
+      recursive: "true",
+      sort_by: "date",
+      sort_order: "desc",
+      source_id: String(state.sourceId ?? 0),
+      limit: "20",
+      offset: String(append ? state.moviePreviewOffset : 0),
+    });
+
+    const data = await gdsFetch(`search?${params.toString()}`);
+    if (!data || data.ret !== "success") return;
+    const list = data.list || data.data || [];
+    const videoExtensions = [".mp4", ".mkv", ".avi", ".mov", ".webm", ".m4v", ".ts"];
+    const candidates = list.filter((item) => {
+      if (!item || item.is_dir || !item.path) return false;
+      const lower = String(item.path).toLowerCase();
+      if (!videoExtensions.some((ext) => lower.endsWith(ext))) return false;
+      const ext = getPathExtension(item.path);
+      return PREVIEW_PLAYABLE_EXTS.has(ext);
+    });
+
+    if (!append) {
+      ui.moviePreviewTrack.innerHTML = "";
+      state.moviePreviewSeenKeys.clear();
+      state.moviePreviewItemMap.clear();
+      state.moviePreviewOffset = 0;
+      state.moviePreviewHasMore = true;
+    }
+
+    // Collapse variants (4K/1080p/release tags) to one card per movie title.
+    const movieMap = new Map();
+    candidates.forEach((item) => {
+      const titleKey = normalizeWorkTitle(item.meta_title || item.title || item.name || "Untitled");
+      const prev = movieMap.get(titleKey);
+      if (!prev) {
+        movieMap.set(titleKey, item);
+        return;
+      }
+      const nowTs = parseMtimeToEpoch(item.mtime);
+      const prevTs = parseMtimeToEpoch(prev.mtime);
+      if (nowTs > prevTs) movieMap.set(titleKey, item);
+    });
+
+    const groupedMovies = Array.from(movieMap.entries())
+      .map(([titleKey, item]) => ({ titleKey, item }))
+      .sort((a, b) => parseMtimeToEpoch(b.item?.mtime) - parseMtimeToEpoch(a.item?.mtime));
+
+    const frag = document.createDocumentFragment();
+    let added = 0;
+    groupedMovies.forEach(({ titleKey, item }, idx) => {
+      if (state.moviePreviewSeenKeys.has(titleKey)) return;
+      state.moviePreviewSeenKeys.add(titleKey);
+
+      const displayTitle = cleanMediaTitle(item.meta_title || item.title || item.name || "Untitled");
+      const poster = getPosterUrlFromItem(item, 540);
+      const previewEnabled = true;
+      const card = document.createElement("button");
+      card.type = "button";
+      card.className = "movie-preview-card";
+      card.setAttribute("tabindex", "0");
+      card.dataset.previewEnabled = previewEnabled ? "1" : "0";
+      card.dataset.previewIndex = String(ui.moviePreviewTrack.children.length + idx);
+      const previewKey = `${titleKey}_${state.moviePreviewOffset}_${idx}`;
+      card.dataset.previewKey = previewKey;
+      state.moviePreviewItemMap.set(previewKey, item);
+      card.innerHTML = `
+        <div class="movie-preview-media">
+          <img class="movie-preview-poster" src="${poster}" alt="${displayTitle}" loading="lazy">
+          <video class="movie-preview-video" playsinline muted loop preload="none"></video>
+          <div class="movie-preview-gradient"></div>
+        </div>
+        <div class="movie-preview-title">${displayTitle}</div>
+      `;
+
+      card.addEventListener("click", () => playVideo(item));
+      frag.appendChild(card);
+      added += 1;
+    });
+
+    if (added > 0) ui.moviePreviewTrack.appendChild(frag);
+    if (ui.moviePreviewTrack.children.length > 0) {
+      const leftCard = getLeftmostVisiblePreviewCard();
+      markLeftAnchorCard(ui.moviePreviewTrack, leftCard);
+    }
+    state.moviePreviewOffset += Number(list.length || 0);
+    state.moviePreviewHasMore = list.length >= 20;
+    if (!append && ui.moviePreviewTrack.children.length === 0) {
+      setMoviePreviewRailVisible(false);
+    }
+  } catch (err) {
+    console.warn("[PREVIEW] movie rail load failed:", err?.message || err);
+  } finally {
+    state.moviePreviewLoading = false;
+  }
+}
+
+async function loadAnimationRail(append = false) {
+  if (!ui.animationRail || !ui.animationTrack) return;
+  if (!!state.currentPath) return;
+  if (state.animationRailLoading) return;
+  if (append && !state.animationRailHasMore) return;
+
+  state.animationRailLoading = true;
+  try {
+    const baseParams = {
+      category: "animation",
+      is_dir: "false",
+      recursive: "true",
+      sort_by: "date",
+      sort_order: "desc",
+      source_id: String(state.sourceId ?? 0),
+      limit: "20",
+      offset: String(append ? state.animationRailOffset : 0),
+    };
+
+    const primary = new URLSearchParams({ ...baseParams, query: "라프텔" });
+    let data = await gdsFetch(`search?${primary.toString()}`);
+    let list = (data && data.ret === "success") ? (data.list || data.data || []) : [];
+
+    if (list.length < 8 && !append) {
+      const fallback = new URLSearchParams({ ...baseParams, query: "" });
+      const fallbackData = await gdsFetch(`search?${fallback.toString()}`);
+      if (fallbackData && fallbackData.ret === "success") {
+        const more = fallbackData.list || fallbackData.data || [];
+        list = [...list, ...more];
+      }
+    }
+
+    const videoExtensions = [".mp4", ".mkv", ".avi", ".mov", ".webm", ".m4v", ".ts"];
+    const candidates = list.filter((item) => {
+      if (!item || item.is_dir || !item.path) return false;
+      const lower = String(item.path).toLowerCase();
+      return videoExtensions.some((ext) => lower.endsWith(ext));
+    });
+
+    if (!append) {
+      ui.animationTrack.innerHTML = "";
+      state.animationRailSeenKeys.clear();
+      state.animationRailOffset = 0;
+      state.animationRailHasMore = true;
+    }
+
+    // Collapse episode files into one card per anime title (latest episode only).
+    const seriesMap = new Map();
+    candidates.forEach((item) => {
+      const meta = resolveAnimeSeriesMeta(item);
+      const seriesKey = normalizePathForCompare(meta.seriesPath || getParentPath(item.path || "") || item.path || item.name);
+      const prev = seriesMap.get(seriesKey);
+      if (!prev) {
+        seriesMap.set(seriesKey, { item, meta });
+        return;
+      }
+
+      const epNow = extractEpisodeNumber(item);
+      const epPrev = extractEpisodeNumber(prev.item);
+      if (epNow > epPrev) {
+        seriesMap.set(seriesKey, { item, meta });
+        return;
+      }
+      if (epNow === epPrev) {
+        const nowTs = parseMtimeToEpoch(item.mtime);
+        const prevTs = parseMtimeToEpoch(prev.item.mtime);
+        if (nowTs > prevTs) seriesMap.set(seriesKey, { item, meta });
+      }
+    });
+
+    const seriesList = Array.from(seriesMap.values()).sort((a, b) => {
+      const ta = parseMtimeToEpoch(a.item?.mtime);
+      const tb = parseMtimeToEpoch(b.item?.mtime);
+      return tb - ta;
+    });
+
+    const frag = document.createDocumentFragment();
+    let added = 0;
+    seriesList.forEach(({ item, meta }) => {
+      const dedupKey = normalizePathForCompare(meta.seriesPath || item.path || item.name);
+      if (state.animationRailSeenKeys.has(dedupKey)) return;
+      state.animationRailSeenKeys.add(dedupKey);
+
+      const title = cleanMediaTitle(meta.seriesTitle || item.meta_title || item.title || item.name || "Untitled");
+      const episode = extractEpisodeLabel(item);
+      const seriesPath = String(meta.seriesPath || "").trim();
+      const seriesBpath = seriesPath
+        ? toUrlSafeBase64(seriesPath.startsWith("/") ? seriesPath : `/${seriesPath}`)
+        : "";
+      const poster = seriesBpath
+        ? `${state.serverUrl}/gds_dviewer/normal/thumbnail?bpath=${seriesBpath}&source_id=${normalizeSourceId(item.source_id)}&w=540&apikey=${state.apiKey}`
+        : getPosterUrlFromItem(item, 540);
+      const ext = getPathExtension(item.path);
+      const previewEnabled = PREVIEW_PLAYABLE_EXTS.has(ext);
+
+      const card = document.createElement("button");
+      card.type = "button";
+      card.className = "movie-preview-card";
+      card.setAttribute("tabindex", "0");
+      card.dataset.previewEnabled = previewEnabled ? "1" : "0";
+      card.innerHTML = `
+        <div class="movie-preview-media">
+          <img class="movie-preview-poster" src="${poster}" alt="${title}" loading="lazy">
+          <video class="movie-preview-video" playsinline muted loop preload="none"></video>
+          <div class="movie-preview-gradient"></div>
+        </div>
+        <div class="movie-preview-title">${title}</div>
+        <div class="movie-preview-subtitle">${episode || "LATEST"}</div>
+      `;
+      card.addEventListener("click", () => playVideo(item));
+      if (previewEnabled) {
+        card.addEventListener("mouseenter", () => scheduleMoviePreviewPlayback(card, item));
+        card.addEventListener("mouseleave", () => stopMoviePreviewPlayback());
+        card.addEventListener("focus", () => {
+          const isLeftmost = isLeftmostCardInTrack(card, ui.animationTrack);
+          console.log("[ANIME-PREVIEW] card focus:", {
+            title,
+            path: item?.path || "",
+            isLeftmost,
+          });
+          if (!isLeftmost) return;
+          scheduleMoviePreviewPlayback(card, item);
+        });
+        card.addEventListener("blur", () => stopMoviePreviewPlayback());
+      }
+      frag.appendChild(card);
+      added += 1;
+    });
+
+    if (added > 0) ui.animationTrack.appendChild(frag);
+    if (ui.animationTrack.children.length > 0) {
+      const cards = Array.from(ui.animationTrack.querySelectorAll(".movie-preview-card"));
+      markLeftAnchorCard(ui.animationTrack, cards[0] || null);
+    }
+    state.animationRailOffset += Number(list.length || 0);
+    state.animationRailHasMore = list.length >= 20;
+    if (!append && ui.animationTrack.children.length === 0) {
+      setAnimationRailVisible(false);
+    }
+  } catch (err) {
+    console.warn("[ANIME-RAIL] load failed:", err?.message || err);
+  } finally {
+    state.animationRailLoading = false;
+  }
+}
+
+async function loadDramaRail(append = false) {
+  if (!ui.dramaRail || !ui.dramaTrack) return;
+  if (!!state.currentPath) return;
+  if (state.dramaRailLoading) return;
+  if (append && !state.dramaRailHasMore) return;
+
+  state.dramaRailLoading = true;
+  try {
+    const params = new URLSearchParams({
+      bucket: "드라마",
+      limit: "20",
+      offset: String(append ? state.dramaRailOffset : 0),
+      sort_by: state.sortBy || "date",
+      sort_order: state.sortOrder || "desc",
+      source_id: String(state.sourceId ?? 0),
+    });
+    const data = await gdsFetch(`series_domestic?${params.toString()}`);
+    if (!data || data.ret !== "success") return;
+    const list = data.list || data.data || data.items || [];
+
+    if (!append) {
+      ui.dramaTrack.innerHTML = "";
+      state.dramaRailSeenKeys.clear();
+      state.dramaRailOffset = 0;
+      state.dramaRailHasMore = true;
+    }
+
+    const frag = document.createDocumentFragment();
+    let added = 0;
+    list.forEach((item) => {
+      const key = normalizePathForCompare(item.path || item.name || "");
+      if (state.dramaRailSeenKeys.has(key)) return;
+      state.dramaRailSeenKeys.add(key);
+
+      const title = cleanMediaTitle(item.meta_title || item.title || item.name || "Untitled");
+      const subtitle = item.is_dir ? "SERIES" : (extractEpisodeLabel(item) || "EP -");
+      const poster = item.meta_poster || item.poster || (() => {
+        const bpath = toUrlSafeBase64(item.path || "");
+        if (!bpath) return `${state.serverUrl}/gds_dviewer/static/img/no_poster.png`;
+        return `${state.serverUrl}/gds_dviewer/normal/thumbnail?bpath=${bpath}&source_id=${normalizeSourceId(item.source_id)}&w=540&apikey=${state.apiKey}`;
+      })();
+
+      const card = document.createElement("button");
+      card.type = "button";
+      card.className = "movie-preview-card";
+      card.setAttribute("tabindex", "0");
+      const ext = getPathExtension(item.path);
+      const previewEnabled = !!item.is_dir || PREVIEW_PLAYABLE_EXTS.has(ext);
+      card.dataset.previewEnabled = previewEnabled ? "1" : "0";
+      card.innerHTML = `
+        <div class="movie-preview-media">
+          <img class="movie-preview-poster" src="${poster}" alt="${title}" loading="lazy">
+          <video class="movie-preview-video" playsinline muted loop preload="none"></video>
+          <div class="movie-preview-gradient"></div>
+        </div>
+        <div class="movie-preview-title">${title}</div>
+        <div class="movie-preview-subtitle">${subtitle}</div>
+      `;
+      card.addEventListener("click", () => {
+        if (item.is_dir) {
+          state.currentPath = item.path || "";
+          state.pathStack = state.currentPath ? [state.currentPath] : [];
+          state.query = "";
+          loadLibrary(true);
+        } else {
+          playVideo(item);
+        }
+      });
+      card.addEventListener("mouseenter", () => {
+        dramaRailUserInteracting = true;
+        stopDramaRailAutoSlide();
+        const isLeftmost = isLeftmostCardInTrack(card, ui.dramaTrack);
+        if (!previewEnabled || !isLeftmost) return;
+        console.log("[DRAMA-PREVIEW] trigger mouseenter:", {
+          title,
+          path: item?.path || "",
+          previewEnabled,
+          isLeftmost,
+        });
+        handleDramaCardPreview(card, item);
+      });
+      card.addEventListener("mouseleave", () => stopMoviePreviewPlayback());
+      card.addEventListener("focus", () => {
+        const isLeftmost = isLeftmostCardInTrack(card, ui.dramaTrack);
+        if (!previewEnabled || !isLeftmost) return;
+        console.log("[DRAMA-PREVIEW] trigger focus:", {
+          title,
+          path: item?.path || "",
+          previewEnabled,
+          isLeftmost,
+        });
+        handleDramaCardPreview(card, item);
+      });
+      card.addEventListener("blur", () => stopMoviePreviewPlayback());
+      frag.appendChild(card);
+      added += 1;
+    });
+
+    if (added > 0) ui.dramaTrack.appendChild(frag);
+    state.dramaRailOffset += Number(list.length || 0);
+    state.dramaRailHasMore = list.length >= 20;
+    if (!append && ui.dramaTrack.children.length === 0) {
+      setDramaRailVisible(false);
+    }
+  } catch (err) {
+    console.warn("[DRAMA-RAIL] load failed:", err?.message || err);
+  } finally {
+    state.dramaRailLoading = false;
+  }
+}
+
+function setupMoviePreviewRail() {
+  if (!ui.moviePreviewTrack || ui.moviePreviewTrack.dataset.bound === "1") return;
+  ui.moviePreviewTrack.dataset.bound = "1";
+  ui.moviePreviewTrack.addEventListener("mouseenter", () => {
+    unlockPreviewAutoplay();
+    moviePreviewUserInteracting = true;
+    stopMoviePreviewAutoSlide();
+    triggerLeftmostMoviePreview();
+  });
+  ui.moviePreviewTrack.addEventListener("mouseleave", () => {
+    moviePreviewUserInteracting = false;
+    stopMoviePreviewPlayback();
+    startMoviePreviewAutoSlide();
+  });
+  ui.moviePreviewTrack.addEventListener("focusin", () => {
+    moviePreviewUserInteracting = true;
+    stopMoviePreviewAutoSlide();
+    triggerLeftmostMoviePreview();
+  });
+  ui.moviePreviewTrack.addEventListener("focusout", () => {
+    const active = document.activeElement;
+    moviePreviewUserInteracting = !!(active && ui.moviePreviewTrack && ui.moviePreviewTrack.contains(active));
+    if (!moviePreviewUserInteracting) stopMoviePreviewPlayback();
+    startMoviePreviewAutoSlide();
+  });
+  ui.moviePreviewTrack.addEventListener("scroll", () => {
+    if (!ui.moviePreviewTrack) return;
+    const remain = ui.moviePreviewTrack.scrollWidth - (ui.moviePreviewTrack.scrollLeft + ui.moviePreviewTrack.clientWidth);
+    if (remain < 260) loadMoviePreviewRail(true);
+    if (moviePreviewScrollTimer) clearTimeout(moviePreviewScrollTimer);
+    moviePreviewScrollTimer = setTimeout(() => {
+      triggerLeftmostMoviePreview();
+    }, 130);
+  }, { passive: true });
+}
+
+function setupAnimationRail() {
+  if (!ui.animationTrack || ui.animationTrack.dataset.bound === "1") return;
+  ui.animationTrack.dataset.bound = "1";
+  ui.animationTrack.addEventListener("mouseenter", () => {
+    unlockPreviewAutoplay();
+    stopAnimationRailAutoSlide();
+  });
+  ui.animationTrack.addEventListener("mouseleave", () => {
+    startAnimationRailAutoSlide();
+  });
+  ui.animationTrack.addEventListener("focusin", () => {
+    const activeTitle = document.activeElement?.querySelector?.(".movie-preview-title")?.textContent || "";
+    console.log("[ANIME-PREVIEW] track focusin:", activeTitle);
+    stopAnimationRailAutoSlide();
+  });
+  ui.animationTrack.addEventListener("focusout", () => {
+    startAnimationRailAutoSlide();
+  });
+  ui.animationTrack.addEventListener("scroll", () => {
+    if (!ui.animationTrack) return;
+    const cards = Array.from(ui.animationTrack.querySelectorAll(".movie-preview-card"));
+    const tr = ui.animationTrack.getBoundingClientRect();
+    const leftmost = cards
+      .filter((card) => {
+        const r = card.getBoundingClientRect();
+        return r.right > tr.left + 6 && r.left < tr.right - 6;
+      })
+      .sort((a, b) => a.getBoundingClientRect().left - b.getBoundingClientRect().left)[0] || cards[0] || null;
+    markLeftAnchorCard(ui.animationTrack, leftmost);
+    const remain = ui.animationTrack.scrollWidth - (ui.animationTrack.scrollLeft + ui.animationTrack.clientWidth);
+    if (remain < 260) loadAnimationRail(true);
+  }, { passive: true });
+}
+
+function setupDramaRail() {
+  if (!ui.dramaTrack || ui.dramaTrack.dataset.bound === "1") return;
+  ui.dramaTrack.dataset.bound = "1";
+  ui.dramaTrack.addEventListener("mouseenter", () => {
+    dramaRailUserInteracting = true;
+    unlockPreviewAutoplay();
+    stopDramaRailAutoSlide();
+  });
+  ui.dramaTrack.addEventListener("mouseleave", () => {
+    dramaRailUserInteracting = false;
+    startDramaRailAutoSlide();
+  });
+  ui.dramaTrack.addEventListener("focusin", () => {
+    dramaRailUserInteracting = true;
+    const activeTitle = document.activeElement?.querySelector?.(".movie-preview-title")?.textContent || "";
+    console.log("[DRAMA-PREVIEW] track focusin:", activeTitle);
+    unlockPreviewAutoplay();
+    stopDramaRailAutoSlide();
+  });
+  ui.dramaTrack.addEventListener("focusout", () => {
+    const active = document.activeElement;
+    dramaRailUserInteracting = !!(active && ui.dramaTrack && ui.dramaTrack.contains(active));
+    if (!dramaRailUserInteracting) startDramaRailAutoSlide();
+  });
+  ui.dramaTrack.addEventListener("scroll", () => {
+    const remain = ui.dramaTrack.scrollWidth - (ui.dramaTrack.scrollLeft + ui.dramaTrack.clientWidth);
+    if (remain < 260) loadDramaRail(true);
+  }, { passive: true });
+}
+
 
 
 // [Redundant startWebPlayer removed - Logic moved to playVideo]
@@ -3074,6 +4161,7 @@ function updateNativeTransparency(active) {
 function playVideo(item) {
   window.currentPlayItem = item; // Debugging
   if (window.tlog) window.tlog(`[PLAY] Entry for: ${item?.name || 'null'}`);
+  stopMoviePreviewPlayback();
   
   if (!item) {
      if (window.tlog) window.tlog("[PLAY] Error: No item provided");
@@ -3676,6 +4764,9 @@ function renderFavorites() {
   const hero = document.querySelector(".hero-section");
   if (grid) grid.innerHTML = '<div style="grid-column:1/-1; padding:100px 0; text-align:center; color:var(--text-secondary);"><i data-lucide="heart" style="width:48px;height:48px;margin-bottom:15px; opacity:0.3;"></i><p>내가 찜한 리스트가 비어 있습니다.</p></div>';
   if (hero) hero.style.display = "none"; // Hide hero in favorites view
+  setMoviePreviewRailVisible(false);
+  setAnimationRailVisible(false);
+  setDramaRailVisible(false);
   if (window.lucide) window.lucide.createIcons();
 }
 
@@ -3811,6 +4902,45 @@ function setupRemoteNavigation() {
         e.preventDefault();
         moveFocus(key, activeOverlay);
         return;
+      }
+
+      const previewTrack = ui.moviePreviewTrack;
+      const currentPreviewCard = current && current.closest
+        ? current.closest(".movie-preview-card")
+        : null;
+      if (previewTrack && currentPreviewCard) {
+        const cards = Array.from(previewTrack.querySelectorAll(".movie-preview-card"));
+        const currentIdx = cards.indexOf(currentPreviewCard);
+        if (currentIdx >= 0) {
+          if (key === "ArrowLeft" || key === "ArrowRight") {
+            const delta = key === "ArrowRight" ? 1 : -1;
+            const nextIdx = Math.max(0, Math.min(cards.length - 1, currentIdx + delta));
+            const target = cards[nextIdx];
+            if (target) {
+              target.focus();
+              target.scrollIntoView({ behavior: e.repeat ? "auto" : "smooth", inline: "center", block: "nearest" });
+              if (key === "ArrowRight" && cards.length - nextIdx <= 3) {
+                loadMoviePreviewRail(true).catch(() => {});
+              }
+              setTimeout(() => triggerLeftmostMoviePreview(), 120);
+            }
+            e.preventDefault();
+            return;
+          }
+          if (key === "ArrowDown") {
+            const firstGridCard = document.querySelector("#library-grid .card");
+            if (firstGridCard) firstGridCard.focus();
+            e.preventDefault();
+            return;
+          }
+          if (key === "ArrowUp") {
+            const heroPlayBtn = document.querySelector(".hero-slide.active .btn-play-hero");
+            const fallback = document.querySelector(".tab.active, .tab");
+            (heroPlayBtn || fallback)?.focus();
+            e.preventDefault();
+            return;
+          }
+        }
       }
 
       const playerOverlay = ui.playerOverlay;

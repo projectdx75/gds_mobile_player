@@ -1556,6 +1556,8 @@ body.native-player-active {
 /* Hide only the content, keep the headers/tabs */
 body.native-player-active .view-header,
 body.native-player-active .hero-section,
+body.native-player-active .movie-preview-rail,
+body.native-player-active #animation-rail,
 body.native-player-active .folder-context-panel,
 body.native-player-active #library-grid,
 body.native-player-active .bottom-nav {
@@ -2349,6 +2351,128 @@ input:focus {
   gap: 10px;
 }
 
+.movie-preview-rail {
+  margin: 4px 2.5% 18px;
+  padding: 0;
+}
+
+.movie-preview-rail.hidden {
+  display: none;
+}
+
+.movie-preview-head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  margin: 0 2px 10px;
+}
+
+.movie-preview-head h3 {
+  margin: 0;
+  font-size: 1.08rem;
+  font-weight: 800;
+  letter-spacing: 0.01em;
+  color: #eef6ff;
+}
+
+.movie-preview-head span {
+  font-size: 0.74rem;
+  color: rgba(205, 224, 255, 0.75);
+}
+
+.movie-preview-track {
+  display: grid;
+  grid-auto-flow: column;
+  grid-auto-columns: minmax(230px, 230px);
+  gap: 12px;
+  overflow-x: auto;
+  overflow-y: hidden;
+  padding: 4px 0 8px;
+  scroll-snap-type: x proximity;
+  -ms-overflow-style: none;
+  scrollbar-width: none;
+}
+
+.movie-preview-track::-webkit-scrollbar {
+  display: none;
+}
+
+.movie-preview-card {
+  border: none;
+  border-radius: 12px;
+  background: rgba(24, 36, 64, 0.56);
+  padding: 0;
+  text-align: left;
+  color: inherit;
+  cursor: pointer;
+  overflow: hidden;
+  scroll-snap-align: start;
+  transition: transform 0.22s ease, box-shadow 0.22s ease, border-color 0.22s ease;
+  border: 1px solid rgba(182, 210, 255, 0.2);
+}
+
+.movie-preview-card:hover,
+.movie-preview-card:focus {
+  outline: none;
+  transform: translateY(-3px) scale(1.02);
+  border-color: rgba(196, 224, 255, 0.72);
+  box-shadow: 0 14px 28px rgba(4, 12, 28, 0.4);
+}
+
+.movie-preview-card.is-left-anchor {
+  border-color: rgba(255, 255, 255, 0.92);
+  box-shadow: 0 0 0 1px rgba(255, 255, 255, 0.55), 0 16px 32px rgba(4, 12, 28, 0.45);
+}
+
+.movie-preview-media {
+  position: relative;
+  width: 100%;
+  aspect-ratio: 16 / 9;
+  background: #0a1220;
+}
+
+.movie-preview-poster,
+.movie-preview-video {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+}
+
+.movie-preview-video {
+  opacity: 0;
+  transition: opacity 0.22s ease;
+}
+
+.movie-preview-card.previewing .movie-preview-video {
+  opacity: 1;
+}
+
+.movie-preview-gradient {
+  position: absolute;
+  inset: auto 0 0 0;
+  height: 46%;
+  background: linear-gradient(to top, rgba(7, 13, 26, 0.65), rgba(7, 13, 26, 0));
+}
+
+.movie-preview-title {
+  padding: 10px 10px 12px;
+  font-size: 0.84rem;
+  line-height: 1.25;
+  color: #f3f7ff;
+  font-weight: 620;
+  min-height: 34px;
+}
+
+.movie-preview-subtitle {
+  padding: 0 10px 12px;
+  font-size: 0.73rem;
+  line-height: 1.1;
+  color: rgba(199, 218, 246, 0.88);
+  font-weight: 560;
+}
+
 /* Mobile Adaptation */
 @media (max-width: 600px) {
   .sort-menu {
@@ -2840,6 +2964,19 @@ body.appletv-skin .sub-category-bar {
   min-height: 34px;
 }
 
+body.appletv-skin .movie-preview-rail {
+  margin: 8px 2.5% 12px;
+}
+
+body.appletv-skin .movie-preview-track {
+  grid-auto-columns: minmax(250px, 250px);
+}
+
+body.appletv-skin .movie-preview-card:focus-visible {
+  outline: 2px solid rgba(215, 236, 255, 0.95);
+  outline-offset: 2px;
+}
+
 body.appletv-skin #library-grid {
   margin-top: 32px;
 }
@@ -3052,5 +3189,18 @@ body.appletv-skin .bottom-nav .nav-item.active {
   }
   body.appletv-skin #library-grid {
     margin-top: 12px;
+  }
+  body.appletv-skin .movie-preview-rail {
+    margin: 8px 12px 8px;
+  }
+  body.appletv-skin .movie-preview-track {
+    grid-auto-columns: minmax(212px, 212px);
+    gap: 10px;
+  }
+  body.appletv-skin .movie-preview-head h3 {
+    font-size: 0.95rem;
+  }
+  body.appletv-skin .movie-preview-head span {
+    display: none;
   }
 }
