@@ -113,6 +113,11 @@
         <span>포커스 1초 유지 시 무음 미리보기</span>
       </div>
       <div id="movie-preview-track" class="movie-preview-track"></div>
+      <div id="movie-preview-meta" class="rail-focus-meta hidden">
+        <div class="rail-focus-title"></div>
+        <div class="rail-focus-subtitle"></div>
+        <div class="rail-focus-summary"></div>
+      </div>
     </section>
 
     <section id="animation-rail" class="movie-preview-rail hidden" aria-label="Animation Rail">
@@ -121,6 +126,11 @@
         <span>클릭 시 바로 재생</span>
       </div>
       <div id="animation-track" class="movie-preview-track"></div>
+      <div id="animation-preview-meta" class="rail-focus-meta hidden">
+        <div class="rail-focus-title"></div>
+        <div class="rail-focus-subtitle"></div>
+        <div class="rail-focus-summary"></div>
+      </div>
     </section>
 
     <section id="drama-rail" class="movie-preview-rail hidden" aria-label="Drama Rail">
@@ -129,6 +139,11 @@
         <span>series_domestic (bucket=드라마)</span>
       </div>
       <div id="drama-track" class="movie-preview-track"></div>
+      <div id="drama-preview-meta" class="rail-focus-meta hidden">
+        <div class="rail-focus-title"></div>
+        <div class="rail-focus-subtitle"></div>
+        <div class="rail-focus-summary"></div>
+      </div>
     </section>
 
     <div class="view-header">
@@ -296,7 +311,7 @@
     </div>
 
     <!-- Video -->
-    <video id="main-player" playsinline></video>
+    <video id="main-player" playsinline webkit-playsinline disablepictureinpicture disableremoteplayback controlslist="nodownload noplaybackrate nofullscreen noremoteplayback"></video>
 
     <!-- Custom Controls Overlay -->
     <div id="custom-controls" class="controls-overlay">

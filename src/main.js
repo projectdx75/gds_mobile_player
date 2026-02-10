@@ -51,6 +51,8 @@ const state = {
   fullscreenEnterRepairAttempted: false,
   lastFullscreenToggleAt: 0,
   domesticVirtualCategory: "방송중",
+  movieVirtualCategory: "전체",
+  animationVirtualCategory: "전체",
   moviePreviewOffset: 0,
   moviePreviewHasMore: true,
   moviePreviewLoading: false,
@@ -60,11 +62,14 @@ const state = {
   animationRailHasMore: true,
   animationRailLoading: false,
   animationRailSeenKeys: new Set(),
+  animationPreviewItemMap: new Map(),
   dramaRailOffset: 0,
   dramaRailHasMore: true,
   dramaRailLoading: false,
   dramaRailSeenKeys: new Set(),
+  dramaPreviewItemMap: new Map(),
   dramaPreviewCache: new Map(),
+  folderContextPrimaryItem: null,
   previewAutoplayUnlocked: false,
 };
 
@@ -76,6 +81,7 @@ const DEBUG_LOG = localStorage.getItem("flashplex_debug_logs") === "1";
 const dlog = (...args) => { if (DEBUG_LOG) console.log(...args); };
 const dwarn = (...args) => { if (DEBUG_LOG) console.warn(...args); };
 const folderMetaCache = new Map();
+const folderMetaHydrateReq = new Map();
 let nativeStatePollTimer = null;
 let infiniteObserver = null;
 let observedInfiniteSentinel = null;
@@ -91,6 +97,12 @@ const PREVIEW_PLAYABLE_EXTS = new Set(["mp4", "m4v", "webm"]);
 const PREVIEW_SOURCE_EXTS = new Set(["mp4", "m4v", "webm", "mkv", "avi", "mov", "ts"]);
 const PREVIEW_RANDOM_SEEK_MIN_RATIO = 0.12;
 const PREVIEW_RANDOM_SEEK_MAX_RATIO = 0.72;
+const PREVIEW_START_TIMEOUT_MS = 4500;
+const PREVIEW_STALL_RETRY_LIMIT = 2;
+const PREVIEW_DEFAULT_VOLUME = 0.35;
+const ANIMATION_PREVIEW_FETCH_LIMIT = 120;
+const ANIMATION_PREVIEW_RENDER_LIMIT = 20;
+const PREVIEW_AUTO_SLIDE_ENABLED = false;
 let animationRailAutoSlideTimer = null;
 let dramaRailAutoSlideTimer = null;
 let dramaRailUserInteracting = false;
@@ -153,10 +165,15 @@ function isGenericAnimeBucket(name) {
 }
 
 function isSeasonLikeName(name) {
-  const n = String(name || "").toLowerCase();
+  const n = String(name || "").trim().toLowerCase();
   return /^s\d{1,2}$/.test(n) ||
     /^season\s*\d+/.test(n) ||
     /^시즌\s*\d+/.test(n) ||
+    /^\d+\s*기$/.test(n) ||
+    /^part\s*\d+/.test(n) ||
+    /^cour\s*\d+/.test(n) ||
+    /^vol(?:ume)?\s*\d+/.test(n) ||
+    /^chapter\s*\d+/.test(n) ||
     n === "specials" ||
     n === "ova";
 }
@@ -196,7 +213,8 @@ function inferSeriesTitleFromFileName(item) {
 }
 
 function resolveAnimeSeriesMeta(item) {
-  const segs = splitPathSegments(item?.path || "");
+  const normalizedPath = String(item?.path || "").normalize("NFC");
+  const segs = splitPathSegments(normalizedPath);
   if (segs.length === 0) {
     return { seriesPath: "", seriesTitle: cleanMediaTitle(item?.meta_title || item?.title || item?.name || "Untitled") };
   }
@@ -213,10 +231,80 @@ function resolveAnimeSeriesMeta(item) {
   const chosenIsGeneric = isGenericAnimeBucket(chosen) || chosen.toLowerCase() === "video";
   const fallbackTitle = inferSeriesTitleFromFileName(item);
   const seriesTitle = cleanMediaTitle(chosenIsGeneric ? (fallbackTitle || chosen || "Untitled") : chosen);
-  const prefixPath = "/" + segs.slice(0, Math.max(1, folderIdx + 1)).join("/");
+  const prefixPath = ("/" + segs.slice(0, Math.max(1, folderIdx + 1)).join("/")).normalize("NFC");
   // If folder bucket is too generic, include inferred title in key path to avoid collapsing all titles.
   const seriesPath = chosenIsGeneric ? `${prefixPath}::${seriesTitle}` : prefixPath;
   return { seriesPath, seriesTitle };
+}
+
+function findNearestFolderMeta(pathValue, maxDepth = 8) {
+  let p = String(pathValue || "").replace(/^\/+/, "");
+  let depth = 0;
+  while (p && depth < maxDepth) {
+    const m = folderMetaCache.get(p) || folderMetaCache.get(`/${p}`) || null;
+    if (m && (m.meta_title || m.title || m.meta_poster || m.poster || m.meta_summary || m.summary || m.desc)) {
+      return m;
+    }
+    p = getParentPath(p).replace(/^\/+/, "");
+    depth += 1;
+  }
+  return null;
+}
+
+function cacheFolderMetaEntry(item) {
+  if (!item || !item.is_dir || !item.path) return;
+  const normalizedPath = String(item.path || "").replace(/^\/+/, "").normalize("NFC");
+  if (!normalizedPath) return;
+  folderMetaCache.set(normalizedPath, {
+    path: normalizedPath,
+    name: item.name,
+    title: item.title || item.meta_title || item.album_info?.title || item.name,
+    meta_title: item.meta_title || "",
+    meta_summary: item.meta_summary || item.summary || item.desc || "",
+    summary: item.summary || "",
+    desc: item.desc || "",
+    meta_poster: item.meta_poster || item.album_info?.posters || "",
+    poster: item.poster || "",
+    year: item.year || item.album_info?.release_date || "",
+    album_info: item.album_info || null,
+    source_id: Number(normalizeSourceId(item.source_id)),
+  });
+}
+
+async function hydrateFolderMetaFromParent(pathValue, sourceId = 0) {
+  const normalizedPath = String(pathValue || "").replace(/^\/+/, "").normalize("NFC");
+  if (!normalizedPath) return null;
+  const existing = folderMetaCache.get(normalizedPath) || null;
+  if (existing && (existing.meta_poster || existing.poster || existing.meta_title || existing.title)) {
+    return existing;
+  }
+
+  const reqKey = `${normalizeSourceId(sourceId)}:${normalizedPath}`;
+  if (folderMetaHydrateReq.has(reqKey)) return folderMetaHydrateReq.get(reqKey);
+
+  const reqPromise = (async () => {
+    const parentPath = String(getParentPath(normalizedPath) || "").replace(/^\/+/, "").normalize("NFC");
+    if (!parentPath) return null;
+    const params = new URLSearchParams({
+      path: parentPath,
+      recursive: "false",
+      limit: "300",
+      offset: "0",
+      sort_by: "date",
+      sort_order: "desc",
+      source_id: normalizeSourceId(sourceId),
+    });
+    const data = await gdsFetch(`list?${params.toString()}`);
+    if (!data || data.ret !== "success") return null;
+    const list = data.list || data.data || [];
+    list.forEach((entry) => cacheFolderMetaEntry(entry));
+    return folderMetaCache.get(normalizedPath) || null;
+  })().finally(() => {
+    folderMetaHydrateReq.delete(reqKey);
+  });
+
+  folderMetaHydrateReq.set(reqKey, reqPromise);
+  return reqPromise;
 }
 
 function seekPreviewVideoRandom(video) {
@@ -804,6 +892,7 @@ function initElements() {
       moviePreviewTrack: document.getElementById("movie-preview-track"),
       animationRail: document.getElementById("animation-rail"),
       animationTrack: document.getElementById("animation-track"),
+      animationPreviewMeta: document.getElementById("animation-preview-meta"),
       dramaRail: document.getElementById("drama-rail"),
       dramaTrack: document.getElementById("drama-track"),
       searchInput: document.getElementById("search-input"),
@@ -1115,11 +1204,15 @@ function setupTabs() {
       console.log("[NAV] Tab clicked, category:", cat);
 
       state.category = cat;
+      document.body.classList.toggle("category-movie", cat === "movie");
+      document.body.classList.toggle("category-tv", cat === "tv_show");
+      document.body.classList.toggle("category-animation", cat === "animation");
       state.currentPath = "";
       state.pathStack = [];
       state.offset = 0;
       state.library = [];
       state.query = ""; // Reset query when switching categories
+      if (getVirtualConfig(cat)) setVirtualBucket(cat, getVirtualConfig(cat).defaultBucket);
 
       // Special handling for Favorites
       if (cat === "favorites") {
@@ -1136,26 +1229,72 @@ function setupTabs() {
   });
 }
 
+function syncCategoryBodyClasses() {
+  const cat = String(state.category || "");
+  document.body.classList.toggle("category-movie", cat === "movie");
+  document.body.classList.toggle("category-tv", cat === "tv_show");
+  document.body.classList.toggle("category-animation", cat === "animation");
+}
+
+const VIRTUAL_CATEGORY_CONFIG = {
+  tv_show: {
+    rootPath: "VIDEO/국내TV",
+    stateKey: "domesticVirtualCategory",
+    defaultBucket: "방송중",
+    endpoint: "series_domestic",
+    debugTag: "SERIES_DOMESTIC_URL",
+    categories: ["방송중", "완결", "드라마", "예능", "다큐멘터리", "교양", "시사", "뉴스", "데일리", "음악", "기타"],
+  },
+  movie: {
+    rootPath: "VIDEO/영화",
+    stateKey: "movieVirtualCategory",
+    defaultBucket: "전체",
+    endpoint: "movie_virtual",
+    debugTag: "MOVIE_VIRTUAL_URL",
+    categories: ["전체", "한국영화", "외국영화", "고화질(4K)", "고전영화", "액션", "스릴러", "코미디"],
+  },
+  animation: {
+    rootPath: "VIDEO/애니메이션",
+    stateKey: "animationVirtualCategory",
+    defaultBucket: "전체",
+    endpoint: "animation_virtual",
+    debugTag: "ANIMATION_VIRTUAL_URL",
+    categories: ["전체", "TV 애니", "극장판", "OVA", "라프텔"],
+  },
+};
+
 const categorySubMenus = {
-  tv_show: ["국내", "해외", "다큐멘터리", "뉴스", "교양", "예능", "시사", "음악", "데일리"],
-  movie: ["한국영화", "외국영화", "고전영화", "액션", "스릴러", "코미디"],
-  animation: ["TV 애니", "극장판", "OVA", "라프텔"]
+  tv_show: ["국내", "해외", ...VIRTUAL_CATEGORY_CONFIG.tv_show.categories],
+  movie: [...VIRTUAL_CATEGORY_CONFIG.movie.categories],
+  animation: [...VIRTUAL_CATEGORY_CONFIG.animation.categories],
 };
-const domesticVirtualCategories = ["방송중", "완결", "드라마", "예능", "다큐멘터리", "교양", "시사", "뉴스", "데일리", "음악", "기타"];
-const domesticVirtualPathMap = {
-  "방송중": "VIDEO/방송중",
-  "완결": "VIDEO/국내TV",
-  "드라마": "VIDEO/국내TV/드라마",
-  "예능": "VIDEO/국내TV/예능",
-  "다큐": "VIDEO/국내TV/다큐멘터리",
-  "다큐멘터리": "VIDEO/국내TV/다큐멘터리",
-  "교양": "VIDEO/국내TV/교양",
-  "시사": "VIDEO/국내TV/시사",
-  "뉴스": "VIDEO/국내TV/뉴스",
-  "데일리": "VIDEO/국내TV/데일리",
-  "음악": "VIDEO/국내TV/음악",
-  "기타": "VIDEO/국내TV"
-};
+function getVirtualConfig(category) {
+  return VIRTUAL_CATEGORY_CONFIG[category] || null;
+}
+
+function getVirtualBucket(category) {
+  const cfg = getVirtualConfig(category);
+  if (!cfg) return "";
+  return state[cfg.stateKey] || cfg.defaultBucket;
+}
+
+function setVirtualBucket(category, value) {
+  const cfg = getVirtualConfig(category);
+  if (!cfg) return;
+  state[cfg.stateKey] = value || cfg.defaultBucket;
+}
+
+function resetAllVirtualBuckets() {
+  Object.keys(VIRTUAL_CATEGORY_CONFIG).forEach((cat) => {
+    const cfg = VIRTUAL_CATEGORY_CONFIG[cat];
+    state[cfg.stateKey] = cfg.defaultBucket;
+  });
+}
+
+function isVirtualRoot(category, currentPath) {
+  const cfg = getVirtualConfig(category);
+  return !!cfg && currentPath === cfg.rootPath;
+}
 const tvShowPathMap = {
   "국내": "VIDEO/국내TV",
   "해외": "VIDEO/해외TV",
@@ -1234,42 +1373,49 @@ function showCategorySubMenu(category, tabEl) {
         
         // [TV SHOW] Prefer server-driven domestic endpoint for consistent behavior.
         if (category === 'tv_show') {
+          const tvCfg = getVirtualConfig("tv_show");
           const domesticMenuSet = new Set([
             "국내",
-            "방송중",
-            "완결",
-            "드라마",
-            "예능",
-            "다큐",
-            "다큐멘터리",
-            "교양",
-            "시사",
-            "뉴스",
-            "데일리",
-            "음악",
-            "기타"
+            ...tvCfg.categories
           ]);
           if (!q) {
             state.currentPath = "";
             state.pathStack = [];
             state.query = "";
-            state.domesticVirtualCategory = "방송중";
+            setVirtualBucket("tv_show", tvCfg.defaultBucket);
           } else if (domesticMenuSet.has(q)) {
             // Force domestic virtual root so loadLibrary() always calls `series_domestic`.
-            state.currentPath = "VIDEO/국내TV";
-            state.pathStack = ["VIDEO/국내TV"];
+            state.currentPath = tvCfg.rootPath;
+            state.pathStack = [tvCfg.rootPath];
             state.query = "";
-            state.domesticVirtualCategory = (q === "국내") ? "방송중" : (q === "다큐" ? "다큐멘터리" : q);
+            setVirtualBucket("tv_show", q === "국내" ? tvCfg.defaultBucket : q);
           } else if (tvShowPathMap[q]) {
             state.currentPath = tvShowPathMap[q];
             state.pathStack = [tvShowPathMap[q]];
             state.query = "";
-            state.domesticVirtualCategory = q === "국내" ? "방송중" : "";
+            if (q === "국내") setVirtualBucket("tv_show", tvCfg.defaultBucket);
           } else {
             // Fallback for unmapped labels: keep tv_show root path clear and filter by query.
             state.currentPath = "";
             state.pathStack = [];
             state.query = q;
+          }
+        } else if (category === "movie" || category === "animation") {
+          const cfg = getVirtualConfig(category);
+          if (!q) {
+            state.currentPath = cfg.rootPath;
+            state.pathStack = [cfg.rootPath];
+            state.query = "";
+            setVirtualBucket(category, cfg.defaultBucket);
+          } else if (cfg.categories.includes(q)) {
+            state.currentPath = cfg.rootPath;
+            state.pathStack = [cfg.rootPath];
+            state.query = "";
+            setVirtualBucket(category, q);
+          } else {
+            state.query = q;
+            state.currentPath = "";
+            state.pathStack = [];
           }
         } else {
           state.query = q;
@@ -1307,6 +1453,15 @@ async function gdsFetch(endpoint, options = {}) {
   console.log(`[GDS-FULL-URL] (${method}) ${finalUrl}`);
   if (endpoint.includes("series_domestic")) {
     console.log(`[SERIES_DOMESTIC_URL] ${finalUrl}`);
+  }
+  if (endpoint.includes("movie_virtual")) {
+    console.log(`[MOVIE_VIRTUAL_URL] ${finalUrl}`);
+  }
+  if (endpoint.includes("animation_virtual")) {
+    console.log(`[ANIMATION_VIRTUAL_URL] ${finalUrl}`);
+  }
+  if (endpoint.includes("animation_preview")) {
+    console.log(`[ANIMATION_PREVIEW_URL] ${finalUrl}`);
   }
 
   // Tauri HTTP Plugin Logic
@@ -1380,6 +1535,7 @@ function hideLoader() {
 }
 
 async function loadLibrary(forceRefresh = false, isAppend = false) {
+  syncCategoryBodyClasses();
   const grid = ui.grid;
   const heroSection = ui.heroSection;
   if (!grid) return;
@@ -1505,11 +1661,13 @@ async function loadLibrary(forceRefresh = false, isAppend = false) {
       pathDepth >= 3 &&
       !isIndexBucketFolder(state.currentPath);
     
-    const isDomesticVirtualRoot = state.category === "tv_show" && state.currentPath === "VIDEO/국내TV";
+    const virtualCfg = isVirtualRoot(state.category, state.currentPath)
+      ? getVirtualConfig(state.category)
+      : null;
 
-    if (isDomesticVirtualRoot) {
+    if (virtualCfg) {
       if (!isAppend) renderSubCategoryChips([]);
-      const selected = state.domesticVirtualCategory || "방송중";
+      const selected = getVirtualBucket(state.category);
       const params = new URLSearchParams({
         bucket: selected,
         limit: String(state.limit),
@@ -1518,27 +1676,23 @@ async function loadLibrary(forceRefresh = false, isAppend = false) {
         sort_order: state.sortOrder,
         source_id: String(state.sourceId ?? 0),
       });
-      // Debug: print full URL so it can be called directly from browser/curl.
       let __base = (state.serverUrl || "").trim();
       if (!/^https?:\/\//i.test(__base)) __base = `http://${__base}`;
       __base = __base.replace(/\/$/, "");
-      console.log(`[SERIES_DOMESTIC_URL] ${__base}/gds_dviewer/normal/series_domestic?${params.toString()}&apikey=${state.apiKey}`);
-      const responses = [await gdsFetch(`series_domestic?${params.toString()}`, { signal: requestSignal })];
+      console.log(`[${virtualCfg.debugTag}] ${__base}/gds_dviewer/normal/${virtualCfg.endpoint}?${params.toString()}&apikey=${state.apiKey}`);
+      const responses = [await gdsFetch(`${virtualCfg.endpoint}?${params.toString()}`, { signal: requestSignal })];
       if (isStaleFreshRequest()) return;
 
       const allRaw = responses
         .filter((r) => r && r.ret === "success")
         .flatMap((r) => r.data || r.items || r.list || []);
       serverBatchSize = allRaw.length;
-
-      // Keep first response semantics for paging hints below.
       data = {
         ret: "success",
         list: allRaw,
         count: allRaw.length,
         has_more: false,
       };
-
       currentList = allRaw;
     } else if (state.currentPath && isHubRoot) {
       // [MODE: HUB] Flattened discovery view
@@ -1867,20 +2021,18 @@ async function loadLibrary(forceRefresh = false, isAppend = false) {
         }
       }
 
-      const shouldShowMoviePreviewRail =
-        state.currentView === "library" &&
-        !state.currentPath &&
-        state.category !== "favorites";
+      const isRootLibrary = state.currentView === "library" && !state.currentPath;
+      const shouldShowMoviePreviewRail = isRootLibrary && state.category === "movie";
       setMoviePreviewRailVisible(shouldShowMoviePreviewRail);
       if (shouldShowMoviePreviewRail && !isAppend) {
         loadMoviePreviewRail(false).catch(() => {});
       }
-      const shouldShowAnimationRail = shouldShowMoviePreviewRail;
+      const shouldShowAnimationRail = isRootLibrary && state.category === "animation";
       setAnimationRailVisible(shouldShowAnimationRail);
       if (shouldShowAnimationRail && !isAppend) {
         loadAnimationRail(false).catch(() => {});
       }
-      const shouldShowDramaRail = shouldShowMoviePreviewRail;
+      const shouldShowDramaRail = isRootLibrary && state.category === "tv_show";
       setDramaRailVisible(shouldShowDramaRail);
       if (shouldShowDramaRail && !isAppend) {
         loadDramaRail(false).catch(() => {});
@@ -1976,7 +2128,7 @@ function renderSubCategoryChips(folders) {
   homeChip.onclick = () => {
     state.currentPath = "";
     state.pathStack = [];
-    state.domesticVirtualCategory = "방송중";
+    resetAllVirtualBuckets();
     loadLibrary();
   };
   chipContainer.appendChild(homeChip);
@@ -1990,23 +2142,23 @@ function renderSubCategoryChips(folders) {
     backChip.onclick = () => {
       state.pathStack.pop();
       state.currentPath = state.pathStack[state.pathStack.length - 1] || "";
-      if (!state.currentPath) state.domesticVirtualCategory = "방송중";
+      if (!state.currentPath) resetAllVirtualBuckets();
       loadLibrary();
     };
     chipContainer.appendChild(backChip);
   }
-
-  if (state.category === "tv_show" && state.currentPath === "VIDEO/국내TV") {
-    domesticVirtualCategories.forEach((label) => {
+  if (isVirtualRoot(state.category, state.currentPath)) {
+    const cfg = getVirtualConfig(state.category);
+    cfg.categories.forEach((label) => {
       const chip = document.createElement("div");
       chip.className = "chip";
       chip.tabIndex = 0;
       chip.setAttribute("role", "button");
-      if ((state.domesticVirtualCategory || "방송중") === label) chip.classList.add("active");
+      if (getVirtualBucket(state.category) === label) chip.classList.add("active");
       chip.innerText = label;
       chip.onclick = () => {
-        if (state.domesticVirtualCategory === label) return;
-        state.domesticVirtualCategory = label;
+        if (getVirtualBucket(state.category) === label) return;
+        setVirtualBucket(state.category, label);
         state.offset = 0;
         state.library = [];
         state.seenPaths = new Set();
@@ -2124,6 +2276,7 @@ function renderFolderContextPanel(items = []) {
   if (!panel) return;
 
   if (!state.currentPath || isIndexBucketFolder(state.currentPath)) {
+    state.folderContextPrimaryItem = null;
     panel.classList.add("hidden");
     panel.innerHTML = "";
     return;
@@ -2155,6 +2308,7 @@ function renderFolderContextPanel(items = []) {
   const episodeCount = episodes.length;
   const seasonCount = subFolders.length;
   const firstMedia = episodes[0] || (items || []).find((i) => i && !i.is_dir) || items[0] || null;
+  state.folderContextPrimaryItem = firstMedia && !firstMedia.is_dir ? firstMedia : null;
   const firstFolder = subFolders[0] || null;
   const mediaPath = firstMedia?.path || "";
   const resolvedSeriesTitle =
@@ -2297,6 +2451,63 @@ function renderGrid(container, items, isFolderCategory = false, isAppend = false
   } else {
     container.parentElement.classList.remove("folder-view");
     container.classList.remove("folder-view");
+  }
+
+  const useSinglePlayButtonMode =
+    !isAppend &&
+    state.category === "movie" &&
+    !!state.currentPath &&
+    !!state.folderContextPrimaryItem;
+  container.classList.toggle("folder-play-only", useSinglePlayButtonMode);
+
+  // Keep folder-context CTA in sync (single play mode only).
+  const folderContextPanel = document.getElementById("folder-context-panel");
+  const folderContextBody = folderContextPanel ? folderContextPanel.querySelector(".folder-context-body") : null;
+  if (folderContextPanel) folderContextPanel.classList.toggle("has-play-cta", useSinglePlayButtonMode);
+  if (folderContextBody) {
+    const prevActions = folderContextBody.querySelector(".folder-context-actions");
+    if (prevActions) prevActions.remove();
+  }
+
+  if (useSinglePlayButtonMode) {
+    const target = state.folderContextPrimaryItem;
+    const title = cleanMediaTitle(target?.meta_title || target?.title || target?.name || "영상");
+    container.innerHTML = "";
+
+    if (folderContextBody) {
+      const actions = document.createElement("div");
+      actions.className = "folder-context-actions";
+      actions.innerHTML = `
+        <button type="button" class="folder-play-single-btn folder-context-play-btn" id="folder-play-single-btn">
+          <span class="folder-play-single-icon">▶</span>
+          <span class="folder-play-single-label">영상보기</span>
+          <span class="folder-play-single-title">${title}</span>
+        </button>
+      `;
+      folderContextBody.appendChild(actions);
+    } else {
+      container.innerHTML = `
+        <div class="folder-play-single-wrap" style="grid-column: 1 / -1;">
+          <button type="button" class="folder-play-single-btn" id="folder-play-single-btn">
+            <span class="folder-play-single-icon">▶</span>
+            <span class="folder-play-single-label">영상보기</span>
+            <span class="folder-play-single-title">${title}</span>
+          </button>
+        </div>
+      `;
+    }
+
+    const btn = document.getElementById("folder-play-single-btn");
+    if (btn) {
+      btn.addEventListener("click", () => playVideo(target));
+      btn.addEventListener("keydown", (e) => {
+        if (e.key === "Enter" || e.key === " ") {
+          e.preventDefault();
+          playVideo(target);
+        }
+      });
+    }
+    return;
   }
 
   if ((!items || items.length === 0) && !isAppend) {
@@ -2746,6 +2957,17 @@ function getStreamUrlFromItem(item) {
   return `${state.serverUrl}/gds_dviewer/normal/stream?bpath=${bpath}&source_id=${normalizeSourceId(item.source_id)}&apikey=${state.apiKey}`;
 }
 
+function getPreviewStreamUrlFromItem(item) {
+  if (!item || !item.path) return "";
+  let cleanPath = String(item.path).normalize("NFC");
+  if (cleanPath && !cleanPath.startsWith("/")) cleanPath = "/" + cleanPath;
+  const bpath = toUrlSafeBase64(cleanPath);
+  if (!bpath) return "";
+  const ext = getPathExtension(cleanPath);
+  const endpoint = ext === "mkv" ? "stream_preview" : "stream";
+  return `${state.serverUrl}/gds_dviewer/normal/${endpoint}?bpath=${bpath}&source_id=${normalizeSourceId(item.source_id)}&apikey=${state.apiKey}`;
+}
+
 async function resolvePlayablePreviewItem(item) {
   if (!item) return null;
   const ext = getPathExtension(item.path);
@@ -2822,22 +3044,79 @@ async function handleDramaCardPreview(card, item) {
   }
   console.log("[DRAMA-PREVIEW] resolved preview source:", previewItem?.path || previewItem?.name || "");
   const resolvedExt = getPathExtension(previewItem?.path || "");
-  if (!PREVIEW_PLAYABLE_EXTS.has(resolvedExt)) {
+  if (!PREVIEW_PLAYABLE_EXTS.has(resolvedExt) && resolvedExt !== "mkv") {
     console.warn("[DRAMA-PREVIEW] resolved source is non-web-playable ext:", resolvedExt || "<none>");
   }
   if (!stillActive()) return;
   scheduleMoviePreviewPlayback(card, previewItem, true);
 }
 
+function resolvePosterUrl(rawUrl, item, width = 640) {
+  const noPoster = `${state.serverUrl}/gds_dviewer/static/img/no_poster.png`;
+  const raw = String(rawUrl || "").trim();
+  if (!raw) return "";
+
+  // Already-proxied/ready URLs from gds_dviewer should be used as-is.
+  if (raw.includes("/gds_dviewer/normal/proxy_image") || raw.includes("/gds_dviewer/normal/thumbnail")) {
+    return raw;
+  }
+
+  // Relative path from same server.
+  if (raw.startsWith("/")) {
+    return `${state.serverUrl}${raw}`;
+  }
+
+  // Absolute external URL -> proxy through gds_dviewer image proxy.
+  if (/^https?:\/\//i.test(raw)) {
+    return `${state.serverUrl}/gds_dviewer/normal/proxy_image?url=${encodeURIComponent(raw)}&apikey=${state.apiKey}`;
+  }
+
+  // Fallback to thumbnail from file path when raw is not a URL.
+  let thumbPath = String(item?.path || "").normalize("NFC");
+  if (thumbPath && !thumbPath.startsWith("/")) thumbPath = `/${thumbPath}`;
+  const bpath = toUrlSafeBase64(thumbPath);
+  if (!bpath) return noPoster;
+  return `${state.serverUrl}/gds_dviewer/normal/thumbnail?bpath=${bpath}&source_id=${normalizeSourceId(item?.source_id)}&w=${width}&apikey=${state.apiKey}`;
+}
+
 function getPosterUrlFromItem(item, width = 640) {
   const noPoster = `${state.serverUrl}/gds_dviewer/static/img/no_poster.png`;
   if (!item) return noPoster;
-  if (item.meta_poster) {
-    return `${state.serverUrl}/gds_dviewer/normal/proxy?url=${encodeURIComponent(item.meta_poster)}&apikey=${state.apiKey}`;
-  }
-  const bpath = toUrlSafeBase64(item.path || "");
+  const rawPoster = item.meta_poster || item.album_info?.posters || item.poster || item.meta_thumb || item.thumb || "";
+  const resolved = resolvePosterUrl(rawPoster, item, width);
+  if (resolved) return resolved;
+  let thumbPath = String(item.path || "").normalize("NFC");
+  if (thumbPath && !thumbPath.startsWith("/")) thumbPath = `/${thumbPath}`;
+  const bpath = toUrlSafeBase64(thumbPath);
   if (!bpath) return noPoster;
   return `${state.serverUrl}/gds_dviewer/normal/thumbnail?bpath=${bpath}&source_id=${normalizeSourceId(item.source_id)}&w=${width}&apikey=${state.apiKey}`;
+}
+
+function buildFolderThumbUrl(pathValue, sourceId, width = 640) {
+  const clean = String(pathValue || "").replace(/^\/+/, "").normalize("NFC");
+  if (!clean) return "";
+  const bpath = toUrlSafeBase64(clean.startsWith("/") ? clean : `/${clean}`);
+  if (!bpath) return "";
+  return `${state.serverUrl}/gds_dviewer/normal/thumbnail?bpath=${bpath}&source_id=${normalizeSourceId(sourceId)}&w=${width}&apikey=${state.apiKey}`;
+}
+
+function choosePosterUrl({ item, width = 640, metaPoster = "", folderPath = "", parentFolderPath = "" } = {}) {
+  if (metaPoster) {
+    const resolved = resolvePosterUrl(metaPoster, item, width);
+    if (resolved) return resolved;
+  }
+  const folderThumb = buildFolderThumbUrl(folderPath, item?.source_id, width);
+  if (folderThumb) return folderThumb;
+  const parentThumb = buildFolderThumbUrl(parentFolderPath, item?.source_id, width);
+  if (parentThumb) return parentThumb;
+  return getPosterUrlFromItem(item, width);
+}
+
+function getPreviewVolume() {
+  const raw = Number(state.volume);
+  if (!Number.isFinite(raw)) return PREVIEW_DEFAULT_VOLUME;
+  const clamped = Math.max(0, Math.min(100, raw));
+  return Math.max(0.05, clamped / 100);
 }
 
 function stopMoviePreviewPlayback() {
@@ -2851,6 +3130,9 @@ function stopMoviePreviewPlayback() {
     try {
       video.pause();
       video.currentTime = 0;
+      // Abort in-flight network and clear decoder state to avoid chained stalls.
+      video.removeAttribute("src");
+      video.load();
     } catch (_) {}
   }
   activeMoviePreviewCard.classList.remove("previewing");
@@ -2860,6 +3142,8 @@ function stopMoviePreviewPlayback() {
 function scheduleMoviePreviewPlayback(card, item, immediate = false) {
   if (!card || !item) return;
   if (card.dataset.previewEnabled !== "1") return;
+  // Prevent repeated hover/focus from restarting the same already-running preview.
+  if (activeMoviePreviewCard === card && card.classList.contains("previewing")) return;
   stopMoviePreviewPlayback();
   const run = () => {
     const video = card.querySelector(".movie-preview-video");
@@ -2873,7 +3157,7 @@ function scheduleMoviePreviewPlayback(card, item, immediate = false) {
       console.log("[PREVIEW] blocked: autoplay not unlocked");
       return;
     }
-    const streamUrl = getStreamUrlFromItem(item);
+    const streamUrl = getPreviewStreamUrlFromItem(item);
     if (!streamUrl) {
       console.warn("[PREVIEW] blocked: empty stream url", item?.path || item?.name || "");
       return;
@@ -2881,9 +3165,9 @@ function scheduleMoviePreviewPlayback(card, item, immediate = false) {
     console.log("[PREVIEW] attempt:", item?.path || item?.name || "", streamUrl);
 
     card.classList.add("previewing");
-    video.muted = true;
-    video.defaultMuted = true;
-    video.volume = 0;
+    video.muted = false;
+    video.defaultMuted = false;
+    video.volume = getPreviewVolume();
     // Rebind source each attempt to avoid stuck states in WebView media pipeline.
     try {
       video.pause();
@@ -2898,6 +3182,57 @@ function scheduleMoviePreviewPlayback(card, item, immediate = false) {
       }, { once: true });
     }
     let settled = false;
+    let retryCount = 0;
+    let startWatchdog = null;
+    const clearStartWatchdog = () => {
+      if (startWatchdog) {
+        clearTimeout(startWatchdog);
+        startWatchdog = null;
+      }
+    };
+    const isStillRelevant = () => activeMoviePreviewCard === card || !activeMoviePreviewCard;
+    const recoverFromStall = (reason) => {
+      if (!isStillRelevant()) return;
+      if (retryCount >= PREVIEW_STALL_RETRY_LIMIT) return;
+      retryCount += 1;
+      console.warn(`[PREVIEW] recovery retry #${retryCount} (${reason}):`, item?.path || item?.name || "");
+      try {
+        const bufferedEnd = video.buffered && video.buffered.length > 0
+          ? Number(video.buffered.end(video.buffered.length - 1) || 0)
+          : 0;
+        const current = Number(video.currentTime || 0);
+        const hasBufferedHeadroom = bufferedEnd > (current + 1.2);
+
+        // If buffer still has enough data, avoid hard reload and just nudge playback.
+        if (hasBufferedHeadroom) {
+          const p0 = video.play();
+          if (p0 && typeof p0.catch === "function") p0.catch(() => {});
+          return;
+        }
+
+        const resumeAt = Number.isFinite(video.currentTime) ? Math.max(0, video.currentTime - 0.8) : 0;
+
+        // First retry: soft resume only (no network reconnect).
+        if (retryCount === 1) {
+          try { video.pause(); } catch (_) {}
+          const p1 = video.play();
+          if (p1 && typeof p1.catch === "function") p1.catch(() => {});
+          return;
+        }
+
+        // Second retry: hard reload with resume point.
+        video.pause();
+        video.load();
+        if (resumeAt > 0.2) {
+          const onMeta = () => {
+            try { video.currentTime = resumeAt; } catch (_) {}
+          };
+          video.addEventListener("loadedmetadata", onMeta, { once: true });
+        }
+        const p2 = video.play();
+        if (p2 && typeof p2.catch === "function") p2.catch(() => {});
+      } catch (_) {}
+    };
     video.addEventListener("loadedmetadata", () => {
       console.log("[PREVIEW] event loadedmetadata:", {
         path: item?.path || item?.name || "",
@@ -2905,6 +3240,8 @@ function scheduleMoviePreviewPlayback(card, item, immediate = false) {
       });
     }, { once: true });
     video.addEventListener("canplay", () => {
+      settled = true;
+      clearStartWatchdog();
       console.log("[PREVIEW] event canplay:", item?.path || item?.name || "");
     }, { once: true });
     video.addEventListener("waiting", () => {
@@ -2912,13 +3249,16 @@ function scheduleMoviePreviewPlayback(card, item, immediate = false) {
     }, { once: true });
     video.addEventListener("stalled", () => {
       console.warn("[PREVIEW] event stalled:", item?.path || item?.name || "");
+      recoverFromStall("stalled");
     }, { once: true });
     video.addEventListener("playing", () => {
       settled = true;
+      clearStartWatchdog();
       console.log("[PREVIEW] event playing:", item?.path || item?.name || "");
     }, { once: true });
     video.addEventListener("error", () => {
       settled = true;
+      clearStartWatchdog();
       const mediaErr = video.error;
       console.warn("[PREVIEW] event error:", {
         code: mediaErr?.code || 0,
@@ -2926,7 +3266,7 @@ function scheduleMoviePreviewPlayback(card, item, immediate = false) {
         path: item?.path || item?.name || "",
       });
     }, { once: true });
-    setTimeout(() => {
+    startWatchdog = setTimeout(() => {
       if (settled) return;
       const bufferedEnd = video.buffered && video.buffered.length > 0
         ? Number(video.buffered.end(video.buffered.length - 1) || 0)
@@ -2938,7 +3278,8 @@ function scheduleMoviePreviewPlayback(card, item, immediate = false) {
         currentSrc: video.currentSrc || "",
         bufferedEnd,
       });
-    }, 2500);
+      recoverFromStall("no-start-timeout");
+    }, PREVIEW_START_TIMEOUT_MS);
 
     let playResult;
     try {
@@ -2951,14 +3292,17 @@ function scheduleMoviePreviewPlayback(card, item, immediate = false) {
 
     if (playResult && typeof playResult.then === "function") {
       playResult.then(() => {
+        clearStartWatchdog();
         console.log("[PREVIEW] play started:", item?.path || item?.name || "");
       }).catch((err) => {
+        clearStartWatchdog();
         card.classList.remove("previewing");
         const name = String(err?.name || "").toLowerCase();
         const msg = String(err?.message || err || "").toLowerCase();
         // Frequent/expected failures: avoid noisy warnings.
         if (name.includes("abort") || msg.includes("aborted")) return;
         if (name.includes("notallowed") || msg.includes("not allowed")) {
+          // Keep previous stable behavior: wait for next explicit user interaction.
           pendingPreviewRequest = { card, item };
           return;
         }
@@ -3009,9 +3353,11 @@ function setAnimationRailVisible(active) {
   if (!active) {
     stopAnimationRailAutoSlide();
     if (ui.animationTrack) ui.animationTrack.innerHTML = "";
+    if (ui.animationPreviewMeta) ui.animationPreviewMeta.classList.add("hidden");
     state.animationRailOffset = 0;
     state.animationRailHasMore = true;
     state.animationRailSeenKeys.clear();
+    state.animationPreviewItemMap.clear();
   } else {
     startAnimationRailAutoSlide();
   }
@@ -3026,6 +3372,7 @@ function setDramaRailVisible(active) {
     state.dramaRailOffset = 0;
     state.dramaRailHasMore = true;
     state.dramaRailSeenKeys.clear();
+    state.dramaPreviewItemMap.clear();
   } else {
     startDramaRailAutoSlide();
   }
@@ -3039,6 +3386,7 @@ function stopMoviePreviewAutoSlide() {
 }
 
 function startMoviePreviewAutoSlide() {
+  if (!PREVIEW_AUTO_SLIDE_ENABLED) return;
   const track = ui.moviePreviewTrack;
   if (!track) return;
   stopMoviePreviewAutoSlide();
@@ -3067,6 +3415,7 @@ function stopAnimationRailAutoSlide() {
 }
 
 function startAnimationRailAutoSlide() {
+  if (!PREVIEW_AUTO_SLIDE_ENABLED) return;
   const track = ui.animationTrack;
   if (!track) return;
   stopAnimationRailAutoSlide();
@@ -3090,6 +3439,7 @@ function stopDramaRailAutoSlide() {
 }
 
 function startDramaRailAutoSlide() {
+  if (!PREVIEW_AUTO_SLIDE_ENABLED) return;
   const track = ui.dramaTrack;
   if (!track) return;
   stopDramaRailAutoSlide();
@@ -3134,11 +3484,45 @@ function isLeftmostCardInTrack(card, track) {
   return !!leftmost && leftmost === card;
 }
 
-function markLeftAnchorCard(trackEl, cardEl) {
+function markLeftAnchorCard(trackEl, cardEl, options = {}) {
+  const force = !!options.force;
   if (!trackEl) return;
+  const fixed = trackEl.querySelector('.movie-preview-card[data-anchor-fixed="1"]');
+  if (fixed && !force) {
+    const cards = trackEl.querySelectorAll(".movie-preview-card");
+    cards.forEach((c) => c.classList.remove("is-left-anchor"));
+    fixed.classList.add("is-left-anchor");
+    if (trackEl === ui.animationTrack) updateAnimationPreviewMetaFromCard(fixed);
+    return;
+  }
   const cards = trackEl.querySelectorAll(".movie-preview-card");
-  cards.forEach((c) => c.classList.remove("is-left-anchor"));
-  if (cardEl) cardEl.classList.add("is-left-anchor");
+  cards.forEach((c) => {
+    c.classList.remove("is-left-anchor");
+    if (force) delete c.dataset.anchorFixed;
+  });
+  if (cardEl) {
+    cardEl.classList.add("is-left-anchor");
+    cardEl.dataset.anchorFixed = "1";
+    if (trackEl === ui.animationTrack) updateAnimationPreviewMetaFromCard(cardEl);
+  } else if (trackEl === ui.animationTrack) {
+    updateAnimationPreviewMetaFromCard(null);
+  }
+}
+
+function swapPreviewCards(trackEl, a, b) {
+  if (!trackEl || !a || !b || a === b) return;
+  const children = Array.from(trackEl.children);
+  const ai = children.indexOf(a);
+  const bi = children.indexOf(b);
+  if (ai < 0 || bi < 0) return;
+
+  if (ai < bi) {
+    trackEl.insertBefore(b, a);
+    trackEl.insertBefore(a, children[bi]);
+  } else {
+    trackEl.insertBefore(a, b);
+    trackEl.insertBefore(b, children[ai]);
+  }
 }
 
 function canRunMoviePreviewNow() {
@@ -3149,17 +3533,162 @@ function canRunMoviePreviewNow() {
   return moviePreviewUserInteracting || focusInside;
 }
 
-function triggerLeftmostMoviePreview() {
-  const track = ui.moviePreviewTrack;
-  const card = getLeftmostVisiblePreviewCard();
+function canRunPreviewNowInTrack(track) {
+  if (!track) return false;
+  const active = document.activeElement;
+  const focusInside = !!(active && track.contains(active));
+  if (track === ui.moviePreviewTrack) return moviePreviewUserInteracting || focusInside;
+  if (track === ui.animationTrack) return focusInside;
+  if (track === ui.dramaTrack) return dramaRailUserInteracting || focusInside;
+  return focusInside;
+}
+
+function getPreviewItemByTrackCard(track, card) {
+  if (!track || !card) return null;
+  const key = card.dataset.previewKey || "";
+  if (!key) return null;
+  if (track === ui.moviePreviewTrack) return state.moviePreviewItemMap.get(key) || null;
+  if (track === ui.animationTrack) return state.animationPreviewItemMap.get(key) || null;
+  if (track === ui.dramaTrack) return state.dramaPreviewItemMap.get(key) || null;
+  return null;
+}
+
+function getPreviewMapForTrack(track) {
+  if (track === ui.moviePreviewTrack) return state.moviePreviewItemMap;
+  if (track === ui.animationTrack) return state.animationPreviewItemMap;
+  if (track === ui.dramaTrack) return state.dramaPreviewItemMap;
+  return null;
+}
+
+function updateAnimationPreviewMetaFromCard(card) {
+  const box = ui.animationPreviewMeta;
+  if (!box) return;
+  if (!card) {
+    box.classList.add("hidden");
+    return;
+  }
+
+  const item = getPreviewItemByTrackCard(ui.animationTrack, card);
+  if (!item) {
+    box.classList.add("hidden");
+    return;
+  }
+
+  const meta = resolveAnimeSeriesMeta(item);
+  let seriesPathForMeta = String(meta.seriesPath || "").split("::")[0].replace(/^\/+/, "").normalize("NFC");
+  const seriesLeafName = splitPathSegments(seriesPathForMeta).slice(-1)[0] || "";
+  if (isSeasonLikeName(seriesLeafName)) {
+    seriesPathForMeta = String(getParentPath(seriesPathForMeta) || "").replace(/^\/+/, "").normalize("NFC");
+  }
+  const seriesMeta = findNearestFolderMeta(seriesPathForMeta);
+  const parentPathForMeta = seriesPathForMeta ? getParentPath(seriesPathForMeta) : "";
+  const parentMeta = findNearestFolderMeta(parentPathForMeta);
+
+  const title = cleanMediaTitle(
+    seriesMeta?.meta_title ||
+    seriesMeta?.title ||
+    seriesMeta?.album_info?.title ||
+    parentMeta?.meta_title ||
+    parentMeta?.title ||
+    parentMeta?.album_info?.title ||
+    meta.seriesTitle ||
+    item?.meta_title ||
+    item?.title ||
+    item?.name ||
+    "Untitled",
+  );
+  const episode = extractEpisodeLabel(item) || "LATEST";
+  const year = seriesMeta?.year || parentMeta?.year || item?.year || "";
+  const subtitle = year ? `${episode} · ${year}` : episode;
+  const summary = String(
+    seriesMeta?.meta_summary ||
+    seriesMeta?.summary ||
+    seriesMeta?.desc ||
+    parentMeta?.meta_summary ||
+    parentMeta?.summary ||
+    parentMeta?.desc ||
+    item?.meta_summary ||
+    item?.summary ||
+    item?.desc ||
+    "",
+  ).trim();
+
+  const titleEl = box.querySelector(".rail-focus-title");
+  const subtitleEl = box.querySelector(".rail-focus-subtitle");
+  const summaryEl = box.querySelector(".rail-focus-summary");
+  if (titleEl) titleEl.textContent = title;
+  if (subtitleEl) subtitleEl.textContent = subtitle;
+  if (summaryEl) summaryEl.textContent = summary || " ";
+  box.classList.remove("hidden");
+}
+
+function applyPreviewCardState(card, stateObj) {
+  if (!card || !stateObj) return;
+  if (Array.isArray(stateObj.nodes)) {
+    card.replaceChildren(...stateObj.nodes);
+  } else {
+    card.innerHTML = stateObj.html || "";
+  }
+  card.dataset.previewKey = stateObj.key;
+  card.dataset.previewEnabled = stateObj.enabled;
+  card.classList.remove("previewing");
+}
+
+function rotateCardContentsKeepAnchor(track, fixedCard, direction = 1) {
+  if (!track || !fixedCard) return false;
+  const cards = Array.from(track.querySelectorAll(".movie-preview-card"));
+  if (cards.length < 2) return false;
+  const fixedIdx = cards.indexOf(fixedCard);
+  if (fixedIdx < 0) return false;
+
+  const snapshot = cards.map((c) => ({
+    // Keep existing DOM nodes to avoid recreating <img>/<video> on every rotation.
+    nodes: Array.from(c.childNodes),
+    html: c.innerHTML,
+    key: c.dataset.previewKey || "",
+    enabled: c.dataset.previewEnabled || "0",
+  }));
+  stopMoviePreviewPlayback();
+
+  if (direction > 0) {
+    const first = snapshot[fixedIdx];
+    for (let i = fixedIdx; i < cards.length - 1; i += 1) {
+      applyPreviewCardState(cards[i], snapshot[i + 1]);
+    }
+    applyPreviewCardState(cards[cards.length - 1], first);
+  } else {
+    const last = snapshot[cards.length - 1];
+    for (let i = cards.length - 1; i > fixedIdx; i -= 1) {
+      applyPreviewCardState(cards[i], snapshot[i - 1]);
+    }
+    applyPreviewCardState(cards[fixedIdx], last);
+  }
+
+  fixedCard.focus({ preventScroll: true });
+  markLeftAnchorCard(track, fixedCard, { force: true });
+  return true;
+}
+
+function triggerLeftmostPreviewForTrack(track, immediate = false) {
+  if (!track) return;
+  const card = getLeftmostVisibleCardInTrack(track);
   markLeftAnchorCard(track, card);
-  if (!canRunMoviePreviewNow()) return;
   if (!card) return;
   if (card.dataset.previewEnabled !== "1") return;
-  const key = card.dataset.previewKey || "";
-  const item = state.moviePreviewItemMap.get(key);
+  if (!canRunPreviewNowInTrack(track)) return;
+
+  const item = getPreviewItemByTrackCard(track, card);
   if (!item) return;
-  scheduleMoviePreviewPlayback(card, item);
+
+  if (track === ui.dramaTrack && !!item.is_dir) {
+    handleDramaCardPreview(card, item);
+    return;
+  }
+  scheduleMoviePreviewPlayback(card, item, immediate);
+}
+
+function triggerLeftmostMoviePreview() {
+  triggerLeftmostPreviewForTrack(ui.moviePreviewTrack, false);
 }
 
 async function loadMoviePreviewRail(append = false) {
@@ -3170,19 +3699,17 @@ async function loadMoviePreviewRail(append = false) {
 
   state.moviePreviewLoading = true;
   try {
+    const selectedBucket = state.movieVirtualCategory || "전체";
     const params = new URLSearchParams({
-      query: "",
-      category: "movie",
-      is_dir: "false",
-      recursive: "true",
+      bucket: selectedBucket,
       sort_by: "date",
       sort_order: "desc",
       source_id: String(state.sourceId ?? 0),
-      limit: "20",
+      limit: String(ANIMATION_PREVIEW_FETCH_LIMIT),
       offset: String(append ? state.moviePreviewOffset : 0),
     });
 
-    const data = await gdsFetch(`search?${params.toString()}`);
+    const data = await gdsFetch(`movie_preview?${params.toString()}`);
     if (!data || data.ret !== "success") return;
     const list = data.list || data.data || [];
     const videoExtensions = [".mp4", ".mkv", ".avi", ".mov", ".webm", ".m4v", ".ts"];
@@ -3191,7 +3718,7 @@ async function loadMoviePreviewRail(append = false) {
       const lower = String(item.path).toLowerCase();
       if (!videoExtensions.some((ext) => lower.endsWith(ext))) return false;
       const ext = getPathExtension(item.path);
-      return PREVIEW_PLAYABLE_EXTS.has(ext);
+      return PREVIEW_SOURCE_EXTS.has(ext);
     });
 
     if (!append) {
@@ -3202,32 +3729,69 @@ async function loadMoviePreviewRail(append = false) {
       state.moviePreviewHasMore = true;
     }
 
-    // Collapse variants (4K/1080p/release tags) to one card per movie title.
-    const movieMap = new Map();
+    // Folder-first mode:
+    // 1) group by parent folder (one card per work)
+    // 2) keep latest playable file in each folder as preview/play source
+    const getBaseName = (p) => {
+      const parts = String(p || "").split("/").filter(Boolean);
+      return parts.length ? parts[parts.length - 1] : "";
+    };
+    const folderMap = new Map();
     candidates.forEach((item) => {
-      const titleKey = normalizeWorkTitle(item.meta_title || item.title || item.name || "Untitled");
-      const prev = movieMap.get(titleKey);
+      const folderPath = String(getParentPath(item.path) || "").replace(/^\/+/, "");
+      if (!folderPath) return;
+      const prev = folderMap.get(folderPath);
       if (!prev) {
-        movieMap.set(titleKey, item);
+        folderMap.set(folderPath, item);
         return;
       }
       const nowTs = parseMtimeToEpoch(item.mtime);
       const prevTs = parseMtimeToEpoch(prev.mtime);
-      if (nowTs > prevTs) movieMap.set(titleKey, item);
+      if (nowTs > prevTs) folderMap.set(folderPath, item);
     });
 
-    const groupedMovies = Array.from(movieMap.entries())
-      .map(([titleKey, item]) => ({ titleKey, item }))
+    const groupedMovies = Array.from(folderMap.entries())
+      .map(([folderPath, item]) => ({ folderPath, item }))
       .sort((a, b) => parseMtimeToEpoch(b.item?.mtime) - parseMtimeToEpoch(a.item?.mtime));
 
     const frag = document.createDocumentFragment();
     let added = 0;
-    groupedMovies.forEach(({ titleKey, item }, idx) => {
-      if (state.moviePreviewSeenKeys.has(titleKey)) return;
-      state.moviePreviewSeenKeys.add(titleKey);
+    groupedMovies.forEach(({ folderPath, item }, idx) => {
+      const folderKey = `folder:${String(folderPath || "").toLowerCase()}`;
+      if (state.moviePreviewSeenKeys.has(folderKey)) return;
+      state.moviePreviewSeenKeys.add(folderKey);
 
-      const displayTitle = cleanMediaTitle(item.meta_title || item.title || item.name || "Untitled");
-      const poster = getPosterUrlFromItem(item, 540);
+      const folderMeta = findNearestFolderMeta(folderPath) || null;
+      const displayTitle = cleanMediaTitle(
+        folderMeta?.meta_title ||
+        folderMeta?.title ||
+        folderMeta?.album_info?.title ||
+        item?.meta_title ||
+        getBaseName(folderPath) ||
+        item?.title ||
+        item?.name ||
+        "Untitled",
+      );
+      const yearText = String(folderMeta?.year || item?.year || "").trim();
+      const subtitle = yearText || "MOVIE";
+      const previewItem = {
+        ...item,
+        folder_path: folderPath,
+        folder_name: getBaseName(folderPath),
+        meta_title: displayTitle,
+        title: displayTitle,
+        meta_summary: folderMeta?.meta_summary || folderMeta?.summary || folderMeta?.desc || item?.meta_summary || item?.summary || item?.desc || "",
+        summary: folderMeta?.summary || folderMeta?.desc || item?.summary || item?.desc || "",
+        desc: folderMeta?.desc || item?.desc || "",
+        meta_poster: folderMeta?.meta_poster || folderMeta?.poster || folderMeta?.album_info?.posters || item?.meta_poster || item?.poster || "",
+      };
+      const poster = choosePosterUrl({
+        item: previewItem,
+        width: 540,
+        metaPoster: previewItem?.meta_poster || "",
+        folderPath,
+        parentFolderPath: getParentPath(folderPath),
+      });
       const previewEnabled = true;
       const card = document.createElement("button");
       card.type = "button";
@@ -3235,19 +3799,23 @@ async function loadMoviePreviewRail(append = false) {
       card.setAttribute("tabindex", "0");
       card.dataset.previewEnabled = previewEnabled ? "1" : "0";
       card.dataset.previewIndex = String(ui.moviePreviewTrack.children.length + idx);
-      const previewKey = `${titleKey}_${state.moviePreviewOffset}_${idx}`;
+      const previewKey = `${folderKey}_${state.moviePreviewOffset}_${idx}`;
       card.dataset.previewKey = previewKey;
-      state.moviePreviewItemMap.set(previewKey, item);
+      state.moviePreviewItemMap.set(previewKey, previewItem);
       card.innerHTML = `
         <div class="movie-preview-media">
           <img class="movie-preview-poster" src="${poster}" alt="${displayTitle}" loading="lazy">
-          <video class="movie-preview-video" playsinline muted loop preload="none"></video>
+          <video class="movie-preview-video" playsinline webkit-playsinline disablepictureinpicture disableremoteplayback controlslist="nodownload noplaybackrate nofullscreen noremoteplayback" loop preload="none"></video>
           <div class="movie-preview-gradient"></div>
         </div>
         <div class="movie-preview-title">${displayTitle}</div>
+        <div class="movie-preview-subtitle">${subtitle}</div>
       `;
 
-      card.addEventListener("click", () => playVideo(item));
+      card.addEventListener("click", () => {
+        const live = getPreviewItemByTrackCard(ui.moviePreviewTrack, card) || previewItem;
+        playVideo(live);
+      });
       frag.appendChild(card);
       added += 1;
     });
@@ -3258,7 +3826,7 @@ async function loadMoviePreviewRail(append = false) {
       markLeftAnchorCard(ui.moviePreviewTrack, leftCard);
     }
     state.moviePreviewOffset += Number(list.length || 0);
-    state.moviePreviewHasMore = list.length >= 20;
+    state.moviePreviewHasMore = typeof data.has_more === "boolean" ? data.has_more : (list.length >= 20);
     if (!append && ui.moviePreviewTrack.children.length === 0) {
       setMoviePreviewRailVisible(false);
     }
@@ -3277,29 +3845,17 @@ async function loadAnimationRail(append = false) {
 
   state.animationRailLoading = true;
   try {
-    const baseParams = {
-      category: "animation",
-      is_dir: "false",
-      recursive: "true",
+    const selectedBucket = state.animationVirtualCategory || "전체";
+    const params = new URLSearchParams({
+      bucket: selectedBucket,
       sort_by: "date",
       sort_order: "desc",
       source_id: String(state.sourceId ?? 0),
       limit: "20",
       offset: String(append ? state.animationRailOffset : 0),
-    };
-
-    const primary = new URLSearchParams({ ...baseParams, query: "라프텔" });
-    let data = await gdsFetch(`search?${primary.toString()}`);
+    });
+    const data = await gdsFetch(`animation_preview?${params.toString()}`);
     let list = (data && data.ret === "success") ? (data.list || data.data || []) : [];
-
-    if (list.length < 8 && !append) {
-      const fallback = new URLSearchParams({ ...baseParams, query: "" });
-      const fallbackData = await gdsFetch(`search?${fallback.toString()}`);
-      if (fallbackData && fallbackData.ret === "success") {
-        const more = fallbackData.list || fallbackData.data || [];
-        list = [...list, ...more];
-      }
-    }
 
     const videoExtensions = [".mp4", ".mkv", ".avi", ".mov", ".webm", ".m4v", ".ts"];
     const candidates = list.filter((item) => {
@@ -3311,6 +3867,7 @@ async function loadAnimationRail(append = false) {
     if (!append) {
       ui.animationTrack.innerHTML = "";
       state.animationRailSeenKeys.clear();
+      state.animationPreviewItemMap.clear();
       state.animationRailOffset = 0;
       state.animationRailHasMore = true;
     }
@@ -3343,42 +3900,93 @@ async function loadAnimationRail(append = false) {
       const ta = parseMtimeToEpoch(a.item?.mtime);
       const tb = parseMtimeToEpoch(b.item?.mtime);
       return tb - ta;
-    });
+    }).slice(0, ANIMATION_PREVIEW_RENDER_LIMIT);
 
     const frag = document.createDocumentFragment();
     let added = 0;
-    seriesList.forEach(({ item, meta }) => {
+    for (const { item, meta } of seriesList) {
       const dedupKey = normalizePathForCompare(meta.seriesPath || item.path || item.name);
-      if (state.animationRailSeenKeys.has(dedupKey)) return;
+      if (state.animationRailSeenKeys.has(dedupKey)) continue;
       state.animationRailSeenKeys.add(dedupKey);
 
-      const title = cleanMediaTitle(meta.seriesTitle || item.meta_title || item.title || item.name || "Untitled");
+      const rawSeriesPath = String(meta.seriesPath || "").normalize("NFC");
+      let seriesPathForMeta = rawSeriesPath.split("::")[0].replace(/^\/+/, "").normalize("NFC");
+      const seriesLeafName = splitPathSegments(seriesPathForMeta).slice(-1)[0] || "";
+      if (isSeasonLikeName(seriesLeafName)) {
+        seriesPathForMeta = String(getParentPath(seriesPathForMeta) || "").replace(/^\/+/, "").normalize("NFC");
+      }
+      let seriesMeta = findNearestFolderMeta(seriesPathForMeta);
+      if (!seriesMeta || !(seriesMeta.meta_poster || seriesMeta.poster || seriesMeta.album_info?.posters)) {
+        const hydrated = await hydrateFolderMetaFromParent(seriesPathForMeta, item?.source_id);
+        if (hydrated) seriesMeta = hydrated;
+      }
+      const parentPathForMeta = seriesPathForMeta ? getParentPath(seriesPathForMeta) : "";
+      let parentMeta = findNearestFolderMeta(parentPathForMeta);
+      if (!parentMeta && parentPathForMeta) {
+        parentMeta = await hydrateFolderMetaFromParent(parentPathForMeta, item?.source_id);
+      }
+
+      const title = cleanMediaTitle(
+        seriesMeta?.meta_title ||
+        seriesMeta?.title ||
+        seriesMeta?.album_info?.title ||
+        parentMeta?.meta_title ||
+        parentMeta?.title ||
+        parentMeta?.album_info?.title ||
+        meta.seriesTitle ||
+        item.meta_title ||
+        item.title ||
+        item.name ||
+        "Untitled",
+      );
       const episode = extractEpisodeLabel(item);
-      const seriesPath = String(meta.seriesPath || "").trim();
-      const seriesBpath = seriesPath
-        ? toUrlSafeBase64(seriesPath.startsWith("/") ? seriesPath : `/${seriesPath}`)
-        : "";
-      const poster = seriesBpath
-        ? `${state.serverUrl}/gds_dviewer/normal/thumbnail?bpath=${seriesBpath}&source_id=${normalizeSourceId(item.source_id)}&w=540&apikey=${state.apiKey}`
-        : getPosterUrlFromItem(item, 540);
+      const seriesPathClean = String(seriesPathForMeta || "").trim();
+      const metaPoster =
+        seriesMeta?.meta_poster ||
+        seriesMeta?.album_info?.posters ||
+        seriesMeta?.poster ||
+        parentMeta?.meta_poster ||
+        parentMeta?.album_info?.posters ||
+        parentMeta?.poster ||
+        "";
+      const poster = choosePosterUrl({
+        item,
+        width: 540,
+        metaPoster,
+        folderPath: seriesPathClean,
+        parentFolderPath: parentPathForMeta,
+      });
       const ext = getPathExtension(item.path);
-      const previewEnabled = PREVIEW_PLAYABLE_EXTS.has(ext);
+      const previewEnabled = PREVIEW_SOURCE_EXTS.has(ext);
 
       const card = document.createElement("button");
       card.type = "button";
       card.className = "movie-preview-card";
       card.setAttribute("tabindex", "0");
       card.dataset.previewEnabled = previewEnabled ? "1" : "0";
+      const previewKey = `${dedupKey}_${state.animationRailOffset}_${added}`;
+      card.dataset.previewKey = previewKey;
+      state.animationPreviewItemMap.set(previewKey, item);
       card.innerHTML = `
         <div class="movie-preview-media">
           <img class="movie-preview-poster" src="${poster}" alt="${title}" loading="lazy">
-          <video class="movie-preview-video" playsinline muted loop preload="none"></video>
+          <video class="movie-preview-video" playsinline webkit-playsinline disablepictureinpicture disableremoteplayback controlslist="nodownload noplaybackrate nofullscreen noremoteplayback" loop preload="none"></video>
           <div class="movie-preview-gradient"></div>
         </div>
         <div class="movie-preview-title">${title}</div>
         <div class="movie-preview-subtitle">${episode || "LATEST"}</div>
       `;
-      card.addEventListener("click", () => playVideo(item));
+      card.addEventListener("click", () => {
+        const live = getPreviewItemByTrackCard(ui.animationTrack, card) || item;
+        playVideo(live);
+      });
+      const posterImg = card.querySelector(".movie-preview-poster");
+      if (posterImg) {
+        posterImg.addEventListener("error", () => {
+          const fallbackSrc = getPosterUrlFromItem(item, 540);
+          if (fallbackSrc && posterImg.src !== fallbackSrc) posterImg.src = fallbackSrc;
+        }, { once: true });
+      }
       if (previewEnabled) {
         card.addEventListener("mouseenter", () => scheduleMoviePreviewPlayback(card, item));
         card.addEventListener("mouseleave", () => stopMoviePreviewPlayback());
@@ -3396,7 +4004,7 @@ async function loadAnimationRail(append = false) {
       }
       frag.appendChild(card);
       added += 1;
-    });
+    }
 
     if (added > 0) ui.animationTrack.appendChild(frag);
     if (ui.animationTrack.children.length > 0) {
@@ -3404,7 +4012,9 @@ async function loadAnimationRail(append = false) {
       markLeftAnchorCard(ui.animationTrack, cards[0] || null);
     }
     state.animationRailOffset += Number(list.length || 0);
-    state.animationRailHasMore = list.length >= 20;
+    state.animationRailHasMore = typeof data?.has_more === "boolean"
+      ? data.has_more
+      : (list.length >= ANIMATION_PREVIEW_FETCH_LIMIT);
     if (!append && ui.animationTrack.children.length === 0) {
       setAnimationRailVisible(false);
     }
@@ -3438,6 +4048,7 @@ async function loadDramaRail(append = false) {
     if (!append) {
       ui.dramaTrack.innerHTML = "";
       state.dramaRailSeenKeys.clear();
+      state.dramaPreviewItemMap.clear();
       state.dramaRailOffset = 0;
       state.dramaRailHasMore = true;
     }
@@ -3451,36 +4062,42 @@ async function loadDramaRail(append = false) {
 
       const title = cleanMediaTitle(item.meta_title || item.title || item.name || "Untitled");
       const subtitle = item.is_dir ? "SERIES" : (extractEpisodeLabel(item) || "EP -");
-      const poster = item.meta_poster || item.poster || (() => {
-        const bpath = toUrlSafeBase64(item.path || "");
-        if (!bpath) return `${state.serverUrl}/gds_dviewer/static/img/no_poster.png`;
-        return `${state.serverUrl}/gds_dviewer/normal/thumbnail?bpath=${bpath}&source_id=${normalizeSourceId(item.source_id)}&w=540&apikey=${state.apiKey}`;
-      })();
+      const poster = choosePosterUrl({
+        item,
+        width: 540,
+        metaPoster: item.meta_poster || item.poster || item.album_info?.posters || "",
+        folderPath: String(item.path || "").replace(/^\/+/, ""),
+        parentFolderPath: getParentPath(String(item.path || "").replace(/^\/+/, "")),
+      });
 
       const card = document.createElement("button");
       card.type = "button";
       card.className = "movie-preview-card";
       card.setAttribute("tabindex", "0");
       const ext = getPathExtension(item.path);
-      const previewEnabled = !!item.is_dir || PREVIEW_PLAYABLE_EXTS.has(ext);
+      const previewEnabled = !!item.is_dir || PREVIEW_SOURCE_EXTS.has(ext);
       card.dataset.previewEnabled = previewEnabled ? "1" : "0";
+      const previewKey = `${key}_${state.dramaRailOffset}_${added}`;
+      card.dataset.previewKey = previewKey;
+      state.dramaPreviewItemMap.set(previewKey, item);
       card.innerHTML = `
         <div class="movie-preview-media">
           <img class="movie-preview-poster" src="${poster}" alt="${title}" loading="lazy">
-          <video class="movie-preview-video" playsinline muted loop preload="none"></video>
+          <video class="movie-preview-video" playsinline webkit-playsinline disablepictureinpicture disableremoteplayback controlslist="nodownload noplaybackrate nofullscreen noremoteplayback" loop preload="none"></video>
           <div class="movie-preview-gradient"></div>
         </div>
         <div class="movie-preview-title">${title}</div>
         <div class="movie-preview-subtitle">${subtitle}</div>
       `;
       card.addEventListener("click", () => {
-        if (item.is_dir) {
-          state.currentPath = item.path || "";
+        const live = getPreviewItemByTrackCard(ui.dramaTrack, card) || item;
+        if (live.is_dir) {
+          state.currentPath = live.path || "";
           state.pathStack = state.currentPath ? [state.currentPath] : [];
           state.query = "";
           loadLibrary(true);
         } else {
-          playVideo(item);
+          playVideo(live);
         }
       });
       card.addEventListener("mouseenter", () => {
@@ -3494,7 +4111,8 @@ async function loadDramaRail(append = false) {
           previewEnabled,
           isLeftmost,
         });
-        handleDramaCardPreview(card, item);
+        const live = getPreviewItemByTrackCard(ui.dramaTrack, card) || item;
+        handleDramaCardPreview(card, live);
       });
       card.addEventListener("mouseleave", () => stopMoviePreviewPlayback());
       card.addEventListener("focus", () => {
@@ -3506,7 +4124,8 @@ async function loadDramaRail(append = false) {
           previewEnabled,
           isLeftmost,
         });
-        handleDramaCardPreview(card, item);
+        const live = getPreviewItemByTrackCard(ui.dramaTrack, card) || item;
+        handleDramaCardPreview(card, live);
       });
       card.addEventListener("blur", () => stopMoviePreviewPlayback());
       frag.appendChild(card);
@@ -3541,6 +4160,11 @@ function setupMoviePreviewRail() {
     startMoviePreviewAutoSlide();
   });
   ui.moviePreviewTrack.addEventListener("focusin", () => {
+    const fixed = ui.moviePreviewTrack.querySelector('.movie-preview-card[data-anchor-fixed="1"]');
+    const active = document.activeElement;
+    if (fixed && (!active || !ui.moviePreviewTrack.contains(active))) {
+      fixed.focus({ preventScroll: true });
+    }
     moviePreviewUserInteracting = true;
     stopMoviePreviewAutoSlide();
     triggerLeftmostMoviePreview();
@@ -3573,9 +4197,15 @@ function setupAnimationRail() {
     startAnimationRailAutoSlide();
   });
   ui.animationTrack.addEventListener("focusin", () => {
+    const fixed = ui.animationTrack.querySelector('.movie-preview-card[data-anchor-fixed="1"]');
+    const active = document.activeElement;
+    if (fixed && (!active || !ui.animationTrack.contains(active))) {
+      fixed.focus({ preventScroll: true });
+    }
     const activeTitle = document.activeElement?.querySelector?.(".movie-preview-title")?.textContent || "";
     console.log("[ANIME-PREVIEW] track focusin:", activeTitle);
     stopAnimationRailAutoSlide();
+    triggerLeftmostPreviewForTrack(ui.animationTrack, true);
   });
   ui.animationTrack.addEventListener("focusout", () => {
     startAnimationRailAutoSlide();
@@ -3591,6 +4221,7 @@ function setupAnimationRail() {
       })
       .sort((a, b) => a.getBoundingClientRect().left - b.getBoundingClientRect().left)[0] || cards[0] || null;
     markLeftAnchorCard(ui.animationTrack, leftmost);
+    triggerLeftmostPreviewForTrack(ui.animationTrack, true);
     const remain = ui.animationTrack.scrollWidth - (ui.animationTrack.scrollLeft + ui.animationTrack.clientWidth);
     if (remain < 260) loadAnimationRail(true);
   }, { passive: true });
@@ -3609,11 +4240,17 @@ function setupDramaRail() {
     startDramaRailAutoSlide();
   });
   ui.dramaTrack.addEventListener("focusin", () => {
+    const fixed = ui.dramaTrack.querySelector('.movie-preview-card[data-anchor-fixed="1"]');
+    const active = document.activeElement;
+    if (fixed && (!active || !ui.dramaTrack.contains(active))) {
+      fixed.focus({ preventScroll: true });
+    }
     dramaRailUserInteracting = true;
     const activeTitle = document.activeElement?.querySelector?.(".movie-preview-title")?.textContent || "";
     console.log("[DRAMA-PREVIEW] track focusin:", activeTitle);
     unlockPreviewAutoplay();
     stopDramaRailAutoSlide();
+    triggerLeftmostPreviewForTrack(ui.dramaTrack, true);
   });
   ui.dramaTrack.addEventListener("focusout", () => {
     const active = document.activeElement;
@@ -3621,6 +4258,7 @@ function setupDramaRail() {
     if (!dramaRailUserInteracting) startDramaRailAutoSlide();
   });
   ui.dramaTrack.addEventListener("scroll", () => {
+    triggerLeftmostPreviewForTrack(ui.dramaTrack, true);
     const remain = ui.dramaTrack.scrollWidth - (ui.dramaTrack.scrollLeft + ui.dramaTrack.clientWidth);
     if (remain < 260) loadDramaRail(true);
   }, { passive: true });
@@ -3931,6 +4569,15 @@ function setupPlayer() {
   if (!ui.mainPlayer) return;
 
   const player = ui.mainPlayer;
+  // Suppress native webview video chrome/overlay (we render custom OSC).
+  player.controls = false;
+  player.setAttribute("playsinline", "");
+  player.setAttribute("webkit-playsinline", "");
+  player.setAttribute("disablepictureinpicture", "");
+  player.setAttribute("disableremoteplayback", "");
+  player.setAttribute("controlslist", "nodownload noplaybackrate nofullscreen noremoteplayback");
+  player.removeAttribute("poster");
+  player.setAttribute("poster", "");
   let hideTimeout;
 
   const showUI = () => {
@@ -4898,31 +5545,134 @@ function setupRemoteNavigation() {
 
     // Spatial Navigation Logic
     if (["ArrowUp", "ArrowDown", "ArrowLeft", "ArrowRight"].includes(key)) {
+      // [MPV REMOTE SEEK] While native player is active, reserve Left/Right for quick seek.
+      // This must run before preview-rail navigation to avoid key conflicts.
+      const playerOverlay = ui.playerOverlay;
+      const isPlayerActive =
+        playerOverlay && playerOverlay.classList.contains("active");
+      if (isPlayerActive && state.isNativeActive && (key === "ArrowRight" || key === "ArrowLeft")) {
+        const invoke =
+          window.__TAURI__ && window.__TAURI__.core
+            ? window.__TAURI__.core.invoke
+            : window.__TAURI__
+              ? window.__TAURI__.invoke
+              : null;
+        if (invoke) {
+          const currentPos = Number.isFinite(state.nativePos) ? state.nativePos : 0;
+          const delta = key === "ArrowRight" ? 10 : -10;
+          const durationCap = Number.isFinite(state.nativeDuration) && state.nativeDuration > 0
+            ? state.nativeDuration
+            : Number.POSITIVE_INFINITY;
+          const targetTime = Math.min(Math.max(0, currentPos + delta), durationCap);
+          invoke("native_seek", { seconds: targetTime })
+            .then(() => {
+              state.nativePos = targetTime;
+              console.log(`[REMOTE] MPV seek ${delta > 0 ? "+" : ""}${delta}s -> ${targetTime.toFixed(2)}s`);
+            })
+            .catch((err) => console.error("[REMOTE] MPV seek failed:", err));
+        }
+        e.preventDefault();
+        e.stopPropagation();
+        return;
+      }
+
       if (activeOverlay) {
         e.preventDefault();
         moveFocus(key, activeOverlay);
         return;
       }
 
-      const previewTrack = ui.moviePreviewTrack;
+      const previewTracks = [ui.moviePreviewTrack, ui.animationTrack, ui.dramaTrack].filter(Boolean);
+      if (key === "ArrowLeft" || key === "ArrowRight") {
+        const forcedTrack = previewTracks.find((track) => {
+          if (!track) return false;
+          if (track.parentElement && track.parentElement.classList.contains("hidden")) return false;
+          const anyCard = track.querySelector(".movie-preview-card");
+          return !!anyCard;
+        }) || null;
+        if (forcedTrack) {
+          const cards = Array.from(forcedTrack.querySelectorAll(".movie-preview-card"));
+          let fixed = forcedTrack.querySelector('.movie-preview-card[data-anchor-fixed="1"]');
+          if (!fixed && cards.length > 0) {
+            fixed = cards[0];
+            markLeftAnchorCard(forcedTrack, fixed, { force: true });
+            console.log("[REMOTE] anchor bootstrap:", forcedTrack.id || "<track>", fixed.dataset.previewKey || "");
+          }
+          // Keep anchor deterministic at the first slot so rotation always has visible effect.
+          if (cards.length > 0 && fixed && cards[0] !== fixed) {
+            fixed = cards[0];
+            markLeftAnchorCard(forcedTrack, fixed, { force: true });
+            console.log("[REMOTE] anchor normalized to first slot:", forcedTrack.id || "<track>");
+          }
+          const fixedIdx = fixed ? cards.indexOf(fixed) : -1;
+          if (fixedIdx >= 0) {
+            const delta = key === "ArrowRight" ? 1 : -1;
+            const changed = rotateCardContentsKeepAnchor(forcedTrack, fixed, delta);
+            if (changed) {
+              markLeftAnchorCard(forcedTrack, fixed, { force: true });
+              fixed.focus({ preventScroll: true });
+              if (key === "ArrowRight") {
+                if (forcedTrack === ui.moviePreviewTrack) loadMoviePreviewRail(true).catch(() => {});
+                else if (forcedTrack === ui.animationTrack) loadAnimationRail(true).catch(() => {});
+                else if (forcedTrack === ui.dramaTrack) loadDramaRail(true).catch(() => {});
+              }
+              setTimeout(() => triggerLeftmostPreviewForTrack(forcedTrack, true), 80);
+            } else {
+              console.warn("[REMOTE] rotate skipped:", {
+                track: forcedTrack.id || "<track>",
+                fixedIdx,
+                cards: cards.length,
+                key,
+              });
+            }
+            e.preventDefault();
+            return;
+          }
+        }
+      }
+
       const currentPreviewCard = current && current.closest
         ? current.closest(".movie-preview-card")
         : null;
-      if (previewTrack && currentPreviewCard) {
-        const cards = Array.from(previewTrack.querySelectorAll(".movie-preview-card"));
-        const currentIdx = cards.indexOf(currentPreviewCard);
-        if (currentIdx >= 0) {
+      const currentPreviewTrack = currentPreviewCard
+        ? (currentPreviewCard.closest("#movie-preview-track, #animation-track, #drama-track") || null)
+        : null;
+      let activePreviewTrack = currentPreviewTrack || previewTracks.find((track) => {
+        if (!track) return false;
+        if (track.parentElement && track.parentElement.classList.contains("hidden")) return false;
+        const fixed = track.querySelector('.movie-preview-card[data-anchor-fixed="1"]');
+        return !!fixed && (track.contains(current) || document.activeElement === fixed);
+      }) || null;
+
+      // Remote UX: if no focused preview card but a preview rail is visible, still drive the first visible rail.
+      if (!activePreviewTrack && (key === "ArrowLeft" || key === "ArrowRight")) {
+        activePreviewTrack = previewTracks.find((track) => {
+          if (!track) return false;
+          if (track.parentElement && track.parentElement.classList.contains("hidden")) return false;
+          const fixed = track.querySelector('.movie-preview-card[data-anchor-fixed="1"]');
+          return !!fixed;
+        }) || null;
+      }
+
+      if (activePreviewTrack) {
+        const cards = Array.from(activePreviewTrack.querySelectorAll(".movie-preview-card"));
+        const fixed = activePreviewTrack.querySelector('.movie-preview-card[data-anchor-fixed="1"]');
+        const fixedIdx = fixed ? cards.indexOf(fixed) : -1;
+        if (fixedIdx >= 0) {
           if (key === "ArrowLeft" || key === "ArrowRight") {
             const delta = key === "ArrowRight" ? 1 : -1;
-            const nextIdx = Math.max(0, Math.min(cards.length - 1, currentIdx + delta));
-            const target = cards[nextIdx];
-            if (target) {
-              target.focus();
-              target.scrollIntoView({ behavior: e.repeat ? "auto" : "smooth", inline: "center", block: "nearest" });
-              if (key === "ArrowRight" && cards.length - nextIdx <= 3) {
-                loadMoviePreviewRail(true).catch(() => {});
+            const changed = rotateCardContentsKeepAnchor(activePreviewTrack, fixed, delta);
+            if (changed) {
+              markLeftAnchorCard(activePreviewTrack, fixed, { force: true });
+              fixed.focus({ preventScroll: true });
+
+              if (key === "ArrowRight") {
+                if (activePreviewTrack === ui.moviePreviewTrack) loadMoviePreviewRail(true).catch(() => {});
+                else if (activePreviewTrack === ui.animationTrack) loadAnimationRail(true).catch(() => {});
+                else if (activePreviewTrack === ui.dramaTrack) loadDramaRail(true).catch(() => {});
               }
-              setTimeout(() => triggerLeftmostMoviePreview(), 120);
+
+              setTimeout(() => triggerLeftmostPreviewForTrack(activePreviewTrack, true), 80);
             }
             e.preventDefault();
             return;
@@ -4942,10 +5692,6 @@ function setupRemoteNavigation() {
           }
         }
       }
-
-      const playerOverlay = ui.playerOverlay;
-      const isPlayerActive =
-        playerOverlay && playerOverlay.classList.contains("active");
 
       if (isPlayerActive) {
         const videoPlayer = ui.mainPlayer;
@@ -4994,6 +5740,10 @@ function setupRemoteNavigation() {
       const moved = moveFocus(key);
       if (!moved && (key === "ArrowDown" || key === "ArrowUp")) {
         const container = document.querySelector(".content-container");
+        if (container && container.classList.contains("folder-play-only")) {
+          // Single-play movie mode should stay fixed; do not scroll away the CTA.
+          return;
+        }
         if (container) {
           const delta = key === "ArrowDown" ? 220 : -220;
           container.scrollBy({ top: delta, behavior: e.repeat ? "auto" : "smooth" });
