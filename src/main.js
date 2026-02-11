@@ -47,6 +47,10 @@ const state = {
   episodeMetaReqSeq: 0,
   episodeMetaCache: new Map(),
   nativeFullscreenTransition: false,
+  nativeSeekPreviewPos: null,
+  nativeSeekPreviewTs: 0,
+  nativeSeekPendingSteps: 0,
+  nativeSeekBasePos: null,
   nativeArch: "unknown",
   fullscreenEnterRepairAttempted: false,
   lastFullscreenToggleAt: 0,
@@ -71,6 +75,7 @@ const state = {
   dramaPreviewCache: new Map(),
   folderContextPrimaryItem: null,
   previewAutoplayUnlocked: false,
+  episodeDrawerOpen: false,
 };
 
 // Platform Detection
@@ -103,9 +108,22 @@ const PREVIEW_DEFAULT_VOLUME = 0.35;
 const ANIMATION_PREVIEW_FETCH_LIMIT = 120;
 const ANIMATION_PREVIEW_RENDER_LIMIT = 20;
 const PREVIEW_AUTO_SLIDE_ENABLED = false;
+const TRICKPLAY_DEFAULT_INTERVAL = 10;
+const TRICKPLAY_DEFAULT_W = 320;
+const TRICKPLAY_DEFAULT_H = 180;
+const TRICKPLAY_HIDE_MS = 1200;
 let animationRailAutoSlideTimer = null;
 let dramaRailAutoSlideTimer = null;
 let dramaRailUserInteracting = false;
+const trickplayManifestCache = new Map();
+let trickplayHideTimer = null;
+
+function resetNativeSeekPending() {
+  state.nativeSeekPendingSteps = 0;
+  state.nativeSeekBasePos = null;
+  state.nativeSeekPreviewPos = null;
+  state.nativeSeekPreviewTs = 0;
+}
 
 function unlockPreviewAutoplay() {
   if (state.previewAutoplayUnlocked) return;
@@ -164,6 +182,20 @@ function isGenericAnimeBucket(name) {
   return generic.has(n) || n.length <= 1;
 }
 
+function isGenericMovieBucket(name) {
+  const n = String(name || "").trim().toLowerCase();
+  if (!n) return true;
+  if (n.length <= 1) return true;
+  if (/^[가-힣]$/.test(n)) return true;
+  if (/^[a-z]$/.test(n)) return true;
+  if (/^\d+[a-z]?$/.test(n)) return true; // e.g. 0, 0z
+  const generic = new Set([
+    "movie", "movies", "영화", "기타", "others", "etc", "up", "upload", "업로드",
+    "국내영화", "외국영화", "한글", "영문", "숫자",
+  ]);
+  return generic.has(n);
+}
+
 function isSeasonLikeName(name) {
   const n = String(name || "").trim().toLowerCase();
   return /^s\d{1,2}$/.test(n) ||
@@ -210,6 +242,107 @@ function inferSeriesTitleFromFileName(item) {
     .replace(/\b(2160P|1080P|720P|4K|UHD|HDR|HEVC|X265|X264|WEB[\s\-]?DL|BLURAY|AAC|DDP?5?\.?1|ATMOS)\b/ig, " ")
     .replace(/\s+/g, " ")
     .trim();
+}
+
+function inferWorkTitleFromPath(pathValue) {
+  const fileName = String(pathValue || "").split("/").filter(Boolean).pop() || "";
+  if (!fileName) return "";
+  return cleanMediaTitle(fileName)
+    .replace(/\bS\d{1,2}E\d{1,3}\b/ig, " ")
+    .replace(/\b(?:EP?|E|제)\s*\.?\d{1,3}(?:화)?\b/ig, " ")
+    .replace(/\b(2160P|1080P|720P|4K|UHD|HDR|DV|HEVC|X265|X264|H\.?265|H\.?264|WEB[\s\-]?DL|BLURAY|AAC|DDP?5?\.?1|ATMOS|KOR|JPN|ENG)\b/ig, " ")
+    .replace(/\[[^\]]+\]/g, " ")
+    .replace(/\{[^}]+\}/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function isUnusableWorkTitle(title) {
+  const t = String(title || "").trim();
+  if (!t) return true;
+  if (isGenericMovieBucket(t)) return true;
+  return false;
+}
+
+function isTechnicalMovieFolderName(name) {
+  const n = String(name || "").toLowerCase();
+  if (!n) return false;
+  return /(1080p|2160p|720p|4k|uhd|bluray|web[\s\-]?dl|webrip|x26[45]|h\.?26[45]|hevc|aac|ddp|atmos|\[[^\]]+\])/.test(n);
+}
+
+function firstUsableMovieTitle(candidates = []) {
+  for (const raw of candidates) {
+    const t = cleanMediaTitle(raw);
+    if (!isUnusableWorkTitle(t)) return t;
+  }
+  return cleanMediaTitle(candidates.find(Boolean) || "");
+}
+
+function buildMoviePreviewIdentity(item, folderPath) {
+  const folderLeaf = splitPathSegments(folderPath).slice(-1)[0] || "";
+  const hierarchyTitle = inferMovieTitleFromPathHierarchy(item?.path || "");
+  const inferredTitle = firstUsableMovieTitle([
+    item?.meta_title,
+    item?.title,
+    hierarchyTitle,
+    inferSeriesTitleFromFileName(item),
+    inferWorkTitleFromPath(item?.path || ""),
+    item?.name,
+    "Untitled",
+  ]);
+  const isBucketFolder = isGenericMovieBucket(folderLeaf);
+  const groupKey = isBucketFolder
+    ? `${folderPath}::${normalizeWorkTitle(inferredTitle)}`
+    : folderPath;
+  return { folderLeaf, hierarchyTitle, inferredTitle, isBucketFolder, groupKey };
+}
+
+function resolveMoviePreviewTitle(identity, item, folderMeta, parentMeta) {
+  if (identity.isBucketFolder) {
+    return firstUsableMovieTitle([
+      identity.inferredTitle,
+      identity.hierarchyTitle,
+      inferWorkTitleFromPath(item?.path || ""),
+      item?.meta_title,
+      item?.title,
+      item?.name,
+      "Untitled",
+    ]);
+  }
+  return firstUsableMovieTitle([
+    folderMeta?.meta_title,
+    folderMeta?.title,
+    folderMeta?.album_info?.title,
+    parentMeta?.meta_title,
+    parentMeta?.title,
+    parentMeta?.album_info?.title,
+    isTechnicalMovieFolderName(identity.folderLeaf) ? "" : identity.folderLeaf,
+    identity.hierarchyTitle,
+    identity.inferredTitle,
+    inferWorkTitleFromPath(item?.path || ""),
+    item?.meta_title,
+    item?.title,
+    item?.name,
+    "Untitled",
+  ]);
+}
+
+function inferMovieTitleFromPathHierarchy(pathValue) {
+  const segs = splitPathSegments(String(pathValue || "").normalize("NFC"));
+  if (!segs.length) return "";
+  // Drop filename segment when path points to a media file.
+  const last = segs[segs.length - 1] || "";
+  const hasMediaExt = /\.(mkv|mp4|avi|mov|webm|m4v|ts)$/i.test(last);
+  const end = hasMediaExt ? segs.length - 2 : segs.length - 1;
+  for (let i = end; i >= 0; i -= 1) {
+    const name = cleanMediaTitle(segs[i] || "");
+    if (!name) continue;
+    if (isGenericMovieBucket(name)) continue;
+    if (isTechnicalMovieFolderName(name)) continue;
+    if (isSeasonLikeName(name)) continue;
+    return name;
+  }
+  return "";
 }
 
 function resolveAnimeSeriesMeta(item) {
@@ -267,6 +400,8 @@ function cacheFolderMetaEntry(item) {
     poster: item.poster || "",
     year: item.year || item.album_info?.release_date || "",
     album_info: item.album_info || null,
+    meta_json: item.meta_json || null,
+    genre: item.genre || [],
     source_id: Number(normalizeSourceId(item.source_id)),
   });
 }
@@ -1146,6 +1281,7 @@ function switchView(viewName) {
     if (invoke) {
       invoke("close_native_player").catch(() => {});
       state.isNativeActive = false;
+      hideTrickplayOverlay();
       state.nativeSource = null;
       document.body.classList.remove("native-player-active");
       document.documentElement.classList.remove("native-player-active");
@@ -2329,6 +2465,34 @@ function renderFolderContextPanel(items = []) {
     firstMedia?.meta_summary || firstMedia?.summary || firstMedia?.desc || ""
   ).trim();
   const countLabel = episodeCount > 0 ? `${episodeCount} Episodes` : `${seasonCount} Seasons`;
+  const mediaName = String(firstMedia?.name || firstMedia?.title || firstMedia?.path || "").toLowerCase();
+  const qualityMatch =
+    mediaName.match(/\b(2160p|1080p|720p|480p)\b/i) ||
+    mediaName.match(/\b(4k|uhd)\b/i) ||
+    mediaName.match(/\b(x265|hevc|x264|h\.?264|h\.?265)\b/i);
+  const qualityText = qualityMatch ? qualityMatch[1].toUpperCase().replace("H.264", "H264").replace("H.265", "H265") : "";
+  const genreListRaw = []
+    .concat(currentMeta?.album_info?.genre || [])
+    .concat(parentMeta?.album_info?.genre || [])
+    .concat(firstMedia?.album_info?.genre || []);
+  const genreList = Array.from(new Set(
+    genreListRaw
+      .map((g) => String(g || "").trim())
+      .filter(Boolean)
+  )).slice(0, 4);
+  const parseMetaJson = (v) => {
+    if (!v) return {};
+    if (typeof v === "object") return v;
+    try { return JSON.parse(String(v)); } catch (_) { return {}; }
+  };
+  const currentMetaJson = parseMetaJson(currentMeta?.meta_json);
+  const parentMetaJson = parseMetaJson(parentMeta?.meta_json);
+  const mediaMetaJson = parseMetaJson(firstMedia?.meta_json);
+  const actorRaw = (currentMetaJson?.actor || parentMetaJson?.actor || mediaMetaJson?.actor || []);
+  const actorList = Array.isArray(actorRaw)
+    ? actorRaw.map((a) => (typeof a === "string" ? a : (a?.name || a?.name_ko || a?.name_en || ""))).filter(Boolean)
+    : String(actorRaw || "").split(",").map((a) => a.trim()).filter(Boolean);
+  const castPreview = actorList.slice(0, 4).join(" · ");
 
   panel.innerHTML = `
     <div class="folder-context-art" style="background-image:url('${backdrop}')"></div>
@@ -2339,7 +2503,10 @@ function renderFolderContextPanel(items = []) {
         <span class="folder-context-chip season">${seasonLabel}</span>
         <span class="folder-context-chip">${countLabel}</span>
         ${(currentMeta?.year || parentMeta?.year) ? `<span class="folder-context-chip">${currentMeta?.year || parentMeta?.year}</span>` : ""}
+        ${qualityText ? `<span class="folder-context-chip accent">영상 ${qualityText}</span>` : ""}
+        ${genreList.length ? `<span class="folder-context-chip">${genreList.join(" · ")}</span>` : ""}
       </div>
+      ${castPreview ? `<div class="folder-context-cast"><span class="folder-context-cast-label">출연</span><span class="folder-context-cast-value">${castPreview}</span></div>` : ""}
       ${summary ? `<p class="folder-context-summary">${summary}</p>` : ""}
     </div>
   `;
@@ -2428,6 +2595,109 @@ function setupInfiniteScroll() {
   );
 }
 
+function isAnimationContextPath() {
+  return /(^|\/)(애니메이션|animation)(\/|$)/i.test(String(state.currentPath || ""));
+}
+
+function ensureEpisodeDrawer() {
+  let overlay = document.getElementById("episode-drawer-overlay");
+  if (overlay) return overlay;
+  overlay = document.createElement("div");
+  overlay.id = "episode-drawer-overlay";
+  overlay.className = "episode-drawer-overlay hidden";
+  overlay.innerHTML = `
+    <div class="episode-drawer-backdrop" data-role="close"></div>
+    <aside class="episode-drawer-panel" role="dialog" aria-modal="true" aria-label="회차 정보">
+      <div class="episode-drawer-header">
+        <div class="episode-drawer-title-wrap">
+          <div class="episode-drawer-kicker">EPISODES</div>
+          <h3 id="episode-drawer-title" class="episode-drawer-title">회차 보기</h3>
+        </div>
+        <button type="button" id="episode-drawer-close" class="episode-drawer-close" tabindex="0" aria-label="닫기">✕</button>
+      </div>
+      <div id="episode-drawer-list" class="episode-drawer-list"></div>
+    </aside>
+  `;
+  document.body.appendChild(overlay);
+
+  const closeTargets = overlay.querySelectorAll('[data-role="close"], #episode-drawer-close');
+  closeTargets.forEach((el) => el.addEventListener('click', () => closeEpisodeDrawer()));
+  return overlay;
+}
+
+function closeEpisodeDrawer() {
+  const overlay = document.getElementById("episode-drawer-overlay");
+  if (!overlay || overlay.classList.contains("hidden")) return false;
+  overlay.classList.add("hidden");
+  document.body.classList.remove("episode-drawer-open");
+  state.episodeDrawerOpen = false;
+  return true;
+}
+
+function openEpisodeDrawer(rawItems = [], contextTitle = "회차 보기") {
+  const overlay = ensureEpisodeDrawer();
+  const listEl = overlay.querySelector('#episode-drawer-list');
+  const titleEl = overlay.querySelector('#episode-drawer-title');
+  if (titleEl) titleEl.textContent = contextTitle || "회차 보기";
+
+  const items = (Array.isArray(rawItems) ? rawItems : [])
+    .filter((i) => i && i.path)
+    .slice()
+    .sort((a, b) => {
+      if (!!a.is_dir !== !!b.is_dir) return a.is_dir ? -1 : 1;
+      const an = String(a.name || a.title || "").toLowerCase();
+      const bn = String(b.name || b.title || "").toLowerCase();
+      return an.localeCompare(bn, 'ko');
+    });
+
+  if (!listEl) return;
+  if (!items.length) {
+    listEl.innerHTML = '<div class="episode-drawer-empty">표시할 회차 정보가 없습니다.</div>';
+  } else {
+    listEl.innerHTML = items.map((item, idx) => {
+      const title = cleanMediaTitle(item.meta_title || item.title || item.name || `Item ${idx + 1}`);
+      const ep = extractEpisodeLabel(item);
+      const sub = item.is_dir
+        ? '폴더'
+        : (ep || String(item.ext || '').toUpperCase() || 'VIDEO');
+      const icon = item.is_dir ? '📁' : '▶';
+      return `
+        <button type="button" class="episode-drawer-item" data-index="${idx}" tabindex="0">
+          <span class="episode-drawer-item-icon">${icon}</span>
+          <span class="episode-drawer-item-text">
+            <span class="episode-drawer-item-title">${title}</span>
+            <span class="episode-drawer-item-sub">${sub}</span>
+          </span>
+        </button>
+      `;
+    }).join('');
+
+    const btns = listEl.querySelectorAll('.episode-drawer-item');
+    btns.forEach((btn) => {
+      btn.addEventListener('click', () => {
+        const idx = Number(btn.getAttribute('data-index'));
+        const item = items[idx];
+        if (!item) return;
+        closeEpisodeDrawer();
+        if (item.is_dir) {
+          state.currentPath = item.path;
+          state.pathStack.push(item.path);
+          loadLibrary(item.path);
+          updateBreadcrumbChips();
+        } else {
+          playVideo(item);
+        }
+      });
+    });
+  }
+
+  overlay.classList.remove('hidden');
+  document.body.classList.add('episode-drawer-open');
+  state.episodeDrawerOpen = true;
+  const firstBtn = overlay.querySelector('.episode-drawer-item, #episode-drawer-close');
+  if (firstBtn) setTimeout(() => firstBtn.focus(), 0);
+}
+
 function renderGrid(container, items, isFolderCategory = false, isAppend = false) {
   if (!isAppend) {
     container.innerHTML = "";
@@ -2453,57 +2723,106 @@ function renderGrid(container, items, isFolderCategory = false, isAppend = false
     container.classList.remove("folder-view");
   }
 
+  const currentPathText = String(state.currentPath || "");
+  const movieLikePath = /(^|\/)(영화|movie)(\/|$)/i.test(currentPathText);
+  const animationLikePath = isAnimationContextPath();
+  const animationPathHint = /(^|\/)(애니메이션|animation|anime)(\/|$)/i.test(currentPathText);
+  const hasEpisodeLikeStructure = Array.isArray(items)
+    && items.some((i) => i && !i.is_dir)
+    && items.some((i) => i && i.is_dir);
   const useSinglePlayButtonMode =
     !isAppend &&
-    state.category === "movie" &&
+    (state.category === "movie" || movieLikePath) &&
     !!state.currentPath &&
     !!state.folderContextPrimaryItem;
-  container.classList.toggle("folder-play-only", useSinglePlayButtonMode);
+  const useEpisodeButtonMode =
+    !isAppend &&
+    (
+      state.category === "animation" ||
+      animationLikePath ||
+      animationPathHint ||
+      (hasEpisodeLikeStructure && !movieLikePath)
+    ) &&
+    !!state.currentPath;
 
-  // Keep folder-context CTA in sync (single play mode only).
+  const useFolderActionPanelMode = useSinglePlayButtonMode || useEpisodeButtonMode;
+  const preserveFolderActionMode =
+    isAppend &&
+    (
+      container.classList.contains("folder-play-only") ||
+      document.querySelector(".content-container")?.classList.contains("folder-play-only") ||
+      document.getElementById("folder-context-panel")?.classList.contains("has-play-cta")
+    );
+  const effectiveFolderActionMode = useFolderActionPanelMode || preserveFolderActionMode;
+  container.classList.toggle("folder-play-only", effectiveFolderActionMode);
+  const contentContainer = document.querySelector(".content-container");
+  if (contentContainer) contentContainer.classList.toggle("folder-play-only", effectiveFolderActionMode);
+
+  // Keep folder-context CTA in sync for folder action panel mode.
   const folderContextPanel = document.getElementById("folder-context-panel");
   const folderContextBody = folderContextPanel ? folderContextPanel.querySelector(".folder-context-body") : null;
-  if (folderContextPanel) folderContextPanel.classList.toggle("has-play-cta", useSinglePlayButtonMode);
-  if (folderContextBody) {
+  if (folderContextPanel) folderContextPanel.classList.toggle("has-play-cta", effectiveFolderActionMode);
+  if (!isAppend && folderContextBody) {
     const prevActions = folderContextBody.querySelector(".folder-context-actions");
     if (prevActions) prevActions.remove();
   }
 
-  if (useSinglePlayButtonMode) {
-    const target = state.folderContextPrimaryItem;
+  if (useSinglePlayButtonMode || useEpisodeButtonMode) {
+    const target = state.folderContextPrimaryItem || (items || []).find((i) => i && !i.is_dir) || null;
     const title = cleanMediaTitle(target?.meta_title || target?.title || target?.name || "영상");
     container.innerHTML = "";
+    const canPlay = !!target;
+    const isAnimationActions = useEpisodeButtonMode;
+
+    const actionsHtml = `
+      <button type="button" class="folder-play-single-btn folder-context-play-btn" id="folder-play-single-btn" ${canPlay ? '' : 'disabled'}>
+        <span class="folder-play-single-icon">▶</span>
+        <span class="folder-play-single-label">영상보기</span>
+        <span class="folder-play-single-title">${title}</span>
+      </button>
+      ${isAnimationActions ? `
+        <button type="button" class="folder-play-single-btn folder-episode-list-btn" id="folder-episode-list-btn">
+          <span class="folder-play-single-icon">☰</span>
+          <span class="folder-play-single-label">회차보기</span>
+          <span class="folder-play-single-title">시즌/에피소드 목록</span>
+        </button>` : ''}
+    `;
 
     if (folderContextBody) {
       const actions = document.createElement("div");
       actions.className = "folder-context-actions";
-      actions.innerHTML = `
-        <button type="button" class="folder-play-single-btn folder-context-play-btn" id="folder-play-single-btn">
-          <span class="folder-play-single-icon">▶</span>
-          <span class="folder-play-single-label">영상보기</span>
-          <span class="folder-play-single-title">${title}</span>
-        </button>
-      `;
+      actions.innerHTML = actionsHtml;
       folderContextBody.appendChild(actions);
     } else {
       container.innerHTML = `
         <div class="folder-play-single-wrap" style="grid-column: 1 / -1;">
-          <button type="button" class="folder-play-single-btn" id="folder-play-single-btn">
-            <span class="folder-play-single-icon">▶</span>
-            <span class="folder-play-single-label">영상보기</span>
-            <span class="folder-play-single-title">${title}</span>
-          </button>
+          ${actionsHtml}
         </div>
       `;
     }
 
     const btn = document.getElementById("folder-play-single-btn");
-    if (btn) {
+    if (btn && canPlay) {
       btn.addEventListener("click", () => playVideo(target));
       btn.addEventListener("keydown", (e) => {
         if (e.key === "Enter" || e.key === " ") {
           e.preventDefault();
           playVideo(target);
+        }
+      });
+    }
+
+    const listBtn = document.getElementById("folder-episode-list-btn");
+    if (listBtn) {
+      listBtn.addEventListener("click", () => {
+        const panelTitle = cleanMediaTitle(state.currentPath?.split('/').pop() || '회차 보기');
+        openEpisodeDrawer(items || [], panelTitle);
+      });
+      listBtn.addEventListener("keydown", (e) => {
+        if (e.key === "Enter" || e.key === " ") {
+          e.preventDefault();
+          const panelTitle = cleanMediaTitle(state.currentPath?.split('/').pop() || '회차 보기');
+          openEpisodeDrawer(items || [], panelTitle);
         }
       });
     }
@@ -2567,6 +2886,8 @@ function renderGrid(container, items, isFolderCategory = false, isAppend = false
         poster: item.poster || "",
         year: item.year || item.album_info?.release_date || "",
         album_info: item.album_info || null,
+        meta_json: item.meta_json || null,
+        genre: item.genre || [],
         source_id: Number(normalizeSourceId(item.source_id)),
       });
     }
@@ -3098,6 +3419,150 @@ function buildFolderThumbUrl(pathValue, sourceId, width = 640) {
   const bpath = toUrlSafeBase64(clean.startsWith("/") ? clean : `/${clean}`);
   if (!bpath) return "";
   return `${state.serverUrl}/gds_dviewer/normal/thumbnail?bpath=${bpath}&source_id=${normalizeSourceId(sourceId)}&w=${width}&apikey=${state.apiKey}`;
+}
+
+function ensureLeadingSlash(pathValue) {
+  const p = String(pathValue || "").normalize("NFC");
+  if (!p) return "";
+  return p.startsWith("/") ? p : `/${p}`;
+}
+
+function getNativeSourcePathForTrickplay() {
+  const path = state?.nativeSource?.path || "";
+  return ensureLeadingSlash(path);
+}
+
+function getNativeSourceIdForTrickplay() {
+  return normalizeSourceId(state?.nativeSource?.source_id);
+}
+
+function getSeekBasePositionForRemote() {
+  const now = Date.now();
+  const recent = (now - Number(state.nativeSeekPreviewTs || 0)) < 1600;
+  if (recent && Number.isFinite(state.nativeSeekPreviewPos)) {
+    return Number(state.nativeSeekPreviewPos);
+  }
+  return Number.isFinite(state.nativePos) ? Number(state.nativePos) : 0;
+}
+
+function getTrickplayCacheKey(pathValue, sourceId) {
+  return `${sourceId}::${pathValue}`;
+}
+
+function getOrCreateTrickplayOverlay() {
+  let overlay = document.getElementById("trickplay-overlay");
+  if (overlay) return overlay;
+  const host = ui.playerOverlay || document.body;
+  if (!host) return null;
+  overlay = document.createElement("div");
+  overlay.id = "trickplay-overlay";
+  overlay.className = "trickplay-overlay hidden";
+  overlay.innerHTML = `
+    <div class="trickplay-rail-wrap">
+      <div class="trickplay-rail"></div>
+      <div class="trickplay-time">00:00</div>
+    </div>
+  `;
+  host.appendChild(overlay);
+  return overlay;
+}
+
+function hideTrickplayOverlay() {
+  const overlay = document.getElementById("trickplay-overlay");
+  if (!overlay) return;
+  if (trickplayHideTimer) {
+    clearTimeout(trickplayHideTimer);
+    trickplayHideTimer = null;
+  }
+  overlay.classList.add("hidden");
+}
+
+function formatClock(totalSeconds) {
+  const sec = Math.max(0, Math.floor(Number(totalSeconds) || 0));
+  const h = Math.floor(sec / 3600);
+  const m = Math.floor((sec % 3600) / 60);
+  const s = sec % 60;
+  if (h > 0) return `${String(h).padStart(2, "0")}:${String(m).padStart(2, "0")}:${String(s).padStart(2, "0")}`;
+  return `${String(m).padStart(2, "0")}:${String(s).padStart(2, "0")}`;
+}
+
+async function ensureTrickplayManifestForNative() {
+  const pathValue = getNativeSourcePathForTrickplay();
+  const sourceId = getNativeSourceIdForTrickplay();
+  if (!pathValue) return null;
+  const key = getTrickplayCacheKey(pathValue, sourceId);
+  const cached = trickplayManifestCache.get(key);
+  if (cached && cached.ret === "success") return cached;
+
+  const bpath = toUrlSafeBase64(pathValue);
+  if (!bpath) return null;
+  const endpoint =
+    `trickplay_manifest?bpath=${encodeURIComponent(bpath)}` +
+    `&source_id=${sourceId}` +
+    `&interval=${TRICKPLAY_DEFAULT_INTERVAL}` +
+    `&w=${TRICKPLAY_DEFAULT_W}&h=${TRICKPLAY_DEFAULT_H}`;
+
+  try {
+    const data = await gdsFetch(endpoint);
+    if (data && data.ret === "success") {
+      trickplayManifestCache.set(key, data);
+      return data;
+    }
+  } catch (e) {
+    console.warn("[TRICKPLAY] manifest fetch failed:", e?.message || e);
+  }
+  return null;
+}
+
+async function showTrickplayAt(seconds) {
+  if (!state.isNativeActive) return;
+  if (!(ui.playerOverlay && ui.playerOverlay.classList.contains("active"))) return;
+
+  const manifest = await ensureTrickplayManifestForNative();
+  if (!manifest || !Array.isArray(manifest.items) || manifest.items.length === 0) return;
+
+  const interval = Number(manifest.interval || TRICKPLAY_DEFAULT_INTERVAL) || TRICKPLAY_DEFAULT_INTERVAL;
+  const idx = Math.max(0, Math.min(manifest.items.length - 1, Math.floor((Number(seconds) || 0) / interval)));
+  const item = manifest.items[idx];
+  if (!item || !item.url) return;
+
+  const overlay = getOrCreateTrickplayOverlay();
+  if (!overlay) return;
+  const rail = overlay.querySelector(".trickplay-rail");
+  const timeEl = overlay.querySelector(".trickplay-time");
+  if (!rail) return;
+
+  const radius = 4; // center + 양옆 4장씩 (좌우 오버플로우 완화)
+  const frag = document.createDocumentFragment();
+  for (let i = idx - radius; i <= idx + radius; i += 1) {
+    const bounded = Math.max(0, Math.min(manifest.items.length - 1, i));
+    const it = manifest.items[bounded];
+    if (!it) continue;
+    let u = String(it.url || "");
+    if (u.startsWith("/")) u = `${state.serverUrl}${u}`;
+    const cell = document.createElement("div");
+    cell.className = "trickplay-item" + (i === idx ? " is-active" : "");
+    cell.innerHTML = `
+      <img class="trickplay-thumb" alt="thumb-${bounded}" src="${u}">
+      <div class="trickplay-item-time">${formatClock(it.t ?? 0)}</div>
+    `;
+    frag.appendChild(cell);
+  }
+  rail.innerHTML = "";
+  rail.appendChild(frag);
+  rail.style.transform = "translateX(0)";
+  console.log("[TRICKPLAY] show", { seconds, idx });
+  if (timeEl) timeEl.textContent = formatClock(item.t ?? seconds);
+  overlay.classList.remove("hidden");
+
+  // While user is in pending seek mode (Left/Right steps), keep trickplay visible.
+  if (trickplayHideTimer) {
+    clearTimeout(trickplayHideTimer);
+    trickplayHideTimer = null;
+  }
+  if (Number(state.nativeSeekPendingSteps || 0) === 0) {
+    trickplayHideTimer = setTimeout(() => hideTrickplayOverlay(), TRICKPLAY_HIDE_MS);
+  }
 }
 
 function choosePosterUrl({ item, width = 640, metaPoster = "", folderPath = "", parentFolderPath = "" } = {}) {
@@ -3691,6 +4156,42 @@ function triggerLeftmostMoviePreview() {
   triggerLeftmostPreviewForTrack(ui.moviePreviewTrack, false);
 }
 
+function createPreviewSkeletonCard() {
+  const card = document.createElement("div");
+  card.className = "movie-preview-card is-skeleton";
+  card.setAttribute("aria-hidden", "true");
+  card.innerHTML = `
+    <div class="movie-preview-media">
+      <div class="movie-preview-skeleton-block"></div>
+      <div class="movie-preview-gradient"></div>
+    </div>
+    <div class="movie-preview-title"><span class="movie-preview-skeleton-line"></span></div>
+    <div class="movie-preview-subtitle"><span class="movie-preview-skeleton-line short"></span></div>
+  `;
+  return card;
+}
+
+function showPreviewRailSkeleton(track, count = 8) {
+  if (!track) return;
+  const trackWidth =
+    Number(track.clientWidth || 0) ||
+    Number(track.getBoundingClientRect?.().width || 0) ||
+    Math.floor((window.innerWidth || 1280) * 0.9);
+  const approxCardWidth = 190; // poster + gap average in appletv skin
+  const dynamicCount = Math.max(count, Math.ceil(trackWidth / approxCardWidth) + 6);
+  const frag = document.createDocumentFragment();
+  for (let i = 0; i < dynamicCount; i += 1) frag.appendChild(createPreviewSkeletonCard());
+  track.innerHTML = "";
+  track.appendChild(frag);
+}
+
+function clearPreviewRailSkeleton(track) {
+  if (!track) return;
+  const skeletons = track.querySelectorAll(".movie-preview-card.is-skeleton");
+  if (skeletons.length === 0) return;
+  skeletons.forEach((el) => el.remove());
+}
+
 async function loadMoviePreviewRail(append = false) {
   if (!ui.moviePreviewRail || !ui.moviePreviewTrack) return;
   if (!!state.currentPath) return;
@@ -3698,6 +4199,13 @@ async function loadMoviePreviewRail(append = false) {
   if (append && !state.moviePreviewHasMore) return;
 
   state.moviePreviewLoading = true;
+  if (!append) {
+    showPreviewRailSkeleton(ui.moviePreviewTrack, 8);
+    state.moviePreviewSeenKeys.clear();
+    state.moviePreviewItemMap.clear();
+    state.moviePreviewOffset = 0;
+    state.moviePreviewHasMore = true;
+  }
   try {
     const selectedBucket = state.movieVirtualCategory || "전체";
     const params = new URLSearchParams({
@@ -3721,14 +4229,6 @@ async function loadMoviePreviewRail(append = false) {
       return PREVIEW_SOURCE_EXTS.has(ext);
     });
 
-    if (!append) {
-      ui.moviePreviewTrack.innerHTML = "";
-      state.moviePreviewSeenKeys.clear();
-      state.moviePreviewItemMap.clear();
-      state.moviePreviewOffset = 0;
-      state.moviePreviewHasMore = true;
-    }
-
     // Folder-first mode:
     // 1) group by parent folder (one card per work)
     // 2) keep latest playable file in each folder as preview/play source
@@ -3740,39 +4240,40 @@ async function loadMoviePreviewRail(append = false) {
     candidates.forEach((item) => {
       const folderPath = String(getParentPath(item.path) || "").replace(/^\/+/, "");
       if (!folderPath) return;
-      const prev = folderMap.get(folderPath);
+      const identity = buildMoviePreviewIdentity(item, folderPath);
+      const groupKey = identity.groupKey;
+      const prev = folderMap.get(groupKey);
       if (!prev) {
-        folderMap.set(folderPath, item);
+        folderMap.set(groupKey, { folderPath, item, identity });
         return;
       }
       const nowTs = parseMtimeToEpoch(item.mtime);
-      const prevTs = parseMtimeToEpoch(prev.mtime);
-      if (nowTs > prevTs) folderMap.set(folderPath, item);
+      const prevTs = parseMtimeToEpoch(prev.item?.mtime);
+      if (nowTs > prevTs) folderMap.set(groupKey, { folderPath, item, identity });
     });
 
-    const groupedMovies = Array.from(folderMap.entries())
-      .map(([folderPath, item]) => ({ folderPath, item }))
+    const groupedMovies = Array.from(folderMap.values())
       .sort((a, b) => parseMtimeToEpoch(b.item?.mtime) - parseMtimeToEpoch(a.item?.mtime));
 
     const frag = document.createDocumentFragment();
     let added = 0;
-    groupedMovies.forEach(({ folderPath, item }, idx) => {
+    for (const { folderPath, item, identity } of groupedMovies) {
       const folderKey = `folder:${String(folderPath || "").toLowerCase()}`;
-      if (state.moviePreviewSeenKeys.has(folderKey)) return;
+      if (state.moviePreviewSeenKeys.has(folderKey)) continue;
       state.moviePreviewSeenKeys.add(folderKey);
 
-      const folderMeta = findNearestFolderMeta(folderPath) || null;
-      const displayTitle = cleanMediaTitle(
-        folderMeta?.meta_title ||
-        folderMeta?.title ||
-        folderMeta?.album_info?.title ||
-        item?.meta_title ||
-        getBaseName(folderPath) ||
-        item?.title ||
-        item?.name ||
-        "Untitled",
-      );
-      const yearText = String(folderMeta?.year || item?.year || "").trim();
+      let folderMeta = findNearestFolderMeta(folderPath) || null;
+      if (!folderMeta || !(folderMeta.meta_title || folderMeta.title || folderMeta.meta_poster || folderMeta.poster || folderMeta.album_info?.posters)) {
+        const hydrated = await hydrateFolderMetaFromParent(folderPath, item?.source_id);
+        if (hydrated) folderMeta = hydrated;
+      }
+      const parentPathForMeta = getParentPath(folderPath);
+      let parentMeta = findNearestFolderMeta(parentPathForMeta) || null;
+      if (!parentMeta && parentPathForMeta) {
+        parentMeta = await hydrateFolderMetaFromParent(parentPathForMeta, item?.source_id);
+      }
+      const displayTitle = resolveMoviePreviewTitle(identity, item, folderMeta, parentMeta);
+      const yearText = String(folderMeta?.year || parentMeta?.year || item?.year || "").trim();
       const subtitle = yearText || "MOVIE";
       const previewItem = {
         ...item,
@@ -3783,14 +4284,23 @@ async function loadMoviePreviewRail(append = false) {
         meta_summary: folderMeta?.meta_summary || folderMeta?.summary || folderMeta?.desc || item?.meta_summary || item?.summary || item?.desc || "",
         summary: folderMeta?.summary || folderMeta?.desc || item?.summary || item?.desc || "",
         desc: folderMeta?.desc || item?.desc || "",
-        meta_poster: folderMeta?.meta_poster || folderMeta?.poster || folderMeta?.album_info?.posters || item?.meta_poster || item?.poster || "",
+        meta_poster:
+          folderMeta?.meta_poster ||
+          folderMeta?.poster ||
+          folderMeta?.album_info?.posters ||
+          parentMeta?.meta_poster ||
+          parentMeta?.poster ||
+          parentMeta?.album_info?.posters ||
+          item?.meta_poster ||
+          item?.poster ||
+          "",
       };
       const poster = choosePosterUrl({
         item: previewItem,
         width: 540,
         metaPoster: previewItem?.meta_poster || "",
-        folderPath,
-        parentFolderPath: getParentPath(folderPath),
+        folderPath: identity.isBucketFolder ? "" : folderPath,
+        parentFolderPath: identity.isBucketFolder ? "" : parentPathForMeta,
       });
       const previewEnabled = true;
       const card = document.createElement("button");
@@ -3798,8 +4308,8 @@ async function loadMoviePreviewRail(append = false) {
       card.className = "movie-preview-card";
       card.setAttribute("tabindex", "0");
       card.dataset.previewEnabled = previewEnabled ? "1" : "0";
-      card.dataset.previewIndex = String(ui.moviePreviewTrack.children.length + idx);
-      const previewKey = `${folderKey}_${state.moviePreviewOffset}_${idx}`;
+      card.dataset.previewIndex = String(ui.moviePreviewTrack.children.length + added);
+      const previewKey = `${folderKey}_${state.moviePreviewOffset}_${added}`;
       card.dataset.previewKey = previewKey;
       state.moviePreviewItemMap.set(previewKey, previewItem);
       card.innerHTML = `
@@ -3818,9 +4328,11 @@ async function loadMoviePreviewRail(append = false) {
       });
       frag.appendChild(card);
       added += 1;
-    });
+    }
 
     if (added > 0) ui.moviePreviewTrack.appendChild(frag);
+    // Keep skeleton visible until cards are actually ready, then remove skeleton only.
+    if (!append) clearPreviewRailSkeleton(ui.moviePreviewTrack);
     if (ui.moviePreviewTrack.children.length > 0) {
       const leftCard = getLeftmostVisiblePreviewCard();
       markLeftAnchorCard(ui.moviePreviewTrack, leftCard);
@@ -3831,6 +4343,7 @@ async function loadMoviePreviewRail(append = false) {
       setMoviePreviewRailVisible(false);
     }
   } catch (err) {
+    if (!append) clearPreviewRailSkeleton(ui.moviePreviewTrack);
     console.warn("[PREVIEW] movie rail load failed:", err?.message || err);
   } finally {
     state.moviePreviewLoading = false;
@@ -3844,6 +4357,13 @@ async function loadAnimationRail(append = false) {
   if (append && !state.animationRailHasMore) return;
 
   state.animationRailLoading = true;
+  if (!append) {
+    showPreviewRailSkeleton(ui.animationTrack, 8);
+    state.animationRailSeenKeys.clear();
+    state.animationPreviewItemMap.clear();
+    state.animationRailOffset = 0;
+    state.animationRailHasMore = true;
+  }
   try {
     const selectedBucket = state.animationVirtualCategory || "전체";
     const params = new URLSearchParams({
@@ -3863,14 +4383,6 @@ async function loadAnimationRail(append = false) {
       const lower = String(item.path).toLowerCase();
       return videoExtensions.some((ext) => lower.endsWith(ext));
     });
-
-    if (!append) {
-      ui.animationTrack.innerHTML = "";
-      state.animationRailSeenKeys.clear();
-      state.animationPreviewItemMap.clear();
-      state.animationRailOffset = 0;
-      state.animationRailHasMore = true;
-    }
 
     // Collapse episode files into one card per anime title (latest episode only).
     const seriesMap = new Map();
@@ -4007,6 +4519,8 @@ async function loadAnimationRail(append = false) {
     }
 
     if (added > 0) ui.animationTrack.appendChild(frag);
+    // Keep skeleton visible until cards are actually ready, then remove skeleton only.
+    if (!append) clearPreviewRailSkeleton(ui.animationTrack);
     if (ui.animationTrack.children.length > 0) {
       const cards = Array.from(ui.animationTrack.querySelectorAll(".movie-preview-card"));
       markLeftAnchorCard(ui.animationTrack, cards[0] || null);
@@ -4019,6 +4533,7 @@ async function loadAnimationRail(append = false) {
       setAnimationRailVisible(false);
     }
   } catch (err) {
+    if (!append) clearPreviewRailSkeleton(ui.animationTrack);
     console.warn("[ANIME-RAIL] load failed:", err?.message || err);
   } finally {
     state.animationRailLoading = false;
@@ -4032,6 +4547,13 @@ async function loadDramaRail(append = false) {
   if (append && !state.dramaRailHasMore) return;
 
   state.dramaRailLoading = true;
+  if (!append) {
+    showPreviewRailSkeleton(ui.dramaTrack, 8);
+    state.dramaRailSeenKeys.clear();
+    state.dramaPreviewItemMap.clear();
+    state.dramaRailOffset = 0;
+    state.dramaRailHasMore = true;
+  }
   try {
     const params = new URLSearchParams({
       bucket: "드라마",
@@ -4044,14 +4566,6 @@ async function loadDramaRail(append = false) {
     const data = await gdsFetch(`series_domestic?${params.toString()}`);
     if (!data || data.ret !== "success") return;
     const list = data.list || data.data || data.items || [];
-
-    if (!append) {
-      ui.dramaTrack.innerHTML = "";
-      state.dramaRailSeenKeys.clear();
-      state.dramaPreviewItemMap.clear();
-      state.dramaRailOffset = 0;
-      state.dramaRailHasMore = true;
-    }
 
     const frag = document.createDocumentFragment();
     let added = 0;
@@ -4133,12 +4647,15 @@ async function loadDramaRail(append = false) {
     });
 
     if (added > 0) ui.dramaTrack.appendChild(frag);
+    // Keep skeleton visible until cards are actually ready, then remove skeleton only.
+    if (!append) clearPreviewRailSkeleton(ui.dramaTrack);
     state.dramaRailOffset += Number(list.length || 0);
     state.dramaRailHasMore = list.length >= 20;
     if (!append && ui.dramaTrack.children.length === 0) {
       setDramaRailVisible(false);
     }
   } catch (err) {
+    if (!append) clearPreviewRailSkeleton(ui.dramaTrack);
     console.warn("[DRAMA-RAIL] load failed:", err?.message || err);
   } finally {
     state.dramaRailLoading = false;
@@ -4534,9 +5051,12 @@ function setupButtons() {
       const invoke = window.__TAURI__ ? window.__TAURI__.core.invoke : null;
       if (invoke) invoke("close_native_player").catch(console.error);
       state.isNativeActive = false;
+      hideTrickplayOverlay();
+      resetNativeSeekPending();
       state.nativeSource = null;
 
       if (ui.playerOverlay) ui.playerOverlay.classList.remove("active");
+  closeEpisodeDrawer();
 
       // Force restoration of UI visibility
       const elementsToRestore = [
@@ -4682,6 +5202,7 @@ function closePlayer() {
       );
     }
     state.isNativeActive = false;
+    hideTrickplayOverlay();
     stopNativeStatePolling();
     state.nativeSource = null;
     updateNativeTransparency(false);
@@ -4997,7 +5518,14 @@ function playVideo(item) {
     // Desktop Native (MPV for Video)
     if (isDesktop && !isAudio) {
       console.log("[PLAYBACK] Launching Native MPV for:", cleanTitle);
-      state.nativeSource = { title: cleanTitle, url: streamUrl, subtitleUrl };
+      state.nativeSource = {
+        title: cleanTitle,
+        url: streamUrl,
+        subtitleUrl,
+        path: cleanPath,
+        source_id: normalizeSourceId(item.source_id),
+      };
+      resetNativeSeekPending();
 
       // [FIX] Force UI Redraw / Transparency Refresh
       document.body.classList.remove("native-player-active");
@@ -5107,8 +5635,10 @@ function playVideo(item) {
         .catch((err) => {
           console.error(`[PLAYBACK] All native attempts failed:`, err);
           document.body.classList.remove("native-player-active");
-          state.isNativeActive = false;
-          stopNativeStatePolling();
+    state.isNativeActive = false;
+    hideTrickplayOverlay();
+    resetNativeSeekPending();
+    stopNativeStatePolling();
           state.nativeSource = null;
 
           // [UI] Reset Native UI if failed
@@ -5418,6 +5948,7 @@ function renderFavorites() {
 }
 
 window.handleAndroidBack = function () {
+  if (closeEpisodeDrawer()) return "handled";
   if (closeCategorySubMenu()) return "handled";
   const qualityOverlay = document.getElementById("quality-menu-overlay");
   if (qualityOverlay) {
@@ -5491,6 +6022,44 @@ function setupRemoteNavigation() {
       const isPlayerActive =
         playerOverlay && playerOverlay.classList.contains("active");
 
+      // Native trickplay confirm mode:
+      // Left/Right only moves pending steps, Enter commits one seek.
+      if (isPlayerActive && state.isNativeActive && Number(state.nativeSeekPendingSteps || 0) !== 0) {
+        const invoke =
+          window.__TAURI__ && window.__TAURI__.core
+            ? window.__TAURI__.core.invoke
+            : window.__TAURI__
+              ? window.__TAURI__.invoke
+              : null;
+        if (invoke) {
+          const base = Number.isFinite(state.nativeSeekBasePos)
+            ? Number(state.nativeSeekBasePos)
+            : getSeekBasePositionForRemote();
+          const durationCap = Number.isFinite(state.nativeDuration) && state.nativeDuration > 0
+            ? state.nativeDuration
+            : Number.POSITIVE_INFINITY;
+          const targetTime = Math.min(
+            Math.max(0, base + Number(state.nativeSeekPendingSteps) * 10),
+            durationCap,
+          );
+          invoke("native_seek", { seconds: targetTime })
+            .then(() => {
+              state.nativePos = targetTime;
+              console.log(
+                `[REMOTE] MPV seek commit steps=${state.nativeSeekPendingSteps} -> ${targetTime.toFixed(2)}s`,
+              );
+            })
+            .catch((err) => console.error("[REMOTE] MPV seek commit failed:", err))
+            .finally(() => {
+              resetNativeSeekPending();
+              hideTrickplayOverlay();
+            });
+        }
+        e.preventDefault();
+        e.stopPropagation();
+        return;
+      }
+
       // While player is active, first Enter should wake OSC/controls instead of clicking background cards.
       if (isPlayerActive) {
         const nativeOscHidden =
@@ -5551,26 +6120,25 @@ function setupRemoteNavigation() {
       const isPlayerActive =
         playerOverlay && playerOverlay.classList.contains("active");
       if (isPlayerActive && state.isNativeActive && (key === "ArrowRight" || key === "ArrowLeft")) {
-        const invoke =
-          window.__TAURI__ && window.__TAURI__.core
-            ? window.__TAURI__.core.invoke
-            : window.__TAURI__
-              ? window.__TAURI__.invoke
-              : null;
-        if (invoke) {
-          const currentPos = Number.isFinite(state.nativePos) ? state.nativePos : 0;
-          const delta = key === "ArrowRight" ? 10 : -10;
-          const durationCap = Number.isFinite(state.nativeDuration) && state.nativeDuration > 0
-            ? state.nativeDuration
-            : Number.POSITIVE_INFINITY;
-          const targetTime = Math.min(Math.max(0, currentPos + delta), durationCap);
-          invoke("native_seek", { seconds: targetTime })
-            .then(() => {
-              state.nativePos = targetTime;
-              console.log(`[REMOTE] MPV seek ${delta > 0 ? "+" : ""}${delta}s -> ${targetTime.toFixed(2)}s`);
-            })
-            .catch((err) => console.error("[REMOTE] MPV seek failed:", err));
+        const currentPos = getSeekBasePositionForRemote();
+        if (!Number.isFinite(state.nativeSeekBasePos)) {
+          state.nativeSeekBasePos = currentPos;
+          state.nativeSeekPendingSteps = 0;
         }
+        state.nativeSeekPendingSteps += (key === "ArrowRight" ? 1 : -1);
+        const durationCap = Number.isFinite(state.nativeDuration) && state.nativeDuration > 0
+          ? state.nativeDuration
+          : Number.POSITIVE_INFINITY;
+        const previewPos = Math.min(
+          Math.max(0, Number(state.nativeSeekBasePos) + Number(state.nativeSeekPendingSteps) * 10),
+          durationCap,
+        );
+        state.nativeSeekPreviewPos = previewPos;
+        state.nativeSeekPreviewTs = Date.now();
+        console.log(
+          `[REMOTE] MPV trickplay step=${state.nativeSeekPendingSteps} preview=${previewPos.toFixed(2)}s`,
+        );
+        showTrickplayAt(previewPos).catch(() => {});
         e.preventDefault();
         e.stopPropagation();
         return;
@@ -5974,6 +6542,7 @@ function setupPremiumOSC() {
             ? window.__TAURI__.invoke
             : null;
       if (invoke) {
+        resetNativeSeekPending();
         invoke("native_seek", { seconds: targetTime })
           .catch(err => console.error("[PLAYER-ERROR] native_seek failed:", err));
       }
