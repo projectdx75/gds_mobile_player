@@ -73,9 +73,18 @@ const state = {
   dramaRailSeenKeys: new Set(),
   dramaPreviewItemMap: new Map(),
   dramaPreviewCache: new Map(),
+  apiResponseCache: new Map(),
+  apiCacheHits: 0,
+  apiCacheMisses: 0,
   folderContextPrimaryItem: null,
   previewAutoplayUnlocked: false,
   episodeDrawerOpen: false,
+  currentMediaPath: "",
+  currentMediaTitle: "",
+  currentMediaSourceId: 0,
+  nextEpisodeItem: null,
+  nextEpisodeResolveSeq: 0,
+  openingSkipDismissPath: "",
 };
 
 // Platform Detection
@@ -108,15 +117,28 @@ const PREVIEW_DEFAULT_VOLUME = 0.35;
 const ANIMATION_PREVIEW_FETCH_LIMIT = 120;
 const ANIMATION_PREVIEW_RENDER_LIMIT = 20;
 const PREVIEW_AUTO_SLIDE_ENABLED = false;
+const API_CACHE_MAX_ENTRIES = 180;
+const API_CACHE_TTL_DEFAULT_MS = 2 * 60 * 1000;
+const API_CACHE_DB_NAME = "flashplex_api_cache_v1";
+const API_CACHE_DB_STORE = "responses";
 const TRICKPLAY_DEFAULT_INTERVAL = 10;
 const TRICKPLAY_DEFAULT_W = 320;
 const TRICKPLAY_DEFAULT_H = 180;
 const TRICKPLAY_HIDE_MS = 1200;
+const PLAYER_HIDE_FILENAME_IN_OVERLAY = true;
+const OPENING_SKIP_STORAGE_KEY = "flashplex_opening_skip_v1";
+const OPENING_SKIP_MIN_DURATION_SEC = 15 * 60;
+const OPENING_SKIP_DEFAULT_JUMP_SEC = 85;
+const OPENING_SKIP_SHOW_FROM_SEC = 12;
+const OPENING_SKIP_SHOW_TO_SEC = 160;
+const NEXT_EPISODE_VIDEO_EXTS = new Set(["mp4", "mkv", "avi", "mov", "webm", "m4v", "ts"]);
 let animationRailAutoSlideTimer = null;
 let dramaRailAutoSlideTimer = null;
 let dramaRailUserInteracting = false;
 const trickplayManifestCache = new Map();
 let trickplayHideTimer = null;
+let openingSkipCache = null;
+let apiCacheDbPromise = null;
 
 function resetNativeSeekPending() {
   state.nativeSeekPendingSteps = 0;
@@ -141,6 +163,186 @@ function getPathExtension(pathValue) {
   const idx = raw.lastIndexOf(".");
   if (idx < 0) return "";
   return raw.slice(idx + 1).toLowerCase();
+}
+
+function getOverlayTitleText(fallback = "") {
+  return PLAYER_HIDE_FILENAME_IN_OVERLAY ? "" : String(fallback || "");
+}
+
+function getOpeningSkipMap() {
+  if (openingSkipCache) return openingSkipCache;
+  try {
+    const raw = localStorage.getItem(OPENING_SKIP_STORAGE_KEY);
+    const parsed = raw ? JSON.parse(raw) : {};
+    openingSkipCache = parsed && typeof parsed === "object" ? parsed : {};
+  } catch (_) {
+    openingSkipCache = {};
+  }
+  return openingSkipCache;
+}
+
+function saveOpeningSkipMap() {
+  if (!openingSkipCache) return;
+  try {
+    localStorage.setItem(OPENING_SKIP_STORAGE_KEY, JSON.stringify(openingSkipCache));
+  } catch (_) {}
+}
+
+function normalizeSeriesTitle(title) {
+  return String(title || "")
+    .replace(/\.(mkv|mp4|avi|mov|m4v|webm|ts)$/i, "")
+    .replace(/\bS\d{1,2}E\d{1,3}\b/ig, "")
+    .replace(/\b(?:EP?|E|제)\s*\.?\d{1,3}(?:화)?\b/ig, "")
+    .replace(/[._]/g, " ")
+    .replace(/\s+/g, " ")
+    .trim()
+    .toLowerCase();
+}
+
+function buildOpeningSeriesKey(pathValue, titleValue = "") {
+  const path = String(pathValue || "").replace(/\\/g, "/");
+  const segs = path.split("/").filter(Boolean);
+  const parent = segs.length > 1 ? segs[segs.length - 2] : "";
+  const baseTitle = normalizeSeriesTitle(parent || titleValue || segs[segs.length - 1] || "unknown");
+  return baseTitle || "unknown";
+}
+
+function getActivePlaybackSnapshot() {
+  const path = state.currentMediaPath || state.nativeSource?.path || "";
+  const title = state.currentMediaTitle || state.nativeSource?.title || "";
+  const sourceId = normalizeSourceId(state.currentMediaSourceId || state.nativeSource?.source_id || state.sourceId || 0);
+  const isNative = !!state.isNativeActive;
+  const current = isNative
+    ? Number(state.nativePos || 0)
+    : Number(ui.mainPlayer && Number.isFinite(ui.mainPlayer.currentTime) ? ui.mainPlayer.currentTime : 0);
+  const duration = isNative
+    ? Number(state.nativeDuration || 0)
+    : Number(ui.mainPlayer && Number.isFinite(ui.mainPlayer.duration) ? ui.mainPlayer.duration : 0);
+  const seriesKey = buildOpeningSeriesKey(path, title);
+  return { path, title, sourceId, current, duration, isNative, seriesKey };
+}
+
+function getOpeningSkipHint(info) {
+  if (!info || !info.seriesKey) return null;
+  const map = getOpeningSkipMap();
+  const entry = map[info.seriesKey];
+  if (!entry || typeof entry.end !== "number") return null;
+  return entry;
+}
+
+function compareEpisodeOrder(a, b) {
+  const epA = extractEpisodeNumber(a);
+  const epB = extractEpisodeNumber(b);
+  const hasEpA = Number.isFinite(epA) && epA >= 0;
+  const hasEpB = Number.isFinite(epB) && epB >= 0;
+  if (hasEpA && hasEpB && epA !== epB) return epA - epB;
+  const nameA = String(a?.name || a?.title || "");
+  const nameB = String(b?.name || b?.title || "");
+  const nameCmp = nameA.localeCompare(nameB, undefined, { numeric: true, sensitivity: "base" });
+  if (nameCmp !== 0) return nameCmp;
+  return parseMtimeToEpoch(a?.mtime) - parseMtimeToEpoch(b?.mtime);
+}
+
+async function resolveNextEpisodeItem(currentPath, sourceId) {
+  const normalizedCurrent = normalizePathForCompare(currentPath);
+  if (!normalizedCurrent) return null;
+  const parentPath = getParentPath(currentPath || "");
+  if (!parentPath) return null;
+  const bpath = toUrlSafeBase64(parentPath);
+  if (!bpath) return null;
+
+  const endpoint = `explorer/list?bpath=${bpath}&source_id=${normalizeSourceId(sourceId)}&limit=200&apikey=${state.apiKey}`;
+  const data = await gdsFetch(endpoint);
+  const list = data?.list || data?.data || data?.items || [];
+  const episodes = list.filter((it) => {
+    if (!it || it.is_dir || !it.path) return false;
+    return NEXT_EPISODE_VIDEO_EXTS.has(getPathExtension(it.path));
+  }).sort(compareEpisodeOrder);
+  if (!episodes.length) return null;
+  const idx = episodes.findIndex((it) => normalizePathForCompare(it.path) === normalizedCurrent);
+  if (idx < 0) return null;
+  return episodes[idx + 1] || null;
+}
+
+function updateNextEpisodeUI() {
+  const btn = ui.btnOscNextEpisode;
+  if (!btn) return;
+  const hasPlayback = !!(state.isNativeActive || (ui.mainPlayer && ui.playerOverlay && ui.playerOverlay.classList.contains("active")));
+  if (!hasPlayback || !state.nextEpisodeItem) {
+    btn.classList.add("hidden");
+    return;
+  }
+  const nextEpNo = extractEpisodeNumber(state.nextEpisodeItem);
+  btn.textContent = Number.isFinite(nextEpNo) && nextEpNo >= 0
+    ? `다음화: ${nextEpNo}화`
+    : "다음화";
+  btn.classList.remove("hidden");
+}
+
+async function refreshNextEpisodeCandidate() {
+  const currentPath = state.currentMediaPath || state.nativeSource?.path || "";
+  const sourceId = normalizeSourceId(state.currentMediaSourceId || state.nativeSource?.source_id || state.sourceId || 0);
+  if (!currentPath) {
+    state.nextEpisodeItem = null;
+    updateNextEpisodeUI();
+    return;
+  }
+  const seq = ++state.nextEpisodeResolveSeq;
+  try {
+    const nextItem = await resolveNextEpisodeItem(currentPath, sourceId);
+    if (seq !== state.nextEpisodeResolveSeq) return;
+    state.nextEpisodeItem = nextItem || null;
+  } catch (err) {
+    if (seq !== state.nextEpisodeResolveSeq) return;
+    state.nextEpisodeItem = null;
+    dwarn("[NEXT-EP] resolve failed:", err?.message || err);
+  }
+  updateNextEpisodeUI();
+}
+
+function learnOpeningSkip(info, targetEndSec, reason = "manual") {
+  if (!info || !info.seriesKey) return;
+  if (!Number.isFinite(info.duration) || info.duration < OPENING_SKIP_MIN_DURATION_SEC) return;
+  const end = Math.max(20, Math.min(Math.floor(info.duration * 0.55), Math.round(targetEndSec)));
+  const start = Math.max(0, end - 70);
+  const map = getOpeningSkipMap();
+  const prev = map[info.seriesKey];
+  const prevSamples = Number(prev?.samples || 0);
+  const weight = Math.min(6, prevSamples + 1);
+  const mergedStart = prev ? Math.round((prev.start * prevSamples + start) / weight) : start;
+  const mergedEnd = prev ? Math.round((prev.end * prevSamples + end) / weight) : end;
+  map[info.seriesKey] = {
+    start: Math.max(0, Math.min(mergedStart, mergedEnd - 8)),
+    end: Math.max(15, mergedEnd),
+    samples: prevSamples + 1,
+    lastReason: reason,
+    updatedAt: Date.now(),
+  };
+  saveOpeningSkipMap();
+  dlog("[OP-SKIP] learned:", info.seriesKey, map[info.seriesKey]);
+}
+
+function updateOpeningSkipUI() {
+  const btn = ui.btnOscOpeningSkip;
+  if (!btn) return;
+  const info = getActivePlaybackSnapshot();
+  const hasPlayback = !!(state.isNativeActive || (ui.mainPlayer && ui.playerOverlay && ui.playerOverlay.classList.contains("active")));
+  if (!hasPlayback || !Number.isFinite(info.duration) || info.duration < OPENING_SKIP_MIN_DURATION_SEC) {
+    btn.classList.add("hidden");
+    return;
+  }
+  const hint = getOpeningSkipHint(info);
+  const now = Number(info.current || 0);
+  const nowPath = normalizePathForCompare(info.path || "");
+  const isDismissedForCurrent = !!nowPath && nowPath === normalizePathForCompare(state.openingSkipDismissPath || "");
+  if (isDismissedForCurrent) {
+    btn.classList.add("hidden");
+    return;
+  }
+  const showWindowStart = hint ? Math.max(OPENING_SKIP_SHOW_FROM_SEC, Number(hint.start || 0) - 4) : OPENING_SKIP_SHOW_FROM_SEC;
+  const showWindowEnd = hint ? Number(hint.end || OPENING_SKIP_SHOW_TO_SEC) + 3 : OPENING_SKIP_SHOW_TO_SEC;
+  const shouldShow = now >= showWindowStart && now <= showWindowEnd;
+  btn.classList.toggle("hidden", !shouldShow);
 }
 
 function getParentPath(pathValue) {
@@ -721,6 +923,50 @@ async function enrichEpisodeMetaForCurrentFolder(folderPath, sourceId, reqSeq) {
   applyEpisodeMetaToGrid(metaList);
 }
 
+async function hydrateItemsWithEpisodeMeta(folderPath, items, sourceId, reqSeq) {
+  if (!folderPath || !Array.isArray(items) || items.length === 0) {
+    return { items: items || [], hasMeta: false };
+  }
+  const source = normalizeSourceId(sourceId);
+  const cacheKey = `${source}:${folderPath}`;
+
+  let metaList = state.episodeMetaCache.get(cacheKey);
+  if (!metaList) {
+    const params = new URLSearchParams({
+      path: folderPath,
+      source_id: source,
+    });
+    const data = await gdsFetch(`episode_meta?${params.toString()}`);
+    if (!data || data.ret !== "success") return { items, hasMeta: false };
+    metaList = data.list || [];
+    state.episodeMetaCache.set(cacheKey, metaList);
+  }
+
+  if (reqSeq !== state.episodeMetaReqSeq) return { items, hasMeta: false };
+  if (!Array.isArray(metaList) || metaList.length === 0) return { items, hasMeta: false };
+
+  const byPath = new Map(metaList.map((m) => [String(m.path || "").normalize("NFC"), m]));
+  let metaHits = 0;
+  const merged = items.map((item) => {
+    const pathKey = String(item?.path || "").normalize("NFC");
+    const m = byPath.get(pathKey);
+    if (!m) return item;
+    metaHits += 1;
+    return {
+      ...item,
+      meta_episode: m.episode ?? item.meta_episode,
+      meta_title: m.title || item.meta_title,
+      title: m.title || item.title,
+      meta_summary: m.summary || item.meta_summary,
+      summary: m.summary || item.summary,
+      meta_aired: m.aired || item.meta_aired,
+      meta_thumb: m.thumb || item.meta_thumb,
+    };
+  });
+
+  return { items: merged, hasMeta: metaHits > 0 };
+}
+
 async function applyNativeQualityProfile(profile, silent = false) {
   const invoke = getTauriInvoke();
   const normalized = normalizeQualityProfile(profile);
@@ -1076,6 +1322,8 @@ function initElements() {
       btnOscFullscreen: document.getElementById("btn-osc-fullscreen"),
       btnOscSubtitles: document.getElementById("btn-osc-subtitles"), // [FIX] ID Plural
       btnOscSettings: document.getElementById("osc-btn-settings"),
+      btnOscOpeningSkip: document.getElementById("btn-osc-opening-skip"),
+      btnOscNextEpisode: document.getElementById("btn-osc-next-episode"),
       btnHeaderSettings: document.getElementById("btn-osc-settings"),
       oscCenterControls: document.querySelector(".osc-center-controls"),
     };
@@ -1457,6 +1705,164 @@ function closeCategorySubMenu() {
   return true;
 }
 
+function shouldUseApiResponseCache(method, endpoint, options = {}) {
+  if (String(method || "").toUpperCase() !== "GET") return false;
+  if (options.cacheMode === "no-store" || options.cacheMode === "reload") return false;
+  const ep = String(endpoint || "").replace(/^\//, "");
+  const cacheablePrefixes = [
+    "search?",
+    "list?",
+    "explorer/list?",
+    "series_domestic?",
+    "movie_virtual?",
+    "animation_virtual?",
+    "movie_preview?",
+    "animation_preview?",
+    "episode_meta?",
+    "get_video_info?",
+  ];
+  return cacheablePrefixes.some((p) => ep.startsWith(p));
+}
+
+function getApiCacheTtlMs(endpoint) {
+  const ep = String(endpoint || "");
+  if (ep.startsWith("get_video_info?")) return 60 * 1000;
+  if (ep.startsWith("episode_meta?")) return 5 * 60 * 1000;
+  if (ep.startsWith("movie_preview?") || ep.startsWith("animation_preview?")) return 90 * 1000;
+  return API_CACHE_TTL_DEFAULT_MS;
+}
+
+function cloneCachePayload(data) {
+  if (typeof structuredClone === "function") {
+    try {
+      return structuredClone(data);
+    } catch (_) {}
+  }
+  try {
+    return JSON.parse(JSON.stringify(data));
+  } catch (_) {
+    return data;
+  }
+}
+
+function buildApiCacheKey(baseUrl, endpoint, method, sourceId) {
+  return `${String(method).toUpperCase()}|${baseUrl}|${String(endpoint || "").replace(/^\//, "")}|sid=${normalizeSourceId(sourceId ?? state.sourceId ?? 0)}`;
+}
+
+function apiCacheGet(key, ttlMs) {
+  const entry = state.apiResponseCache.get(key);
+  if (!entry) {
+    state.apiCacheMisses += 1;
+    return null;
+  }
+  const age = Date.now() - Number(entry.ts || 0);
+  if (age > ttlMs) {
+    state.apiResponseCache.delete(key);
+    state.apiCacheMisses += 1;
+    return null;
+  }
+  // LRU touch
+  state.apiResponseCache.delete(key);
+  state.apiResponseCache.set(key, entry);
+  state.apiCacheHits += 1;
+  return cloneCachePayload(entry.data);
+}
+
+function apiCacheSet(key, data) {
+  if (!key) return;
+  if (state.apiResponseCache.size >= API_CACHE_MAX_ENTRIES) {
+    const oldestKey = state.apiResponseCache.keys().next().value;
+    if (oldestKey) state.apiResponseCache.delete(oldestKey);
+  }
+  state.apiResponseCache.set(key, { ts: Date.now(), data: cloneCachePayload(data) });
+}
+
+function idbRequestToPromise(req) {
+  return new Promise((resolve, reject) => {
+    req.onsuccess = () => resolve(req.result);
+    req.onerror = () => reject(req.error || new Error("IndexedDB request failed"));
+  });
+}
+
+async function getApiCacheDb() {
+  if (typeof indexedDB === "undefined") return null;
+  if (apiCacheDbPromise) return apiCacheDbPromise;
+  apiCacheDbPromise = new Promise((resolve) => {
+    try {
+      const req = indexedDB.open(API_CACHE_DB_NAME, 1);
+      req.onupgradeneeded = () => {
+        const db = req.result;
+        if (!db.objectStoreNames.contains(API_CACHE_DB_STORE)) {
+          db.createObjectStore(API_CACHE_DB_STORE, { keyPath: "key" });
+        }
+      };
+      req.onsuccess = () => resolve(req.result);
+      req.onerror = () => {
+        console.warn("[GDS-CACHE] indexedDB open failed:", req.error);
+        resolve(null);
+      };
+    } catch (err) {
+      console.warn("[GDS-CACHE] indexedDB unavailable:", err?.message || err);
+      resolve(null);
+    }
+  });
+  return apiCacheDbPromise;
+}
+
+async function apiDiskCacheGet(key, ttlMs) {
+  const db = await getApiCacheDb();
+  if (!db) return null;
+  try {
+    const tx = db.transaction(API_CACHE_DB_STORE, "readonly");
+    const store = tx.objectStore(API_CACHE_DB_STORE);
+    const entry = await idbRequestToPromise(store.get(key));
+    if (!entry) return null;
+    const age = Date.now() - Number(entry.ts || 0);
+    if (age > ttlMs) {
+      // Fire-and-forget stale cleanup.
+      const dtx = db.transaction(API_CACHE_DB_STORE, "readwrite");
+      dtx.objectStore(API_CACHE_DB_STORE).delete(key);
+      return null;
+    }
+    return cloneCachePayload(entry.data);
+  } catch (err) {
+    dwarn("[GDS-CACHE] disk get failed:", err?.message || err);
+    return null;
+  }
+}
+
+async function apiDiskCacheSet(key, data) {
+  const db = await getApiCacheDb();
+  if (!db) return;
+  try {
+    const tx = db.transaction(API_CACHE_DB_STORE, "readwrite");
+    const store = tx.objectStore(API_CACHE_DB_STORE);
+    store.put({ key, ts: Date.now(), data: cloneCachePayload(data) });
+  } catch (err) {
+    dwarn("[GDS-CACHE] disk set failed:", err?.message || err);
+  }
+}
+
+async function clearApiDiskCache() {
+  const db = await getApiCacheDb();
+  if (!db) return;
+  try {
+    const tx = db.transaction(API_CACHE_DB_STORE, "readwrite");
+    tx.objectStore(API_CACHE_DB_STORE).clear();
+  } catch (err) {
+    dwarn("[GDS-CACHE] disk clear failed:", err?.message || err);
+  }
+}
+
+function clearApiResponseCache(reason = "manual") {
+  const count = state.apiResponseCache.size;
+  state.apiResponseCache.clear();
+  dlog(`[GDS-CACHE] cleared (${reason}) entries=${count}, hit=${state.apiCacheHits}, miss=${state.apiCacheMisses}`);
+  state.apiCacheHits = 0;
+  state.apiCacheMisses = 0;
+  clearApiDiskCache().catch(() => {});
+}
+
 function showCategorySubMenu(category, tabEl) {
   const subItems = categorySubMenus[category];
   if (!subItems) return;
@@ -1580,6 +1986,24 @@ async function gdsFetch(endpoint, options = {}) {
 
   const url = `${baseUrl.replace(/\/$/, "")}/gds_dviewer/normal/${endpoint.replace(/^\//, "")}`;
   const method = options.method || "GET";
+  const cacheable = shouldUseApiResponseCache(method, endpoint, options);
+  const cacheKey = buildApiCacheKey(baseUrl, endpoint, method, options.source_id);
+  const cacheTtlMs = getApiCacheTtlMs(endpoint);
+
+  if (cacheable) {
+    const hit = apiCacheGet(cacheKey, cacheTtlMs);
+    if (hit) {
+      dlog(`[GDS-CACHE] HIT (${method}) ${endpoint} ttl=${cacheTtlMs}ms`);
+      return hit;
+    }
+    const diskHit = await apiDiskCacheGet(cacheKey, cacheTtlMs);
+    if (diskHit) {
+      dlog(`[GDS-CACHE] DISK-HIT (${method}) ${endpoint} ttl=${cacheTtlMs}ms`);
+      apiCacheSet(cacheKey, diskHit);
+      return diskHit;
+    }
+    dlog(`[GDS-CACHE] MISS (${method}) ${endpoint}`);
+  }
 
   // URL에 API Key 추가 (POST body에 이미 있으면 생략해도 되지만 안전을 위해 유지)
   const separator = url.includes("?") ? "&" : "?";
@@ -1624,6 +2048,10 @@ async function gdsFetch(endpoint, options = {}) {
         const resp = await tauriPlugin.fetch(finalUrl, fetchOptions);
         const data = await resp.json();
         dlog(`[GDS-API] Tauri Plugin Success:`, data);
+        if (cacheable) {
+          apiCacheSet(cacheKey, data);
+          apiDiskCacheSet(cacheKey, data).catch(() => {});
+        }
         return data;
       } catch (perr) {
         dwarn(
@@ -1640,6 +2068,10 @@ async function gdsFetch(endpoint, options = {}) {
     }
     const data = await response.json();
     dlog(`[GDS-API] Success (${method}):`, endpoint);
+    if (cacheable) {
+      apiCacheSet(cacheKey, data);
+      apiDiskCacheSet(cacheKey, data).catch(() => {});
+    }
     return data;
   } catch (e) {
     console.error("[GDS-API] Fetch Error:", e);
@@ -2174,17 +2606,25 @@ async function loadLibrary(forceRefresh = false, isAppend = false) {
         loadDramaRail(false).catch(() => {});
       }
 
-      if (!isAppend) renderFolderContextPanel(displayItems);
-      renderGrid(grid, displayItems, isFolderCategory, isAppend);
-
-      // Folder view: enrich episode cards from show.yaml metadata (progressive, no full rerender).
-      if (!isAppend && state.currentPath) {
+      let renderItems = displayItems;
+      if (!isAppend && state.currentPath && Array.isArray(displayItems) && displayItems.some((i) => i && !i.is_dir)) {
         const reqSeq = ++state.episodeMetaReqSeq;
         const targetPath = state.currentPath;
-        enrichEpisodeMetaForCurrentFolder(targetPath, state.sourceId, reqSeq).catch((e) => {
-          dlog("[EP_META] enrich skipped:", e?.message || e);
-        });
+        try {
+          const hydrated = await hydrateItemsWithEpisodeMeta(targetPath, displayItems, state.sourceId, reqSeq);
+          if (reqSeq === state.episodeMetaReqSeq) {
+            renderItems = hydrated.items;
+            if (!hydrated.hasMeta) {
+              dlog("[EP_META] no yaml metadata found for folder:", targetPath);
+            }
+          }
+        } catch (e) {
+          dlog("[EP_META] pre-render hydrate skipped:", e?.message || e);
+        }
       }
+
+      if (!isAppend) renderFolderContextPanel(renderItems);
+      renderGrid(grid, renderItems, isFolderCategory, isAppend);
 
       // [FIX] Ensure scroll is at top after rendering first page
       if (!isAppend && state.currentView === "library") {
@@ -2480,6 +2920,19 @@ function renderFolderContextPanel(items = []) {
       .map((g) => String(g || "").trim())
       .filter(Boolean)
   )).slice(0, 4);
+  const getGenreChipClass = (genre) => {
+    const g = String(genre || "").toLowerCase();
+    if (g.includes("romance") || g.includes("로맨스")) return "genre-romance";
+    if (g.includes("drama") || g.includes("드라마")) return "genre-drama";
+    if (g.includes("comedy") || g.includes("코미디")) return "genre-comedy";
+    if (g.includes("thriller") || g.includes("스릴러")) return "genre-thriller";
+    if (g.includes("action") || g.includes("액션")) return "genre-action";
+    if (g.includes("fantasy") || g.includes("판타지")) return "genre-fantasy";
+    return "genre-default";
+  };
+  const genreChipsHtml = genreList
+    .map((genre) => `<span class="folder-context-chip ${getGenreChipClass(genre)}">${genre}</span>`)
+    .join("");
   const parseMetaJson = (v) => {
     if (!v) return {};
     if (typeof v === "object") return v;
@@ -2503,9 +2956,9 @@ function renderFolderContextPanel(items = []) {
         <span class="folder-context-chip season">${seasonLabel}</span>
         <span class="folder-context-chip">${countLabel}</span>
         ${(currentMeta?.year || parentMeta?.year) ? `<span class="folder-context-chip">${currentMeta?.year || parentMeta?.year}</span>` : ""}
-        ${qualityText ? `<span class="folder-context-chip accent">영상 ${qualityText}</span>` : ""}
-        ${genreList.length ? `<span class="folder-context-chip">${genreList.join(" · ")}</span>` : ""}
+        ${qualityText ? `<span class="folder-context-chip accent">${qualityText}</span>` : ""}
       </div>
+      ${genreChipsHtml ? `<div class="folder-context-genres">${genreChipsHtml}</div>` : ""}
       ${castPreview ? `<div class="folder-context-cast"><span class="folder-context-cast-label">출연</span><span class="folder-context-cast-value">${castPreview}</span></div>` : ""}
       ${summary ? `<p class="folder-context-summary">${summary}</p>` : ""}
     </div>
@@ -2657,15 +3110,23 @@ function openEpisodeDrawer(rawItems = [], contextTitle = "회차 보기") {
     listEl.innerHTML = items.map((item, idx) => {
       const title = cleanMediaTitle(item.meta_title || item.title || item.name || `Item ${idx + 1}`);
       const ep = extractEpisodeLabel(item);
+      const titleLine = item.is_dir
+        ? title
+        : (ep ? `${ep} · ${title}` : title);
       const sub = item.is_dir
         ? '폴더'
-        : (ep || String(item.ext || '').toUpperCase() || 'VIDEO');
-      const icon = item.is_dir ? '📁' : '▶';
+        : (String(item.ext || '').replace(/^\./, '').toUpperCase() || 'VIDEO');
+      const poster = item.is_dir
+        ? (buildFolderThumbUrl(item.path || "", item.source_id, 240) || getPosterUrlFromItem(item, 240, false))
+        : getPosterUrlFromItem(item, 240, true);
+      const noPoster = `${state.serverUrl}/gds_dviewer/static/img/no_poster.png`;
       return `
         <button type="button" class="episode-drawer-item" data-index="${idx}" tabindex="0">
-          <span class="episode-drawer-item-icon">${icon}</span>
+          <span class="episode-drawer-item-thumb-wrap">
+            <img class="episode-drawer-item-thumb" src="${poster}" alt="${title}" loading="lazy" onerror="this.onerror=null; this.src='${noPoster}'">
+          </span>
           <span class="episode-drawer-item-text">
-            <span class="episode-drawer-item-title">${title}</span>
+            <span class="episode-drawer-item-title">${titleLine}</span>
             <span class="episode-drawer-item-sub">${sub}</span>
           </span>
         </button>
@@ -2895,7 +3356,7 @@ function renderGrid(container, items, isFolderCategory = false, isAppend = false
     card.className = isAppend ? baseCardClass : `${baseCardClass} card-loading`;
 
     // [MOD] Filename Cleaning for Premium Look
-    let displayTitle = item.title || item.name;
+    let displayTitle = item.meta_title || item.title || item.name;
     if (!item.title) {
       displayTitle = displayTitle
         .replace(/\.(mkv|mp4|avi|srt|ass)$/i, "")
@@ -2906,8 +3367,14 @@ function renderGrid(container, items, isFolderCategory = false, isAppend = false
         .trim();
     }
     if (!isFolder) {
+      const metaEpisodeNo = Number(item.meta_episode);
+      if (Number.isFinite(metaEpisodeNo)) {
+        const epNo = String(metaEpisodeNo).padStart(2, "0");
+        const epTitle = cleanMediaTitle(item.meta_title || item.title || "");
+        displayTitle = epTitle ? `Episode ${epNo} · ${epTitle}` : `Episode ${epNo}`;
+      }
       const epMatch = (item.name || "").match(/S(\d{1,2})E(\d{1,3})/i);
-      if (epMatch) {
+      if (epMatch && !Number.isFinite(metaEpisodeNo)) {
         const epNo = String(parseInt(epMatch[2], 10)).padStart(2, "0");
         displayTitle = `Episode ${epNo}`;
       }
@@ -2963,6 +3430,32 @@ function renderGrid(container, items, isFolderCategory = false, isAppend = false
     const subtitle = isFolder
       ? getFolderSubtitle(item)
       : (item.meta_summary || item.summary || item.desc || formatSize(item.size));
+    const parseMetaJsonForCard = (v) => {
+      if (!v) return {};
+      if (typeof v === "object") return v;
+      try { return JSON.parse(String(v)); } catch (_) { return {}; }
+    };
+    const metaJson = parseMetaJsonForCard(item.meta_json);
+    const hasYamlMeta =
+      !isFolder &&
+      (
+        Number.isFinite(Number(item.meta_episode)) ||
+        !!String(item.meta_title || "").trim() ||
+        !!String(item.meta_summary || "").trim() ||
+        !!String(item.meta_thumb || "").trim()
+      );
+    const genreRaw = []
+      .concat(item.album_info?.genre || [])
+      .concat(item.genre || [])
+      .concat(metaJson?.genre || []);
+    const genreList = Array.from(new Set(
+      genreRaw.map((g) => String(g || "").trim()).filter(Boolean)
+    )).slice(0, 3);
+    const actorRaw = metaJson?.actor || [];
+    const actorList = Array.isArray(actorRaw)
+      ? actorRaw.map((a) => (typeof a === "string" ? a : (a?.name || a?.name_ko || a?.name_en || ""))).filter(Boolean)
+      : String(actorRaw || "").split(",").map((a) => a.trim()).filter(Boolean);
+    const castPreview = actorList.slice(0, 2).join(" · ");
     const yearMatch = (item.name || "").match(/\b(19|20)\d{2}\b/);
     const yearTag = yearMatch ? yearMatch[0] : "";
     const mediaLabel = isSeasonFolder
@@ -2999,6 +3492,12 @@ function renderGrid(container, items, isFolderCategory = false, isAppend = false
     const tagsHtml = tags.length > 0 
         ? `<div class="card-tags">${tags.map(t => `<span class="card-tag ${t==='4K'||t==='2160P'?'accent':''}">${t}</span>`).join('')}</div>`
         : '<div class="card-tags"></div>';
+    const metaGenresHtml = (hasYamlMeta && genreList.length > 0)
+      ? `<div class="card-genres">${genreList.map((g) => `<span class="card-genre-chip">${g}</span>`).join("")}</div>`
+      : "";
+    const metaCastHtml = (hasYamlMeta && castPreview)
+      ? `<div class="card-cast">출연: ${castPreview}</div>`
+      : "";
     const hay = `${normalizePathForCompare(item.path || "")} ${String(item.name || "").toLowerCase()} ${String(item.status || "").toLowerCase()}`;
     const isOnAir =
       hay.includes("방송중") ||
@@ -3023,6 +3522,8 @@ function renderGrid(container, items, isFolderCategory = false, isAppend = false
           <div class="card-eyebrow">${mediaLabel}${yearTag ? ` · ${yearTag}` : ""}</div>
           <div class="card-title">${displayTitle}</div>
           ${tagsHtml}
+          ${metaGenresHtml}
+          ${metaCastHtml}
           <div class="card-subtitle">${subtitle}</div>
         </div>
       `;
@@ -3036,6 +3537,8 @@ function renderGrid(container, items, isFolderCategory = false, isAppend = false
           <div class="card-eyebrow">${mediaLabel}${yearTag ? ` · ${yearTag}` : ""}</div>
           <div class="card-title">${displayTitle}</div>
           ${tagsHtml}
+          ${metaGenresHtml}
+          ${metaCastHtml}
           <div class="card-subtitle">${subtitle}</div>
         </div>
       `;
@@ -3377,9 +3880,17 @@ function resolvePosterUrl(rawUrl, item, width = 640) {
   const raw = String(rawUrl || "").trim();
   if (!raw) return "";
 
+  if (/no[_-]?image|no[_-]?poster/i.test(raw)) {
+    return "";
+  }
+
   // Already-proxied/ready URLs from gds_dviewer should be used as-is.
   if (raw.includes("/gds_dviewer/normal/proxy_image") || raw.includes("/gds_dviewer/normal/thumbnail")) {
     return raw;
+  }
+
+  if (raw.startsWith("gds_dviewer/")) {
+    return `${state.serverUrl}/${raw}`;
   }
 
   // Relative path from same server.
@@ -3392,6 +3903,16 @@ function resolvePosterUrl(rawUrl, item, width = 640) {
     return `${state.serverUrl}/gds_dviewer/normal/proxy_image?url=${encodeURIComponent(raw)}&apikey=${state.apiKey}`;
   }
 
+  // If metadata stores a file-ish path, build thumbnail from that path directly.
+  if (/[\\/]/.test(raw) || /\.(jpe?g|png|webp|bmp|gif|mp4|mkv|avi|mov|m4v|webm|ts)$/i.test(raw)) {
+    let rawPath = String(raw).replace(/\\/g, "/").normalize("NFC");
+    if (!rawPath.startsWith("/")) rawPath = `/${rawPath}`;
+    const rawBpath = toUrlSafeBase64(rawPath);
+    if (rawBpath) {
+      return `${state.serverUrl}/gds_dviewer/normal/thumbnail?bpath=${rawBpath}&source_id=${normalizeSourceId(item?.source_id)}&w=${width}&apikey=${state.apiKey}`;
+    }
+  }
+
   // Fallback to thumbnail from file path when raw is not a URL.
   let thumbPath = String(item?.path || "").normalize("NFC");
   if (thumbPath && !thumbPath.startsWith("/")) thumbPath = `/${thumbPath}`;
@@ -3400,12 +3921,16 @@ function resolvePosterUrl(rawUrl, item, width = 640) {
   return `${state.serverUrl}/gds_dviewer/normal/thumbnail?bpath=${bpath}&source_id=${normalizeSourceId(item?.source_id)}&w=${width}&apikey=${state.apiKey}`;
 }
 
-function getPosterUrlFromItem(item, width = 640) {
+function getPosterUrlFromItem(item, width = 640, preferThumb = false) {
   const noPoster = `${state.serverUrl}/gds_dviewer/static/img/no_poster.png`;
   if (!item) return noPoster;
-  const rawPoster = item.meta_poster || item.album_info?.posters || item.poster || item.meta_thumb || item.thumb || "";
-  const resolved = resolvePosterUrl(rawPoster, item, width);
-  if (resolved) return resolved;
+  const sources = preferThumb
+    ? [item.meta_thumb, item.thumb, item.meta_poster, item.album_info?.posters, item.poster]
+    : [item.meta_poster, item.album_info?.posters, item.poster, item.meta_thumb, item.thumb];
+  for (const raw of sources) {
+    const resolved = resolvePosterUrl(raw, item, width);
+    if (resolved) return resolved;
+  }
   let thumbPath = String(item.path || "").normalize("NFC");
   if (thumbPath && !thumbPath.startsWith("/")) thumbPath = `/${thumbPath}`;
   const bpath = toUrlSafeBase64(thumbPath);
@@ -5018,8 +5543,13 @@ function setupSettings() {
       return;
     }
 
+    const prevUrl = state.serverUrl;
+    const prevKey = state.apiKey;
     state.serverUrl = url;
     state.apiKey = key;
+    if (prevUrl !== url || prevKey !== key) {
+      clearApiResponseCache("settings-change");
+    }
 
     localStorage.setItem("gds_server_url", url);
     localStorage.setItem("gds_api_key", key);
@@ -5131,6 +5661,7 @@ function setupPlayer() {
     if (ui.progressSlider) ui.progressSlider.value = percent;
     if (ui.currentTime)
       ui.currentTime.textContent = formatTime(player.currentTime);
+    updateOpeningSkipUI();
   });
 
   player.addEventListener("loadedmetadata", () => {
@@ -5138,6 +5669,7 @@ function setupPlayer() {
     if (ui.progressSlider) ui.progressSlider.value = 0;
     if (ui.progressBarFill) ui.progressBarFill.style.width = "0%";
     showUI();
+    updateOpeningSkipUI();
   });
 
   // Seeking
@@ -5225,6 +5757,14 @@ function closePlayer() {
 
   if (ui.playerOverlay) ui.playerOverlay.classList.remove("active");
   document.body.classList.remove("player-active");
+  state.currentMediaPath = "";
+  state.currentMediaTitle = "";
+  state.currentMediaSourceId = 0;
+  state.nextEpisodeItem = null;
+  state.nextEpisodeResolveSeq += 1;
+  state.openingSkipDismissPath = "";
+  if (ui.btnOscOpeningSkip) ui.btnOscOpeningSkip.classList.add("hidden");
+  if (ui.btnOscNextEpisode) ui.btnOscNextEpisode.classList.add("hidden");
 }
 
 function hideWebOscForAndroidExo() {
@@ -5283,6 +5823,8 @@ function startNativeStatePolling() {
         const percent = state.nativeDuration > 0 ? (state.nativePos / state.nativeDuration) * 100 : 0;
         if (ui.oscProgressFill) ui.oscProgressFill.style.width = percent + "%";
         if (ui.oscProgressSlider && !state.isDraggingOscSlider) ui.oscProgressSlider.value = percent;
+        updateOpeningSkipUI();
+        updateNextEpisodeUI();
 
         const icon = state.nativePaused ? "play" : "pause";
         if (ui.btnOscPlayPause) {
@@ -5390,10 +5932,11 @@ function playVideo(item) {
   if (ui.playerOverlay) ui.playerOverlay.classList.add("active");
   document.body.classList.add("player-active");
   const cleanTitle = displayTitle;
-  if (ui.playerTitle) ui.playerTitle.textContent = cleanTitle + " (Loading...)";
+  state.currentMediaTitle = cleanTitle;
+  if (ui.playerTitle) ui.playerTitle.textContent = getOverlayTitleText("Loading...");
 
   const premiumTitle = document.getElementById("player-video-title");
-  if (premiumTitle) premiumTitle.textContent = cleanTitle;
+  if (premiumTitle) premiumTitle.textContent = getOverlayTitleText(cleanTitle);
 
   // 2. Clear Existing Player State
   if (ui.mainPlayer) {
@@ -5447,6 +5990,11 @@ function playVideo(item) {
   if (cleanPath && !cleanPath.startsWith("/")) {
     cleanPath = "/" + cleanPath;
   }
+  state.currentMediaPath = cleanPath;
+  state.currentMediaSourceId = normalizeSourceId(item.source_id);
+  state.nextEpisodeItem = null;
+  state.openingSkipDismissPath = "";
+  updateNextEpisodeUI();
 
   const bpath = toUrlSafeBase64(cleanPath);
   const encodedPath = encodeURIComponent(cleanPath);
@@ -5618,11 +6166,12 @@ function playVideo(item) {
             }
           }, 1500); // 1.5s delay to ensure MPV is ready
 
-          ui.playerTitle.textContent = cleanTitle;
+          ui.playerTitle.textContent = getOverlayTitleText(cleanTitle);
           state.isNativeActive = true;
 
           // [OSC] Set Title
-          if (ui.oscTitle) ui.oscTitle.textContent = cleanTitle;
+          if (ui.oscTitle) ui.oscTitle.textContent = getOverlayTitleText(cleanTitle);
+          refreshNextEpisodeCandidate().catch(() => {});
 
           // Hide video container to show transparent hole
           if (ui.videoContainer) {
@@ -5704,13 +6253,14 @@ function startWebPlayback(item, streamUrl, isAudio = false) {
     ui.mainPlayer.addEventListener(
       "loadedmetadata",
       () => {
-        ui.playerTitle.textContent = item.name;
+        ui.playerTitle.textContent = getOverlayTitleText(item.name);
         if (ui.mainPlayer.textTracks.length > 0) {
           ui.mainPlayer.textTracks[0].mode = "showing";
         }
       },
       { once: true },
     );
+    refreshNextEpisodeCandidate().catch(() => {});
   }
 
   ui.mainPlayer.src = streamUrl;
@@ -6531,7 +7081,13 @@ function setupPremiumOSC() {
     }, 4000);
   };
 
-  const seekTo = (seconds) => {
+  const seekTo = (seconds, reason = "seek") => {
+    const fromTime = state.isNativeActive
+      ? Number(state.nativePos || 0)
+      : Number(ui.mainPlayer && Number.isFinite(ui.mainPlayer.currentTime) ? ui.mainPlayer.currentTime : 0);
+    const totalTime = state.isNativeActive
+      ? Number(state.nativeDuration || 0)
+      : Number(ui.mainPlayer && Number.isFinite(ui.mainPlayer.duration) ? ui.mainPlayer.duration : 0);
     const targetTime = Math.max(0, seconds);
     console.log("[PLAYER-ACTION] seekTo requested:", targetTime);
     if (state.isNativeActive) {
@@ -6549,6 +7105,12 @@ function setupPremiumOSC() {
     } else if (ui.mainPlayer) {
       ui.mainPlayer.currentTime = targetTime;
     }
+    if (reason === "opening_button") {
+      const info = getActivePlaybackSnapshot();
+      if (Number.isFinite(totalTime) && totalTime > 0) info.duration = totalTime;
+      learnOpeningSkip(info, targetTime, "opening_button");
+    }
+    updateOpeningSkipUI();
   };
 
   const togglePlay = (e) => {
@@ -6609,7 +7171,33 @@ function setupPremiumOSC() {
     e.stopPropagation();
     const current = state.isNativeActive ? state.nativePos : (ui.mainPlayer ? ui.mainPlayer.currentTime : 0);
     const total = state.isNativeActive ? state.nativeDuration : (ui.mainPlayer ? ui.mainPlayer.duration : Infinity);
-    seekTo(Math.min(total, current + 10));
+    seekTo(Math.min(total, current + 10), "skip10");
+  });
+
+  bind(ui.btnOscOpeningSkip, "Opening Skip", (e) => {
+    e.stopPropagation();
+    const info = getActivePlaybackSnapshot();
+    if (!Number.isFinite(info.duration) || info.duration <= 0) return;
+    const hint = getOpeningSkipHint(info);
+    const fallback = Math.min(Math.max(60, Math.round(info.duration * 0.12)), OPENING_SKIP_DEFAULT_JUMP_SEC + 40);
+    const target = hint && Number.isFinite(hint.end)
+      ? Math.max(info.current + 8, Number(hint.end))
+      : Math.min(info.duration - 1, info.current + fallback);
+    console.log("[OP-SKIP] click:", { seriesKey: info.seriesKey, current: info.current, target, hint });
+    state.openingSkipDismissPath = info.path || state.currentMediaPath || "";
+    if (ui.btnOscOpeningSkip) ui.btnOscOpeningSkip.classList.add("hidden");
+    seekTo(target, "opening_button");
+  });
+
+  bind(ui.btnOscNextEpisode, "Next Episode", (e) => {
+    e.stopPropagation();
+    const nextItem = state.nextEpisodeItem;
+    if (!nextItem) {
+      console.log("[NEXT-EP] no next episode candidate");
+      return;
+    }
+    console.log("[NEXT-EP] play:", nextItem.path || nextItem.name || "");
+    playVideo(nextItem);
   });
 
   // [FIX] Force select button to ensure binding
@@ -7049,11 +7637,12 @@ function setupPremiumOSC() {
       if (state.isNativeActive) {
         if (state.nativeDuration > 0) {
           const seekTime = (val / 100) * state.nativeDuration;
-          seekTo(seekTime);
+          seekTo(seekTime, "slider");
         }
       } else if (ui.mainPlayer && ui.mainPlayer.duration) {
         ui.mainPlayer.currentTime = (val / 100) * ui.mainPlayer.duration;
       }
+      updateOpeningSkipUI();
     });
   }
 

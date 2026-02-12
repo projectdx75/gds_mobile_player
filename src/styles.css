@@ -1982,6 +1982,37 @@ input:focus {
   margin-bottom: var(--safe-area-inset-bottom);
 }
 
+.osc-action-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  min-height: 34px;
+}
+
+.osc-action-chip {
+  border: 1px solid rgba(255, 255, 255, 0.42);
+  background: rgba(0, 0, 0, 0.45);
+  color: #fff;
+  border-radius: 999px;
+  padding: 6px 14px;
+  font-size: 0.78rem;
+  font-weight: 700;
+  cursor: pointer;
+  transition: background 0.2s ease, transform 0.12s ease;
+}
+
+.osc-action-chip:hover {
+  background: rgba(229, 9, 20, 0.8);
+}
+
+.osc-action-chip:active {
+  transform: scale(0.98);
+}
+
+#btn-osc-next-episode {
+  margin-left: auto;
+}
+
 .osc-timeline-area {
   display: flex;
   align-items: center;
@@ -3304,11 +3335,49 @@ body.appletv-skin .card-tag.accent {
   color: #d7ecff;
 }
 
+body.appletv-skin .card-genres {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 5px;
+  margin: 4px 0 6px;
+  max-height: 0;
+  overflow: hidden;
+  opacity: 0;
+  transform: translateY(4px);
+  transition: max-height 0.2s ease, opacity 0.2s ease, transform 0.2s ease;
+}
+
+body.appletv-skin .card-genre-chip {
+  font-size: 0.62rem;
+  font-weight: 700;
+  padding: 2px 8px;
+  border-radius: 15px;
+  color: rgba(236, 246, 255, 0.94);
+  border: 1px solid rgba(166, 198, 255, 0.35);
+  background: rgba(82, 118, 186, 0.36);
+}
+
+body.appletv-skin .card-cast {
+  color: rgba(203, 224, 252, 0.9);
+  font-size: 0.7rem;
+  line-height: 1.2;
+  margin: 0 0 5px;
+  max-height: 0;
+  overflow: hidden;
+  opacity: 0;
+  transform: translateY(4px);
+  transition: max-height 0.2s ease, opacity 0.2s ease, transform 0.2s ease;
+}
+
 body.appletv-skin .card.atv-card:hover .card-eyebrow,
 body.appletv-skin .card.atv-card:hover .card-tags,
+body.appletv-skin .card.atv-card:hover .card-genres,
+body.appletv-skin .card.atv-card:hover .card-cast,
 body.appletv-skin .card.atv-card:hover .card-subtitle,
 body.appletv-skin .card.atv-card:focus-visible .card-eyebrow,
 body.appletv-skin .card.atv-card:focus-visible .card-tags,
+body.appletv-skin .card.atv-card:focus-visible .card-genres,
+body.appletv-skin .card.atv-card:focus-visible .card-cast,
 body.appletv-skin .card.atv-card:focus-visible .card-subtitle {
   max-height: 36px;
   opacity: 1;
@@ -3462,7 +3531,7 @@ body.appletv-skin .folder-context-body {
   position: relative;
   z-index: 2;
   padding: 28px 4.5%;
-  max-width: min(780px, 62%);
+  max-width: min(1040px, 74%);
 }
 
 body.appletv-skin .folder-context-actions {
@@ -3527,6 +3596,55 @@ body.appletv-skin .folder-context-chip.accent {
   border-color: rgba(205, 235, 255, 0.95);
   background: linear-gradient(135deg, rgba(169, 224, 255, 0.94), rgba(123, 187, 255, 0.9));
   font-weight: 800;
+}
+
+body.appletv-skin .folder-context-genres {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin: 8px 0 8px;
+}
+
+body.appletv-skin .folder-context-chip.genre-romance {
+  border-radius: 15px;
+  color: #fff0f6;
+  border-color: rgba(255, 169, 209, 0.9);
+  background: linear-gradient(135deg, rgba(255, 101, 167, 0.7), rgba(220, 74, 139, 0.65));
+}
+
+body.appletv-skin .folder-context-chip.genre-drama {
+  border-radius: 15px;
+  color: #f0f7ff;
+  border-color: rgba(151, 198, 255, 0.9);
+  background: linear-gradient(135deg, rgba(80, 132, 210, 0.7), rgba(58, 104, 178, 0.65));
+}
+
+body.appletv-skin .folder-context-chip.genre-comedy {
+  border-radius: 15px;
+  color: #fffbe8;
+  border-color: rgba(255, 217, 126, 0.9);
+  background: linear-gradient(135deg, rgba(255, 183, 57, 0.72), rgba(236, 154, 32, 0.68));
+}
+
+body.appletv-skin .folder-context-chip.genre-thriller {
+  border-radius: 15px;
+  color: #fbeeee;
+  border-color: rgba(255, 133, 133, 0.86);
+  background: linear-gradient(135deg, rgba(209, 80, 80, 0.72), rgba(160, 53, 53, 0.68));
+}
+
+body.appletv-skin .folder-context-chip.genre-action {
+  border-radius: 15px;
+  color: #eef9ff;
+  border-color: rgba(116, 226, 255, 0.85);
+  background: linear-gradient(135deg, rgba(55, 183, 227, 0.72), rgba(42, 139, 210, 0.68));
+}
+
+body.appletv-skin .folder-context-chip.genre-fantasy {
+  border-radius: 15px;
+  color: #f7f0ff;
+  border-color: rgba(195, 161, 255, 0.86);
+  background: linear-gradient(135deg, rgba(142, 103, 224, 0.72), rgba(103, 79, 184, 0.68));
 }
 
 body.appletv-skin .folder-context-cast {
@@ -3757,12 +3875,21 @@ body.appletv-skin .folder-episode-list-btn:hover {
   box-shadow: 0 0 0 2px rgba(176, 220, 255, 0.28);
 }
 
-.episode-drawer-item-icon {
-  width: 20px;
-  min-width: 20px;
-  text-align: center;
-  font-size: 0.95rem;
-  opacity: 0.95;
+.episode-drawer-item-thumb-wrap {
+  width: 84px;
+  min-width: 84px;
+  height: 48px;
+  border-radius: 9px;
+  overflow: hidden;
+  border: 1px solid rgba(173, 206, 244, 0.42);
+  background: rgba(14, 22, 37, 0.8);
+}
+
+.episode-drawer-item-thumb {
+  width: 100%;
+  height: 100%;
+  display: block;
+  object-fit: cover;
 }
 
 .episode-drawer-item-text {
