@@ -54,6 +54,9 @@ const state = {
   nativeArch: "unknown",
   fullscreenEnterRepairAttempted: false,
   lastFullscreenToggleAt: 0,
+  fullscreenOpSeq: 0,
+  lastWindowedInnerWidth: 0,
+  lastWindowedInnerHeight: 0,
   domesticVirtualCategory: "방송중",
   movieVirtualCategory: "전체",
   animationVirtualCategory: "전체",
@@ -62,6 +65,12 @@ const state = {
   moviePreviewLoading: false,
   moviePreviewSeenKeys: new Set(),
   moviePreviewItemMap: new Map(),
+  movieGenreRails: {
+    "액션": { offset: 0, hasMore: true, loading: false, seenKeys: new Set(), itemMap: new Map() },
+    "스릴러": { offset: 0, hasMore: true, loading: false, seenKeys: new Set(), itemMap: new Map() },
+    "로맨스": { offset: 0, hasMore: true, loading: false, seenKeys: new Set(), itemMap: new Map() },
+    "코미디": { offset: 0, hasMore: true, loading: false, seenKeys: new Set(), itemMap: new Map() },
+  },
   animationRailOffset: 0,
   animationRailHasMore: true,
   animationRailLoading: false,
@@ -124,13 +133,13 @@ const API_CACHE_DB_STORE = "responses";
 const TRICKPLAY_DEFAULT_INTERVAL = 10;
 const TRICKPLAY_DEFAULT_W = 320;
 const TRICKPLAY_DEFAULT_H = 180;
-const TRICKPLAY_HIDE_MS = 1200;
+const TRICKPLAY_HIDE_MS = 5000;
 const PLAYER_HIDE_FILENAME_IN_OVERLAY = true;
 const OPENING_SKIP_STORAGE_KEY = "flashplex_opening_skip_v1";
 const OPENING_SKIP_MIN_DURATION_SEC = 15 * 60;
-const OPENING_SKIP_DEFAULT_JUMP_SEC = 85;
+const OPENING_SKIP_DEFAULT_JUMP_SEC = 90;
 const OPENING_SKIP_SHOW_FROM_SEC = 12;
-const OPENING_SKIP_SHOW_TO_SEC = 160;
+const OPENING_SKIP_SHOW_TO_SEC = 130;
 const NEXT_EPISODE_VIDEO_EXTS = new Set(["mp4", "mkv", "avi", "mov", "webm", "m4v", "ts"]);
 let animationRailAutoSlideTimer = null;
 let dramaRailAutoSlideTimer = null;
@@ -482,14 +491,16 @@ function firstUsableMovieTitle(candidates = []) {
 
 function buildMoviePreviewIdentity(item, folderPath) {
   const folderLeaf = splitPathSegments(folderPath).slice(-1)[0] || "";
-  const hierarchyTitle = inferMovieTitleFromPathHierarchy(item?.path || "");
+  const hierarchyTitle =
+    inferMovieTitleFromPathHierarchy(item?.path || "") ||
+    inferMovieTitleFromPathHierarchy(folderPath || "");
   const inferredTitle = firstUsableMovieTitle([
+    hierarchyTitle,
+    inferMovieTitleFromPathHierarchy(folderPath || ""),
     item?.meta_title,
     item?.title,
-    hierarchyTitle,
     inferSeriesTitleFromFileName(item),
     inferWorkTitleFromPath(item?.path || ""),
-    item?.name,
     "Untitled",
   ]);
   const isBucketFolder = isGenericMovieBucket(folderLeaf);
@@ -502,12 +513,11 @@ function buildMoviePreviewIdentity(item, folderPath) {
 function resolveMoviePreviewTitle(identity, item, folderMeta, parentMeta) {
   if (identity.isBucketFolder) {
     return firstUsableMovieTitle([
-      identity.inferredTitle,
       identity.hierarchyTitle,
+      identity.inferredTitle,
       inferWorkTitleFromPath(item?.path || ""),
       item?.meta_title,
       item?.title,
-      item?.name,
       "Untitled",
     ]);
   }
@@ -524,7 +534,6 @@ function resolveMoviePreviewTitle(identity, item, folderMeta, parentMeta) {
     inferWorkTitleFromPath(item?.path || ""),
     item?.meta_title,
     item?.title,
-    item?.name,
     "Untitled",
   ]);
 }
@@ -541,6 +550,22 @@ function inferMovieTitleFromPathHierarchy(pathValue) {
     if (!name) continue;
     if (isGenericMovieBucket(name)) continue;
     if (isTechnicalMovieFolderName(name)) continue;
+    if (isSeasonLikeName(name)) continue;
+    return name;
+  }
+  return "";
+}
+
+function inferSeriesTitleFromPathHierarchy(pathValue) {
+  const segs = splitPathSegments(String(pathValue || "").normalize("NFC"));
+  if (!segs.length) return "";
+  const last = segs[segs.length - 1] || "";
+  const hasMediaExt = /\.(mkv|mp4|avi|mov|webm|m4v|ts)$/i.test(last);
+  const end = hasMediaExt ? segs.length - 2 : segs.length - 1;
+  for (let i = end; i >= 0; i -= 1) {
+    const name = cleanMediaTitle(segs[i] || "");
+    if (!name) continue;
+    if (isGenericAnimeBucket(name)) continue;
     if (isSeasonLikeName(name)) continue;
     return name;
   }
@@ -564,7 +589,7 @@ function resolveAnimeSeriesMeta(item) {
 
   const chosen = segs[folderIdx] || "";
   const chosenIsGeneric = isGenericAnimeBucket(chosen) || chosen.toLowerCase() === "video";
-  const fallbackTitle = inferSeriesTitleFromFileName(item);
+  const fallbackTitle = inferSeriesTitleFromPathHierarchy(item?.path || "") || inferSeriesTitleFromFileName(item);
   const seriesTitle = cleanMediaTitle(chosenIsGeneric ? (fallbackTitle || chosen || "Untitled") : chosen);
   const prefixPath = ("/" + segs.slice(0, Math.max(1, folderIdx + 1)).join("/")).normalize("NFC");
   // If folder bucket is too generic, include inferred title in key path to avoid collapsing all titles.
@@ -1010,7 +1035,10 @@ async function recreateNativePlayerAfterResize(reason = "fullscreen") {
     try {
       const snap = await invoke("get_mpv_state");
       if (snap && typeof snap === "object") {
-        mpvState.position = typeof snap.position === "number" ? snap.position : mpvState.position;
+        // Guard: do not override with 0/invalid position during fullscreen transition race.
+        if (typeof snap.position === "number" && snap.position > 0.2) {
+          mpvState.position = snap.position;
+        }
         // Do not override pause with the forced pause state we just applied.
         mpvState.sid = typeof snap.sid === "number" ? snap.sid : mpvState.sid;
         mpvState.volume = typeof snap.volume === "number" ? snap.volume : mpvState.volume;
@@ -1128,6 +1156,33 @@ async function waitForNativeFullscreenState(invoke, targetFs, timeoutMs = 1400) 
   return false;
 }
 
+async function waitForWindowedBoundsSettle(timeoutMs = 2200) {
+  const start = Date.now();
+  const baseW = Number(state.lastWindowedInnerWidth || 0);
+  const baseH = Number(state.lastWindowedInnerHeight || 0);
+  let stableCount = 0;
+  let prevW = window.innerWidth || 0;
+  let prevH = window.innerHeight || 0;
+
+  while (Date.now() - start < timeoutMs) {
+    await new Promise((r) => setTimeout(r, 80));
+    const w = window.innerWidth || 0;
+    const h = window.innerHeight || 0;
+    const nearBase = baseW > 0 && baseH > 0
+      ? (Math.abs(w - baseW) <= 140 && Math.abs(h - baseH) <= 120)
+      : true;
+    const nearPrev = Math.abs(w - prevW) <= 3 && Math.abs(h - prevH) <= 3;
+    if (nearBase && nearPrev) {
+      stableCount += 1;
+      if (stableCount >= 3) return;
+    } else {
+      stableCount = 0;
+    }
+    prevW = w;
+    prevH = h;
+  }
+}
+
 async function maybeRecreateOnFullscreenExitIntel(invoke) {
   if (!invoke || !state.isNativeActive) return;
   if (state.nativeArch !== "x86_64") return;
@@ -1156,6 +1211,34 @@ async function maybeRecreateOnFullscreenEnterIntel(invoke) {
     console.warn("[PLAYER] Intel fullscreen-enter osd mismatch -> recreate once", { osdW, expectedW });
     await recreateNativePlayerAfterResize("fullscreen-enter-intel-fix");
     await invoke("resize_native_player", {}).catch(() => {});
+  }
+}
+
+async function maybeRecreateOnFullscreenMismatch(invoke, phase = "fullscreen", allowRecreate = true) {
+  if (!invoke || !state.isNativeActive) return;
+  try {
+    const sampleMismatch = async (delayMs) => {
+      if (delayMs > 0) await new Promise((r) => setTimeout(r, delayMs));
+      await invoke("resize_native_player", {}).catch(() => {});
+      const snap = await invoke("get_mpv_state").catch(() => null);
+      const osdW = Number(snap?.osd_width ?? -1);
+      const expectedW = Math.round((window.innerWidth || 0) * (window.devicePixelRatio || 1));
+      const delta = Math.abs(osdW - expectedW);
+      return { osdW, expectedW, delta };
+    };
+
+    const first = await sampleMismatch(320);
+    if (!(first.osdW > 0 && first.expectedW > 0 && first.delta > 260)) return;
+
+    const second = await sampleMismatch(240);
+    if (!(second.osdW > 0 && second.expectedW > 0 && second.delta > 260)) return;
+
+    console.warn("[PLAYER] fullscreen osd mismatch detected", { phase, first, second });
+    if (!allowRecreate || state.nativeRecreating) return;
+    await recreateNativePlayerAfterResize(`${phase}-osd-mismatch`);
+    await invoke("resize_native_player", {}).catch(() => {});
+  } catch (e) {
+    console.warn("[PLAYER] fullscreen mismatch check failed:", e?.message || e);
   }
 }
 
@@ -1271,6 +1354,15 @@ function initElements() {
       heroSection: document.querySelector(".hero-section"),
       moviePreviewRail: document.getElementById("movie-preview-rail"),
       moviePreviewTrack: document.getElementById("movie-preview-track"),
+      moviePreviewMeta: document.getElementById("movie-preview-meta"),
+      movieGenreActionRail: document.getElementById("movie-genre-action-rail"),
+      movieGenreActionTrack: document.getElementById("movie-genre-action-track"),
+      movieGenreThrillerRail: document.getElementById("movie-genre-thriller-rail"),
+      movieGenreThrillerTrack: document.getElementById("movie-genre-thriller-track"),
+      movieGenreRomanceRail: document.getElementById("movie-genre-romance-rail"),
+      movieGenreRomanceTrack: document.getElementById("movie-genre-romance-track"),
+      movieGenreComedyRail: document.getElementById("movie-genre-comedy-rail"),
+      movieGenreComedyTrack: document.getElementById("movie-genre-comedy-track"),
       animationRail: document.getElementById("animation-rail"),
       animationTrack: document.getElementById("animation-track"),
       animationPreviewMeta: document.getElementById("animation-preview-meta"),
@@ -1548,6 +1640,7 @@ function switchView(viewName) {
     setTimeout(() => initHeroCarousel(), 50);
   } else {
     setMoviePreviewRailVisible(false);
+    setMovieGenreRailsVisible(false);
     setAnimationRailVisible(false);
     setDramaRailVisible(false);
     // [NEW] Kill hero timer if not in library
@@ -1596,7 +1689,18 @@ function setupTabs() {
       state.offset = 0;
       state.library = [];
       state.query = ""; // Reset query when switching categories
-      if (getVirtualConfig(cat)) setVirtualBucket(cat, getVirtualConfig(cat).defaultBucket);
+      if (!cat) {
+        resetAllVirtualBuckets();
+      }
+      if (getVirtualConfig(cat)) {
+        const cfg = getVirtualConfig(cat);
+        setVirtualBucket(cat, cfg.defaultBucket);
+        // Movie/Animation should default to virtual-root "전체" list under rails.
+        if (cat === "movie" || cat === "animation") {
+          state.currentPath = cfg.rootPath;
+          state.pathStack = [cfg.rootPath];
+        }
+      }
 
       // Special handling for Favorites
       if (cat === "favorites") {
@@ -1635,7 +1739,7 @@ const VIRTUAL_CATEGORY_CONFIG = {
     defaultBucket: "전체",
     endpoint: "movie_virtual",
     debugTag: "MOVIE_VIRTUAL_URL",
-    categories: ["전체", "한국영화", "외국영화", "고화질(4K)", "고전영화", "액션", "스릴러", "코미디"],
+    categories: ["전체", "한국영화", "외국영화", "고화질(4K)", "고전영화", "액션", "스릴러", "로맨스", "코미디"],
   },
   animation: {
     rootPath: "VIDEO/애니메이션",
@@ -1715,6 +1819,7 @@ function shouldUseApiResponseCache(method, endpoint, options = {}) {
     "explorer/list?",
     "series_domestic?",
     "movie_virtual?",
+    "movie_genre?",
     "animation_virtual?",
     "movie_preview?",
     "animation_preview?",
@@ -1728,6 +1833,7 @@ function getApiCacheTtlMs(endpoint) {
   const ep = String(endpoint || "");
   if (ep.startsWith("get_video_info?")) return 60 * 1000;
   if (ep.startsWith("episode_meta?")) return 5 * 60 * 1000;
+  if (ep.startsWith("movie_genre?")) return 5 * 60 * 1000;
   if (ep.startsWith("movie_preview?") || ep.startsWith("animation_preview?")) return 90 * 1000;
   return API_CACHE_TTL_DEFAULT_MS;
 }
@@ -1955,9 +2061,17 @@ function showCategorySubMenu(category, tabEl) {
             state.query = "";
             setVirtualBucket(category, q);
           } else {
-            state.query = q;
-            state.currentPath = "";
-            state.pathStack = [];
+            // Keep animation default flow stable: unknown labels should not switch to raw query mode.
+            if (category === "animation") {
+              state.currentPath = cfg.rootPath;
+              state.pathStack = [cfg.rootPath];
+              state.query = "";
+              setVirtualBucket(category, cfg.defaultBucket);
+            } else {
+              state.query = q;
+              state.currentPath = "";
+              state.pathStack = [];
+            }
           }
         } else {
           state.query = q;
@@ -2143,7 +2257,7 @@ async function loadLibrary(forceRefresh = false, isAppend = false) {
   }
 
   // Determine current view mode
-  const isFolderCategory = [
+  const isFolderCategory = !state.category || [
     "video",
     "audio",
     "image",
@@ -2571,16 +2685,17 @@ async function loadLibrary(forceRefresh = false, isAppend = false) {
       }
 
       // Final Render
+      const isVirtualCatRoot = isVirtualRoot(state.category, state.currentPath);
       if (!isAppend) {
         state.isFirstFreshLoadDone = true; // Mark as done now that fresh data arrived
         ui.statusDot.className = "status-dot success";
         if (heroSection) {
           heroSection.style.display =
-            state.currentView === "library" && !state.currentPath
+            state.currentView === "library" && (!state.currentPath || isVirtualCatRoot)
               ? "block"
               : "none";
 
-          if (state.currentView === "library" && !state.currentPath) {
+          if (state.currentView === "library" && (!state.currentPath || isVirtualCatRoot)) {
             const heroCarousel = document.getElementById("hero-carousel");
             if (heroCarousel) renderHeroPlaceholder(heroCarousel);
             // Re-init when category/path changes inside library.
@@ -2589,18 +2704,24 @@ async function loadLibrary(forceRefresh = false, isAppend = false) {
         }
       }
 
-      const isRootLibrary = state.currentView === "library" && !state.currentPath;
-      const shouldShowMoviePreviewRail = isRootLibrary && state.category === "movie";
+      const isRootLibrary = state.currentView === "library" && (!state.currentPath || isVirtualCatRoot);
+      const isHomeCategory = !state.category;
+      const shouldShowMoviePreviewRail = isRootLibrary && (isHomeCategory || state.category === "movie");
       setMoviePreviewRailVisible(shouldShowMoviePreviewRail);
       if (shouldShowMoviePreviewRail && !isAppend) {
         loadMoviePreviewRail(false).catch(() => {});
       }
-      const shouldShowAnimationRail = isRootLibrary && state.category === "animation";
+      const shouldShowMovieGenreRails = isRootLibrary && state.category === "movie";
+      setMovieGenreRailsVisible(shouldShowMovieGenreRails);
+      if (shouldShowMovieGenreRails && !isAppend) {
+        loadMovieGenreRails().catch(() => {});
+      }
+      const shouldShowAnimationRail = isRootLibrary && (isHomeCategory || state.category === "animation");
       setAnimationRailVisible(shouldShowAnimationRail);
       if (shouldShowAnimationRail && !isAppend) {
         loadAnimationRail(false).catch(() => {});
       }
-      const shouldShowDramaRail = isRootLibrary && state.category === "tv_show";
+      const shouldShowDramaRail = isRootLibrary && (isHomeCategory || state.category === "tv_show");
       setDramaRailVisible(shouldShowDramaRail);
       if (shouldShowDramaRail && !isAppend) {
         loadDramaRail(false).catch(() => {});
@@ -2686,8 +2807,9 @@ async function loadLibrary(forceRefresh = false, isAppend = false) {
 function renderSubCategoryChips(folders) {
   const chipContainer = document.getElementById("sub-category-chips");
   if (!chipContainer) return;
-  document.body.classList.toggle("has-folder-path", !!state.currentPath);
-  document.documentElement.classList.toggle("has-folder-path", !!state.currentPath);
+  const hasRealFolderPath = !!state.currentPath && !isVirtualRoot(state.category, state.currentPath);
+  document.body.classList.toggle("has-folder-path", hasRealFolderPath);
+  document.documentElement.classList.toggle("has-folder-path", hasRealFolderPath);
 
   // Clear previous content
   chipContainer.innerHTML = "";
@@ -2851,7 +2973,7 @@ function renderFolderContextPanel(items = []) {
   const panel = document.getElementById("folder-context-panel");
   if (!panel) return;
 
-  if (!state.currentPath || isIndexBucketFolder(state.currentPath)) {
+  if (!state.currentPath || isIndexBucketFolder(state.currentPath) || isVirtualRoot(state.category, state.currentPath)) {
     state.folderContextPrimaryItem = null;
     panel.classList.add("hidden");
     panel.innerHTML = "";
@@ -3195,6 +3317,7 @@ function renderGrid(container, items, isFolderCategory = false, isAppend = false
     !isAppend &&
     (state.category === "movie" || movieLikePath) &&
     !!state.currentPath &&
+    !isVirtualRoot(state.category, state.currentPath) &&
     !!state.folderContextPrimaryItem;
   const useEpisodeButtonMode =
     !isAppend &&
@@ -3204,7 +3327,8 @@ function renderGrid(container, items, isFolderCategory = false, isAppend = false
       animationPathHint ||
       (hasEpisodeLikeStructure && !movieLikePath)
     ) &&
-    !!state.currentPath;
+    !!state.currentPath &&
+    !isVirtualRoot(state.category, state.currentPath);
 
   const useFolderActionPanelMode = useSinglePlayButtonMode || useEpisodeButtonMode;
   const preserveFolderActionMode =
@@ -3239,7 +3363,6 @@ function renderGrid(container, items, isFolderCategory = false, isAppend = false
       <button type="button" class="folder-play-single-btn folder-context-play-btn" id="folder-play-single-btn" ${canPlay ? '' : 'disabled'}>
         <span class="folder-play-single-icon">▶</span>
         <span class="folder-play-single-label">영상보기</span>
-        <span class="folder-play-single-title">${title}</span>
       </button>
       ${isAnimationActions ? `
         <button type="button" class="folder-play-single-btn folder-episode-list-btn" id="folder-episode-list-btn">
@@ -4002,6 +4125,13 @@ function hideTrickplayOverlay() {
   overlay.classList.add("hidden");
 }
 
+function armTrickplayAutoHide() {
+  if (trickplayHideTimer) {
+    clearTimeout(trickplayHideTimer);
+  }
+  trickplayHideTimer = setTimeout(() => hideTrickplayOverlay(), TRICKPLAY_HIDE_MS);
+}
+
 function formatClock(totalSeconds) {
   const sec = Math.max(0, Math.floor(Number(totalSeconds) || 0));
   const h = Math.floor(sec / 3600);
@@ -4080,14 +4210,8 @@ async function showTrickplayAt(seconds) {
   if (timeEl) timeEl.textContent = formatClock(item.t ?? seconds);
   overlay.classList.remove("hidden");
 
-  // While user is in pending seek mode (Left/Right steps), keep trickplay visible.
-  if (trickplayHideTimer) {
-    clearTimeout(trickplayHideTimer);
-    trickplayHideTimer = null;
-  }
-  if (Number(state.nativeSeekPendingSteps || 0) === 0) {
-    trickplayHideTimer = setTimeout(() => hideTrickplayOverlay(), TRICKPLAY_HIDE_MS);
-  }
+  // Always auto-hide when there is no further input for TRICKPLAY_HIDE_MS.
+  armTrickplayAutoHide();
 }
 
 function choosePosterUrl({ item, width = 640, metaPoster = "", folderPath = "", parentFolderPath = "" } = {}) {
@@ -4337,6 +4461,31 @@ function setMoviePreviewRailVisible(active) {
   }
 }
 
+function getMovieGenreRailDefs() {
+  return [
+    { bucket: "액션", rail: ui.movieGenreActionRail, track: ui.movieGenreActionTrack },
+    { bucket: "스릴러", rail: ui.movieGenreThrillerRail, track: ui.movieGenreThrillerTrack },
+    { bucket: "로맨스", rail: ui.movieGenreRomanceRail, track: ui.movieGenreRomanceTrack },
+    { bucket: "코미디", rail: ui.movieGenreComedyRail, track: ui.movieGenreComedyTrack },
+  ];
+}
+
+function setMovieGenreRailsVisible(active) {
+  const defs = getMovieGenreRailDefs();
+  defs.forEach(({ bucket, rail, track }) => {
+    if (rail) rail.classList.toggle("hidden", !active);
+    if (!active && track) track.innerHTML = "";
+    const s = state.movieGenreRails?.[bucket];
+    if (s && !active) {
+      s.offset = 0;
+      s.hasMore = true;
+      s.loading = false;
+      s.seenKeys.clear();
+      s.itemMap.clear();
+    }
+  });
+}
+
 function setAnimationRailVisible(active) {
   if (!ui.animationRail) return;
   ui.animationRail.classList.toggle("hidden", !active);
@@ -4482,6 +4631,7 @@ function markLeftAnchorCard(trackEl, cardEl, options = {}) {
     const cards = trackEl.querySelectorAll(".movie-preview-card");
     cards.forEach((c) => c.classList.remove("is-left-anchor"));
     fixed.classList.add("is-left-anchor");
+    if (trackEl === ui.moviePreviewTrack) updateMoviePreviewMetaFromCard(fixed);
     if (trackEl === ui.animationTrack) updateAnimationPreviewMetaFromCard(fixed);
     return;
   }
@@ -4493,9 +4643,11 @@ function markLeftAnchorCard(trackEl, cardEl, options = {}) {
   if (cardEl) {
     cardEl.classList.add("is-left-anchor");
     cardEl.dataset.anchorFixed = "1";
+    if (trackEl === ui.moviePreviewTrack) updateMoviePreviewMetaFromCard(cardEl);
     if (trackEl === ui.animationTrack) updateAnimationPreviewMetaFromCard(cardEl);
-  } else if (trackEl === ui.animationTrack) {
-    updateAnimationPreviewMetaFromCard(null);
+  } else {
+    if (trackEl === ui.moviePreviewTrack) updateMoviePreviewMetaFromCard(null);
+    if (trackEl === ui.animationTrack) updateAnimationPreviewMetaFromCard(null);
   }
 }
 
@@ -4548,6 +4700,43 @@ function getPreviewMapForTrack(track) {
   if (track === ui.animationTrack) return state.animationPreviewItemMap;
   if (track === ui.dramaTrack) return state.dramaPreviewItemMap;
   return null;
+}
+
+function updateMoviePreviewMetaFromCard(card) {
+  const box = ui.moviePreviewMeta;
+  if (!box) return;
+  if (!card) {
+    box.classList.add("hidden");
+    return;
+  }
+
+  const item = getPreviewItemByTrackCard(ui.moviePreviewTrack, card);
+  if (!item) {
+    box.classList.add("hidden");
+    return;
+  }
+
+  const title = cleanMediaTitle(item?.meta_title || item?.title || item?.folder_name || item?.name || "Untitled");
+  const year = String(item?.year || "").trim();
+  const quality = (() => {
+    const hay = String(item?.name || item?.path || "").toLowerCase();
+    const m = hay.match(/\b(2160p|1080p|720p|4k|uhd|x265|hevc|x264|h\.?264|h\.?265)\b/i);
+    return m ? String(m[1]).toUpperCase().replace("UH D", "UHD") : "";
+  })();
+  const subtitleParts = [];
+  if (year) subtitleParts.push(year);
+  if (quality) subtitleParts.push(quality);
+  if (subtitleParts.length === 0) subtitleParts.push("MOVIE");
+  const subtitle = subtitleParts.join(" · ");
+  const summary = String(item?.meta_summary || item?.summary || item?.desc || "").trim();
+
+  const titleEl = box.querySelector(".rail-focus-title");
+  const subtitleEl = box.querySelector(".rail-focus-subtitle");
+  const summaryEl = box.querySelector(".rail-focus-summary");
+  if (titleEl) titleEl.textContent = title;
+  if (subtitleEl) subtitleEl.textContent = subtitle;
+  if (summaryEl) summaryEl.textContent = summary || " ";
+  box.classList.remove("hidden");
 }
 
 function updateAnimationPreviewMetaFromCard(card) {
@@ -4719,7 +4908,7 @@ function clearPreviewRailSkeleton(track) {
 
 async function loadMoviePreviewRail(append = false) {
   if (!ui.moviePreviewRail || !ui.moviePreviewTrack) return;
-  if (!!state.currentPath) return;
+  if (!!state.currentPath && !isVirtualRoot("movie", state.currentPath)) return;
   if (state.moviePreviewLoading) return;
   if (append && !state.moviePreviewHasMore) return;
 
@@ -4875,9 +5064,200 @@ async function loadMoviePreviewRail(append = false) {
   }
 }
 
+async function loadMovieGenreRails() {
+  const defs = getMovieGenreRailDefs();
+  for (const { bucket, rail, track } of defs) {
+    await loadSingleMovieGenreRail(bucket, rail, track);
+  }
+}
+
+async function loadSingleMovieGenreRail(bucket, railEl, trackEl) {
+  if (!railEl || !trackEl) return;
+  if (!!state.currentPath && !isVirtualRoot("movie", state.currentPath)) return;
+  const railState = state.movieGenreRails?.[bucket];
+  if (!railState || railState.loading) return;
+
+  railState.loading = true;
+  showPreviewRailSkeleton(trackEl, 8);
+  railState.seenKeys.clear();
+  railState.itemMap.clear();
+  railState.offset = 0;
+  railState.hasMore = true;
+
+  try {
+    const movieGenreIdMap = {
+      "액션": "28",
+      "스릴러": "53",
+      "로맨스": "10749",
+      "코미디": "35",
+    };
+    const genreId = movieGenreIdMap[bucket] || "";
+    const params = new URLSearchParams({
+      bucket: "전체",
+      genre_id: genreId,
+      sort_by: "date",
+      sort_order: "desc",
+      source_id: String(state.sourceId ?? 0),
+      limit: String(ANIMATION_PREVIEW_FETCH_LIMIT),
+      offset: "0",
+    });
+    const data = await gdsFetch(`movie_genre?${params.toString()}`);
+    if (!data || data.ret !== "success") {
+      railEl.classList.add("hidden");
+      return;
+    }
+    const list = data.list || data.data || [];
+    const videoExtensions = [".mp4", ".mkv", ".avi", ".mov", ".webm", ".m4v", ".ts"];
+    const dirCandidates = list.filter((item) => item && item.is_dir && item.path);
+    const fileCandidates = list.filter((item) => {
+      if (!item || item.is_dir || !item.path) return false;
+      const lower = String(item.path).toLowerCase();
+      if (!videoExtensions.some((ext) => lower.endsWith(ext))) return false;
+      const ext = getPathExtension(item.path);
+      return PREVIEW_SOURCE_EXTS.has(ext);
+    });
+
+    const getBaseName = (p) => {
+      const parts = String(p || "").split("/").filter(Boolean);
+      return parts.length ? parts[parts.length - 1] : "";
+    };
+    const folderMap = new Map();
+    // 1) Directories from API are already "work units".
+    dirCandidates.forEach((item) => {
+      const folderPath = String(item.path || "").replace(/^\/+/, "");
+      if (!folderPath) return;
+      const identity = buildMoviePreviewIdentity(item, folderPath);
+      const groupKey = identity.groupKey || folderPath;
+      const prev = folderMap.get(groupKey);
+      if (!prev) {
+        folderMap.set(groupKey, { folderPath, item, identity, isDirSeed: true });
+        return;
+      }
+      const nowTs = parseMtimeToEpoch(item.mtime);
+      const prevTs = parseMtimeToEpoch(prev.item?.mtime);
+      if (nowTs > prevTs) folderMap.set(groupKey, { folderPath, item, identity, isDirSeed: true });
+    });
+
+    // 2) File candidates are collapsed by parent folder as fallback.
+    fileCandidates.forEach((item) => {
+      const folderPath = String(getParentPath(item.path) || "").replace(/^\/+/, "");
+      if (!folderPath) return;
+      const identity = buildMoviePreviewIdentity(item, folderPath);
+      const groupKey = identity.groupKey;
+      const prev = folderMap.get(groupKey);
+      if (!prev) {
+        folderMap.set(groupKey, { folderPath, item, identity, isDirSeed: false });
+        return;
+      }
+      const nowTs = parseMtimeToEpoch(item.mtime);
+      const prevTs = parseMtimeToEpoch(prev.item?.mtime);
+      // Prefer directory seed if present; otherwise newer file wins.
+      if (prev.isDirSeed) return;
+      if (nowTs > prevTs) folderMap.set(groupKey, { folderPath, item, identity, isDirSeed: false });
+    });
+
+    const groupedMovies = Array.from(folderMap.values())
+      .sort((a, b) => parseMtimeToEpoch(b.item?.mtime) - parseMtimeToEpoch(a.item?.mtime));
+
+    const frag = document.createDocumentFragment();
+    let added = 0;
+    for (const { folderPath, item, identity } of groupedMovies) {
+      const folderKey = `folder:${String(folderPath || "").toLowerCase()}`;
+      if (railState.seenKeys.has(folderKey)) continue;
+      railState.seenKeys.add(folderKey);
+
+      let folderMeta = findNearestFolderMeta(folderPath) || null;
+      if (!folderMeta || !(folderMeta.meta_title || folderMeta.title || folderMeta.meta_poster || folderMeta.poster || folderMeta.album_info?.posters)) {
+        const hydrated = await hydrateFolderMetaFromParent(folderPath, item?.source_id);
+        if (hydrated) folderMeta = hydrated;
+      }
+      const parentPathForMeta = getParentPath(folderPath);
+      let parentMeta = findNearestFolderMeta(parentPathForMeta) || null;
+      if (!parentMeta && parentPathForMeta) parentMeta = await hydrateFolderMetaFromParent(parentPathForMeta, item?.source_id);
+
+      const displayTitle = resolveMoviePreviewTitle(identity, item, folderMeta, parentMeta);
+      const yearText = String(folderMeta?.year || parentMeta?.year || item?.year || "").trim();
+      const subtitle = yearText || "MOVIE";
+      const previewItem = {
+        ...item,
+        folder_path: folderPath,
+        folder_name: getBaseName(folderPath),
+        meta_title: displayTitle,
+        title: displayTitle,
+        meta_summary: folderMeta?.meta_summary || folderMeta?.summary || folderMeta?.desc || item?.meta_summary || item?.summary || item?.desc || "",
+        summary: folderMeta?.summary || folderMeta?.desc || item?.summary || item?.desc || "",
+        desc: folderMeta?.desc || item?.desc || "",
+        meta_poster:
+          folderMeta?.meta_poster ||
+          folderMeta?.poster ||
+          folderMeta?.album_info?.posters ||
+          parentMeta?.meta_poster ||
+          parentMeta?.poster ||
+          parentMeta?.album_info?.posters ||
+          item?.meta_poster ||
+          item?.poster ||
+          "",
+      };
+
+      const poster = choosePosterUrl({
+        item: previewItem,
+        width: 540,
+        metaPoster: previewItem?.meta_poster || "",
+        folderPath: identity.isBucketFolder ? "" : folderPath,
+        parentFolderPath: identity.isBucketFolder ? "" : parentPathForMeta,
+      });
+
+      const card = document.createElement("button");
+      card.type = "button";
+      card.className = "movie-preview-card";
+      card.setAttribute("tabindex", "0");
+      card.dataset.previewEnabled = "0";
+      const previewKey = `${bucket}:${folderKey}_${added}`;
+      card.dataset.previewKey = previewKey;
+      railState.itemMap.set(previewKey, previewItem);
+      card.innerHTML = `
+        <div class="movie-preview-media">
+          <img class="movie-preview-poster" src="${poster}" alt="${displayTitle}" loading="lazy">
+          <video class="movie-preview-video" playsinline webkit-playsinline disablepictureinpicture disableremoteplayback controlslist="nodownload noplaybackrate nofullscreen noremoteplayback" loop preload="none"></video>
+          <div class="movie-preview-gradient"></div>
+        </div>
+        <div class="movie-preview-title">${displayTitle}</div>
+        <div class="movie-preview-subtitle">${subtitle}</div>
+      `;
+      card.addEventListener("click", () => {
+        if (previewItem?.is_dir) {
+          state.currentPath = previewItem.path || "";
+          state.pathStack = state.currentPath ? [state.currentPath] : [];
+          state.query = "";
+          loadLibrary(true);
+          return;
+        }
+        playVideo(previewItem);
+      });
+      frag.appendChild(card);
+      added += 1;
+    }
+
+    trackEl.innerHTML = "";
+    if (added > 0) {
+      trackEl.appendChild(frag);
+      railEl.classList.remove("hidden");
+    } else {
+      railEl.classList.add("hidden");
+    }
+    clearPreviewRailSkeleton(trackEl);
+  } catch (err) {
+    clearPreviewRailSkeleton(trackEl);
+    railEl.classList.add("hidden");
+    console.warn(`[PREVIEW] movie genre rail(${bucket}) load failed:`, err?.message || err);
+  } finally {
+    railState.loading = false;
+  }
+}
+
 async function loadAnimationRail(append = false) {
   if (!ui.animationRail || !ui.animationTrack) return;
-  if (!!state.currentPath) return;
+  if (!!state.currentPath && !isVirtualRoot("animation", state.currentPath)) return;
   if (state.animationRailLoading) return;
   if (append && !state.animationRailHasMore) return;
 
@@ -5067,7 +5447,7 @@ async function loadAnimationRail(append = false) {
 
 async function loadDramaRail(append = false) {
   if (!ui.dramaRail || !ui.dramaTrack) return;
-  if (!!state.currentPath) return;
+  if (!!state.currentPath && !isVirtualRoot("tv_show", state.currentPath)) return;
   if (state.dramaRailLoading) return;
   if (append && !state.dramaRailHasMore) return;
 
@@ -6492,6 +6872,7 @@ function renderFavorites() {
   if (grid) grid.innerHTML = '<div style="grid-column:1/-1; padding:100px 0; text-align:center; color:var(--text-secondary);"><i data-lucide="heart" style="width:48px;height:48px;margin-bottom:15px; opacity:0.3;"></i><p>내가 찜한 리스트가 비어 있습니다.</p></div>';
   if (hero) hero.style.display = "none"; // Hide hero in favorites view
   setMoviePreviewRailVisible(false);
+  setMovieGenreRailsVisible(false);
   setAnimationRailVisible(false);
   setDramaRailVisible(false);
   if (window.lucide) window.lucide.createIcons();
@@ -6546,6 +6927,55 @@ window.handleAndroidBack = function () {
 // [NEW] Android TV Remote (Spatial) Navigation Manager
 function setupRemoteNavigation() {
   console.log("[REMOTE] Initializing spatial navigation...");
+
+  const getOrderedMovieRailTracks = () => {
+    const tracks = [
+      ui.moviePreviewTrack,
+      ui.movieGenreActionTrack,
+      ui.movieGenreThrillerTrack,
+      ui.movieGenreRomanceTrack,
+      ui.movieGenreComedyTrack,
+    ].filter(Boolean);
+    return tracks.filter((track) => {
+      const rail = track.closest(".movie-preview-rail");
+      if (rail && rail.classList.contains("hidden")) return false;
+      return track.querySelector(".movie-preview-card");
+    });
+  };
+
+  const focusMovieRailByStep = (currentTrack, delta) => {
+    const tracks = getOrderedMovieRailTracks();
+    if (!tracks.length) return false;
+    const curIdx = Math.max(0, tracks.indexOf(currentTrack));
+    const nextIdx = curIdx + delta;
+    if (nextIdx < 0 || nextIdx >= tracks.length) return false;
+    const targetTrack = tracks[nextIdx];
+    let fixed = targetTrack.querySelector('.movie-preview-card[data-anchor-fixed="1"]');
+    if (!fixed) {
+      const first = targetTrack.querySelector(".movie-preview-card");
+      if (!first) return false;
+      markLeftAnchorCard(targetTrack, first, { force: true });
+      fixed = first;
+    }
+    fixed.focus({ preventScroll: true });
+    setTimeout(() => triggerLeftmostPreviewForTrack(targetTrack, true), 40);
+    return true;
+  };
+
+  const getMovieRailTrackFromElement = (el) => {
+    if (!el || !el.closest) return null;
+    const direct = el.closest(
+      "#movie-preview-track, #movie-genre-action-track, #movie-genre-thriller-track, #movie-genre-romance-track, #movie-genre-comedy-track",
+    );
+    if (direct) return direct;
+    const inRail = el.closest(
+      "#movie-preview-rail, #movie-genre-action-rail, #movie-genre-thriller-rail, #movie-genre-romance-rail, #movie-genre-comedy-rail",
+    );
+    if (!inRail) return null;
+    return inRail.querySelector(
+      "#movie-preview-track, #movie-genre-action-track, #movie-genre-thriller-track, #movie-genre-romance-track, #movie-genre-comedy-track",
+    );
+  };
 
   window.addEventListener("keydown", (e) => {
     const key = e.key;
@@ -6700,13 +7130,45 @@ function setupRemoteNavigation() {
         return;
       }
 
+      // Movie rail deterministic vertical routing:
+      // preview -> action -> thriller -> romance -> comedy -> grid(first card)
+      if (state.category === "movie" && (key === "ArrowDown" || key === "ArrowUp")) {
+        const movieTrack = getMovieRailTrackFromElement(current);
+        if (movieTrack) {
+          const movedRail = focusMovieRailByStep(movieTrack, key === "ArrowDown" ? 1 : -1);
+          if (movedRail) {
+            e.preventDefault();
+            return;
+          }
+          if (key === "ArrowDown") {
+            const firstGridCard = document.querySelector("#library-grid .card");
+            if (firstGridCard) {
+              firstGridCard.focus({ preventScroll: true });
+              e.preventDefault();
+              return;
+            }
+          }
+          if (key === "ArrowUp") {
+            const heroPlayBtn = document.querySelector(".hero-slide.active .btn-play-hero");
+            const fallback = document.querySelector(".tab.active, .tab");
+            (heroPlayBtn || fallback)?.focus?.();
+            e.preventDefault();
+            return;
+          }
+        }
+      }
+
       const previewTracks = [ui.moviePreviewTrack, ui.animationTrack, ui.dramaTrack].filter(Boolean);
-      if (key === "ArrowLeft" || key === "ArrowRight") {
+      const isFocusInPreviewRail = !!(
+        current &&
+        current.closest &&
+        current.closest(".movie-preview-rail, #movie-preview-track, #animation-track, #drama-track, .movie-preview-card")
+      );
+      if ((key === "ArrowLeft" || key === "ArrowRight") && isFocusInPreviewRail) {
         const forcedTrack = previewTracks.find((track) => {
           if (!track) return false;
           if (track.parentElement && track.parentElement.classList.contains("hidden")) return false;
-          const anyCard = track.querySelector(".movie-preview-card");
-          return !!anyCard;
+          return track.contains(current);
         }) || null;
         if (forcedTrack) {
           const cards = Array.from(forcedTrack.querySelectorAll(".movie-preview-card"));
@@ -6763,7 +7225,7 @@ function setupRemoteNavigation() {
       }) || null;
 
       // Remote UX: if no focused preview card but a preview rail is visible, still drive the first visible rail.
-      if (!activePreviewTrack && (key === "ArrowLeft" || key === "ArrowRight")) {
+      if (!activePreviewTrack && (key === "ArrowLeft" || key === "ArrowRight") && isFocusInPreviewRail) {
         activePreviewTrack = previewTracks.find((track) => {
           if (!track) return false;
           if (track.parentElement && track.parentElement.classList.contains("hidden")) return false;
@@ -6777,6 +7239,15 @@ function setupRemoteNavigation() {
         const fixed = activePreviewTrack.querySelector('.movie-preview-card[data-anchor-fixed="1"]');
         const fixedIdx = fixed ? cards.indexOf(fixed) : -1;
         if (fixedIdx >= 0) {
+          // Movie category rail UX:
+          // ArrowDown/ArrowUp moves across rails in fixed order.
+          if (state.category === "movie" && (key === "ArrowDown" || key === "ArrowUp")) {
+            const movedRail = focusMovieRailByStep(activePreviewTrack, key === "ArrowDown" ? 1 : -1);
+            if (movedRail) {
+              e.preventDefault();
+              return;
+            }
+          }
           if (key === "ArrowLeft" || key === "ArrowRight") {
             const delta = key === "ArrowRight" ? 1 : -1;
             const changed = rotateCardContentsKeepAnchor(activePreviewTrack, fixed, delta);
@@ -7225,6 +7696,7 @@ function setupPremiumOSC() {
   bind(ui.btnOscFullscreen, "Fullscreen", async (e) => {
     e.stopPropagation();
     if (state.nativeFullscreenTransition) return;
+    const opSeq = ++state.fullscreenOpSeq;
     const now = Date.now();
     if (now - (state.lastFullscreenToggleAt || 0) < 1800) {
       console.warn("[PLAYER] Fullscreen click ignored (cooldown)");
@@ -7243,6 +7715,11 @@ function setupPremiumOSC() {
         setNativeTransitionMask(true);
         const currentFs = await invoke("native_get_fullscreen").catch(() => false);
         const targetFs = !currentFs;
+        if (opSeq !== state.fullscreenOpSeq) return;
+        if (!currentFs) {
+          state.lastWindowedInnerWidth = window.innerWidth || 0;
+          state.lastWindowedInnerHeight = window.innerHeight || 0;
+        }
 
         // Pre-size once before parent fullscreen transition to reduce first jump.
         if (state.isNativeActive) {
@@ -7254,16 +7731,13 @@ function setupPremiumOSC() {
         const reached = await waitForNativeFullscreenState(invoke, targetFs, 1500);
         if (!reached) console.warn("[PLAYER] set_fullscreen timed out.");
         const finalFs = await invoke("native_get_fullscreen").catch(() => currentFs);
+        if (opSeq !== state.fullscreenOpSeq) return;
         applyWindowFullscreenClass(finalFs);
         if (!reached || finalFs !== targetFs) {
           console.warn("[PLAYER] Fullscreen state mismatch after request", { targetFs, finalFs });
         }
-        // Embedded Intel path: keep mpv windowed and only resize container.
-        if (state.nativeArch === "x86_64") {
-          await invoke("native_set_mpv_fullscreen", { fullscreen: false }).catch(() => {});
-        } else {
-          await invoke("native_set_mpv_fullscreen", { fullscreen: !!finalFs }).catch(() => {});
-        }
+        // Keep embedded MPV windowed always; parent window fullscreen drives final size.
+        await invoke("native_set_mpv_fullscreen", { fullscreen: false }).catch(() => {});
         await stabilizeNativeFullscreenResize(invoke, finalFs);
 
         console.log("[PLAYER] Native Fullscreen Set:", finalFs);
@@ -7272,22 +7746,19 @@ function setupPremiumOSC() {
           await prefitNativeContainerForFullscreen(invoke, targetFs);
         }
         // 2) Recreate once after bounds are stabilized.
-        // Intel Macs are more stable with resize-only during fullscreen transitions.
+        // This is the most reliable path for embedded mpv sizing across mac variants.
         if (state.isNativeActive) {
-          await new Promise((r) => setTimeout(r, targetFs ? 140 : 120));
-          if (state.nativeArch === "x86_64") {
-            if (targetFs) {
-              console.log("[PLAYER] Intel fullscreen-enter: resize-only");
-              await invoke("resize_native_player", {}).catch(() => {});
-            } else {
-              console.log("[PLAYER] Intel fullscreen-exit: resize + conditional recreate");
-              state.fullscreenEnterRepairAttempted = false;
-              await invoke("resize_native_player", {}).catch(() => {});
-              await maybeRecreateOnFullscreenExitIntel(invoke).catch(() => {});
-            }
-          } else {
-            await recreateNativePlayerAfterResize(targetFs ? "fullscreen-enter" : "fullscreen-exit");
+          await new Promise((r) => setTimeout(r, targetFs ? 140 : 220));
+          state.fullscreenEnterRepairAttempted = false;
+          await invoke("resize_native_player", {}).catch(() => {});
+          if (!targetFs) {
+            await waitForWindowedBoundsSettle(2200);
           }
+          await maybeRecreateOnFullscreenMismatch(
+            invoke,
+            targetFs ? "fullscreen-enter" : "fullscreen-exit",
+            !targetFs
+          );
         } else {
           setTimeout(() => setNativeTransitionMask(false), 160);
         }
@@ -7334,8 +7805,7 @@ function setupPremiumOSC() {
         inv("native_get_fullscreen")
           .then((isFs) => {
             applyWindowFullscreenClass(isFs);
-            const mpvFs = state.nativeArch === "x86_64" ? false : !!isFs;
-            return inv("native_set_mpv_fullscreen", { fullscreen: mpvFs })
+            return inv("native_set_mpv_fullscreen", { fullscreen: false })
               .catch(() => {})
               .then(() => stabilizeNativeFullscreenResize(inv, !!isFs));
           })

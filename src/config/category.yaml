@@ -1,0 +1,102 @@
+# FlashPlex category rules (human-editable)
+# Path base is logical GDS path (e.g. VIDEO/...)
+#
+# Notes:
+# - sources: merged search roots for the virtual category
+# - include_keywords: optional "any-match" filter (name/path)
+# - exclude_keywords: optional exclude filter (name/path)
+# - exclude_bucket_folders: hide index buckets like 가/나/다/0Z
+# - exclude_season_folders: hide Season/시즌 folders in aggregate view
+# - sort_priority: lower number = shown first
+
+version: 1
+
+tv_show:
+  domestic_virtual:
+    default: 방송중
+    categories:
+      - id: 방송중
+        label: 방송중
+        sources:
+          - VIDEO/방송중
+        include_keywords: [방송중, 방영중, on air, airing]
+        exclude_keywords: []
+        exclude_bucket_folders: true
+        exclude_season_folders: true
+        sort_priority: 0
+
+      - id: 완결
+        label: 완결
+        sources:
+          - VIDEO/국내TV
+        include_keywords: []
+        exclude_keywords: [방송중, 방영중, on air, airing]
+        exclude_bucket_folders: true
+        exclude_season_folders: true
+        sort_priority: 1
+
+      - id: 드라마
+        label: 드라마
+        sources:
+          - VIDEO/국내TV/드라마
+          - VIDEO/방송중/드라마
+        include_keywords: [드라마, drama]
+        exclude_keywords: []
+        exclude_bucket_folders: true
+        exclude_season_folders: true
+        sort_priority: 2
+
+      - id: 예능
+        label: 예능
+        sources:
+          - VIDEO/국내TV/예능
+          - VIDEO/방송중/예능
+        include_keywords: [예능, variety]
+        exclude_keywords: []
+        exclude_bucket_folders: true
+        exclude_season_folders: true
+        sort_priority: 3
+
+      - id: 다큐
+        label: 다큐멘터리
+        sources:
+          - VIDEO/국내TV/다큐멘터리
+          - VIDEO/방송중/다큐멘터리
+        include_keywords: [다큐, documentary]
+        exclude_keywords: []
+        exclude_bucket_folders: true
+        exclude_season_folders: true
+        sort_priority: 4
+
+      - id: 시사
+        label: 시사
+        sources:
+          - VIDEO/국내TV/시사
+          - VIDEO/방송중/시사
+        include_keywords: [시사]
+        exclude_keywords: []
+        exclude_bucket_folders: true
+        exclude_season_folders: true
+        sort_priority: 5
+
+      - id: 뉴스
+        label: 뉴스
+        sources:
+          - VIDEO/국내TV/뉴스
+          - VIDEO/방송중/뉴스
+        include_keywords: [뉴스, news]
+        exclude_keywords: []
+        exclude_bucket_folders: true
+        exclude_season_folders: true
+        sort_priority: 6
+
+      - id: 기타
+        label: 기타
+        sources:
+          - VIDEO/국내TV
+        include_keywords: []
+        exclude_keywords: [드라마, 예능, 다큐, 시사, 뉴스]
+        exclude_bucket_folders: true
+        exclude_season_folders: true
+        sort_priority: 7
+
