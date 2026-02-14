@@ -4,6 +4,115 @@
 //   window.__TAURI__ = window.__TAURI_INTERNALS__; // Attempt polyfill if needed
 // }
 
+// Platform Detection
+const isAndroid = /Android/i.test(navigator.userAgent);
+const isIOS = /iPhone|iPad|iPod/i.test(navigator.userAgent);
+const isDesktop = !isAndroid && !isIOS;
+const DEBUG_LOG = localStorage.getItem("flashplex_debug_logs") === "1";
+
+// [PHASE 1-3 OPTIMIZATION] Utility functions and LRU Cache class MUST be defined before state
+const dlog = (...args) => { if (DEBUG_LOG) console.log(...args); };
+const dwarn = (...args) => { if (DEBUG_LOG) console.warn(...args); };
+
+const debounce = (fn, delay) => {
+  let timeout;
+  return (...args) => {
+    clearTimeout(timeout);
+    timeout = setTimeout(() => fn.apply(this, args), delay);
+  };
+};
+
+const throttle = (fn, limit) => {
+  let inThrottle;
+  return (...args) => {
+    if (!inThrottle) {
+      fn.apply(this, args);
+      inThrottle = true;
+      setTimeout(() => inThrottle = false, limit);
+    }
+  };
+};
+
+const raf = {
+  batched: new Set(),
+  schedule(callback) {
+    if (this.batched.has(callback)) return;
+    this.batched.add(callback);
+    requestAnimationFrame(() => {
+      this.batched.forEach(cb => {
+        try {
+          cb();
+        } catch (e) {
+          console.error('[RAF] Callback error:', e);
+        }
+      });
+      this.batched.clear();
+    });
+  }
+};
+
+const rafDebounce = (fn) => {
+  let rafId = null;
+  return (...args) => {
+    cancelAnimationFrame(rafId);
+    rafId = requestAnimationFrame(() => fn.apply(this, args));
+  };
+};
+
+// [PHASE 1] LRU Cache implementation to prevent unbounded growth
+class LRUCache {
+  constructor(maxSize = 100, name = "LRUCache") {
+    this.maxSize = maxSize;
+    this.name = name;
+    this.cache = new Map();
+    this.hits = 0;
+    this.misses = 0;
+  }
+
+  get(key) {
+    if (!this.cache.has(key)) {
+      this.misses++;
+      return null;
+    }
+    this.hits++;
+    const value = this.cache.get(key);
+    this.cache.delete(key);
+    this.cache.set(key, value);
+    return value;
+  }
+
+  set(key, value) {
+    if (this.cache.has(key)) {
+      this.cache.delete(key);
+    } else if (this.cache.size >= this.maxSize) {
+      const oldestKey = this.cache.keys().next().value;
+      if (oldestKey) {
+        this.cache.delete(oldestKey);
+        dlog(`[${this.name}] Evicted: ${oldestKey} (size: ${this.cache.size}/${this.maxSize})`);
+      }
+    }
+    this.cache.set(key, value);
+  }
+
+  has(key) {
+    return this.cache.has(key);
+  }
+
+  delete(key) {
+    return this.cache.delete(key);
+  }
+
+  clear() {
+    const count = this.cache.size;
+    this.cache.clear();
+    dlog(`[${this.name}] Cleared ${count} entries (hits: ${this.hits}, misses: ${this.misses})`);
+  }
+
+  get size() {
+    return this.cache.size;
+  }
+}
+
 // State Management (Hardcoded for testing as requested)
 const state = {
   serverUrl: "https://music.yommi.mywire.org",
@@ -45,7 +154,7 @@ const state = {
   freshRequestSeq: 0,
   freshAbortController: null,
   episodeMetaReqSeq: 0,
-  episodeMetaCache: new Map(),
+  episodeMetaCache: new LRUCache(500, "episodeMetaCache"),
   nativeFullscreenTransition: false,
   nativeSeekPreviewPos: null,
   nativeSeekPreviewTs: 0,
@@ -81,8 +190,8 @@ const state = {
   dramaRailLoading: false,
   dramaRailSeenKeys: new Set(),
   dramaPreviewItemMap: new Map(),
-  dramaPreviewCache: new Map(),
-  apiResponseCache: new Map(),
+  dramaPreviewCache: new LRUCache(200, "dramaPreviewCache"),
+  apiResponseCache: new LRUCache(180, "apiResponseCache"),
   apiCacheHits: 0,
   apiCacheMisses: 0,
   folderContextPrimaryItem: null,
@@ -97,14 +206,8 @@ const state = {
   playLaunchSeq: 0,
 };
 
-// Platform Detection
-const isAndroid = /Android/i.test(navigator.userAgent);
-const isIOS = /iPhone|iPad|iPod/i.test(navigator.userAgent);
-const isDesktop = !isAndroid && !isIOS;
-const DEBUG_LOG = localStorage.getItem("flashplex_debug_logs") === "1";
-const dlog = (...args) => { if (DEBUG_LOG) console.log(...args); };
-const dwarn = (...args) => { if (DEBUG_LOG) console.warn(...args); };
-const folderMetaCache = new Map();
+// Additional constants and variables (moved from duplicates above)
+const folderMetaCache = new LRUCache(1000, "folderMetaCache");
 const folderMetaHydrateReq = new Map();
 let nativeStatePollTimer = null;
 let infiniteObserver = null;
@@ -145,11 +248,46 @@ const NEXT_EPISODE_VIDEO_EXTS = new Set(["mp4", "mkv", "avi", "mov", "webm", "m4
 let animationRailAutoSlideTimer = null;
 let dramaRailAutoSlideTimer = null;
 let dramaRailUserInteracting = false;
-const trickplayManifestCache = new Map();
+const trickplayManifestCache = new LRUCache(50, "trickplayManifestCache");
 let trickplayHideTimer = null;
 let openingSkipCache = null;
 let apiCacheDbPromise = null;
+let clockInterval = null;
 const deferredPlayKickoff = new WeakSet();
+
+// [PHASE 3] Optimized Lucide icon rendering with caching
+let iconRenderPending = false;
+const iconsCache = new Map();
+
+function optimizedCreateIcons(container = document.body) {
+  if (!window.lucide) return;
+
+  // Use RAF to batch multiple calls within the same frame
+  if (iconRenderPending) return;
+  iconRenderPending = true;
+
+  raf.schedule(() => {
+    iconRenderPending = false;
+
+    // Only scan new/changed elements
+    const newElements = container.querySelectorAll('[data-lucide]:not([data-lucide-rendered])');
+
+    if (newElements.length === 0) return;
+
+    newElements.forEach(el => {
+      const iconName = el.getAttribute('data-lucide');
+      if (!iconName) return;
+
+      // Create icon
+      try {
+        lucide.createIcons({ root: el, name: iconName, attrs: ['class', 'width', 'height'] });
+        el.setAttribute('data-lucide-rendered', 'true');
+      } catch (e) {
+        console.warn('[ICON] Failed to render icon:', iconName, e);
+      }
+    });
+  });
+}
 
 function resetNativeSeekPending() {
   state.nativeSeekPendingSteps = 0;
@@ -1245,7 +1383,10 @@ async function maybeRecreateOnFullscreenMismatch(invoke, phase = "fullscreen", a
 }
 
 // [NEW] Shared logic for checking/selecting subs and updating badge with retry
+// [PHASE 1] Added sequence tracking to prevent timer leaks
+let subtitleCheckSeq = 0;
 async function checkAndSelectSubtitles(retries = 4) {
+  const currentSeq = ++subtitleCheckSeq;
   const invoke = getTauriInvoke();
   if (!invoke) return;
 
@@ -1286,8 +1427,13 @@ async function checkAndSelectSubtitles(retries = 4) {
     if (badge) badge.style.display = hasSelection ? "block" : "none";
 
     // Retry if no tracks found (maybe loading)
+    // [PHASE 1] Prevent timer leaks by checking sequence number
     if (retries > 0) {
-      setTimeout(() => checkAndSelectSubtitles(retries - 1), 2000); 
+      setTimeout(() => {
+        if (currentSeq === subtitleCheckSeq) {
+          checkAndSelectSubtitles(retries - 1);
+        }
+      }, 2000);
     }
     return hasSelection;
   } catch (e) {
@@ -1510,7 +1656,7 @@ window.addEventListener("DOMContentLoaded", () => {
 
   initElements();
   detectNativeArch();
-  if (window.lucide) lucide.createIcons();
+  if (window.lucide) optimizedCreateIcons();
 
   // Register robust global listeners
   document.addEventListener("keydown", unlockPreviewAutoplay, { once: true });
@@ -1635,6 +1781,15 @@ function switchView(viewName) {
   // [FIX] Reset scroll position on view switch
   const container = document.querySelector(".content-container");
   if (container) container.scrollTop = 0;
+
+  // [PHASE 1] Clear caches when leaving library view to prevent memory leaks
+  if (viewName !== "library") {
+    state.episodeMetaCache.clear();
+    state.dramaPreviewCache.clear();
+    folderMetaCache.clear();
+    trickplayManifestCache.clear();
+    dlog(`[PHASE 1] Cleared caches on view switch to: ${viewName}`);
+  }
 
   // [FIX] Initialize hero carousel when library view is shown
   if (viewName === "library") {
@@ -1860,28 +2015,21 @@ function buildApiCacheKey(baseUrl, endpoint, method, sourceId) {
 function apiCacheGet(key, ttlMs) {
   const entry = state.apiResponseCache.get(key);
   if (!entry) {
-    state.apiCacheMisses += 1;
+    state.apiCacheMisses++;
     return null;
   }
   const age = Date.now() - Number(entry.ts || 0);
   if (age > ttlMs) {
     state.apiResponseCache.delete(key);
-    state.apiCacheMisses += 1;
+    state.apiCacheMisses++;
     return null;
   }
-  // LRU touch
-  state.apiResponseCache.delete(key);
-  state.apiResponseCache.set(key, entry);
-  state.apiCacheHits += 1;
+  state.apiCacheHits++;
   return cloneCachePayload(entry.data);
 }
 
 function apiCacheSet(key, data) {
   if (!key) return;
-  if (state.apiResponseCache.size >= API_CACHE_MAX_ENTRIES) {
-    const oldestKey = state.apiResponseCache.keys().next().value;
-    if (oldestKey) state.apiResponseCache.delete(oldestKey);
-  }
   state.apiResponseCache.set(key, { ts: Date.now(), data: cloneCachePayload(data) });
 }
 
@@ -1969,6 +2117,13 @@ function clearApiResponseCache(reason = "manual") {
   state.apiCacheHits = 0;
   state.apiCacheMisses = 0;
   clearApiDiskCache().catch(() => {});
+
+  // [PHASE 1] Clear other unbounded caches
+  state.episodeMetaCache.clear();
+  state.dramaPreviewCache.clear();
+  folderMetaCache.clear();
+  trickplayManifestCache.clear();
+  dlog(`[PHASE 1] Cleared all unbounded caches on: ${reason}`);
 }
 
 function showCategorySubMenu(category, tabEl) {
@@ -3292,10 +3447,33 @@ function openEpisodeDrawer(rawItems = [], contextTitle = "회차 보기") {
   document.body.classList.add('episode-drawer-open');
   state.episodeDrawerOpen = true;
   const firstBtn = overlay.querySelector('.episode-drawer-item, #episode-drawer-close');
-  if (firstBtn) setTimeout(() => firstBtn.focus(), 0);
+  if (firstBtn) raf.schedule(() => firstBtn?.focus());
 }
 
 function renderGrid(container, items, isFolderCategory = false, isAppend = false) {
+  // [PHASE 2] Set up event delegation for grid cards (only once)
+  if (!container.hasAttribute("data-delegated")) {
+    container.setAttribute("data-delegated", "true");
+    container.addEventListener("click", (e) => {
+      const card = e.target.closest(".card[data-path]");
+      if (!card) return;
+
+      const itemKey = card.getAttribute("data-path");
+      const isCatRoot = !state.currentPath;
+      const item = state.library.find(i => getDedupKey(i, isCatRoot) === itemKey);
+
+      if (!item) return;
+
+      if (item.is_dir) {
+        state.pathStack.push(item.path);
+        state.currentPath = item.path;
+        loadLibrary();
+      } else {
+        playVideo(item);
+      }
+    });
+  }
+
   if (!isAppend) {
     container.innerHTML = "";
   }
@@ -3681,22 +3859,13 @@ function renderGrid(container, items, isFolderCategory = false, isAppend = false
       `;
     }
 
-
-    if (isFolder) {
-      card.addEventListener("click", () => {
-        state.pathStack.push(item.path);
-        state.currentPath = item.path;
-        loadLibrary();
-      });
-    } else {
-      card.addEventListener("click", () => playVideo(item));
-    }
+    // [PHASE 2] Individual card listeners removed - using event delegation at container level
     fragment.appendChild(card);
     newCards.push(card);
   });
   if (newCards.length > 0) container.appendChild(fragment);
 
-  if (window.lucide) lucide.createIcons();
+  if (window.lucide) optimizedCreateIcons();
 
   // [BATCH REVEAL + PLACEHOLDER] Keep cards visible first, then reveal viewport images together.
   if (newCards.length > 0) {
@@ -3785,15 +3954,16 @@ function renderGrid(container, items, isFolderCategory = false, isAppend = false
 
 // Search Logic
 function setupSearch() {
-  let timeout = null;
+  // [PHASE 3] Use shared debounce utility
+  const debouncedSearch = debounce((query) => performSearch(query), 600);
+
   ui.searchInput.addEventListener("input", (e) => {
     const query = e.target.value.trim();
     document.getElementById("search-placeholder").style.display = query
       ? "none"
       : "flex";
 
-    clearTimeout(timeout);
-    timeout = setTimeout(() => performSearch(query), 600);
+    debouncedSearch(query);
   });
 }
 
@@ -4926,6 +5096,18 @@ async function loadMoviePreviewRail(append = false) {
   if (state.moviePreviewLoading) return;
   if (append && !state.moviePreviewHasMore) return;
 
+  // [PHASE 2] Set up event delegation for movie preview rail (only once)
+  if (!ui.moviePreviewTrack.hasAttribute("data-delegated")) {
+    ui.moviePreviewTrack.setAttribute("data-delegated", "true");
+    ui.moviePreviewTrack.addEventListener("click", (e) => {
+      const card = e.target.closest(".movie-preview-card");
+      if (!card) return;
+      const previewKey = card.getAttribute("data-preview-key");
+      const live = state.moviePreviewItemMap.get(previewKey) || getPreviewItemByTrackCard(ui.moviePreviewTrack, card);
+      if (live) playVideo(live);
+    });
+  }
+
   state.moviePreviewLoading = true;
   if (!append) {
     showPreviewRailSkeleton(ui.moviePreviewTrack, 8);
@@ -5048,12 +5230,9 @@ async function loadMoviePreviewRail(append = false) {
         </div>
         <div class="movie-preview-title">${displayTitle}</div>
         <div class="movie-preview-subtitle">${subtitle}</div>
-      `;
+       `;
 
-      card.addEventListener("click", () => {
-        const live = getPreviewItemByTrackCard(ui.moviePreviewTrack, card) || previewItem;
-        playVideo(live);
-      });
+      // [PHASE 2] Individual card click listener removed - using event delegation
       frag.appendChild(card);
       added += 1;
     }
@@ -5275,6 +5454,18 @@ async function loadAnimationRail(append = false) {
   if (state.animationRailLoading) return;
   if (append && !state.animationRailHasMore) return;
 
+  // [PHASE 2] Set up event delegation for animation rail (only once)
+  if (!ui.animationTrack.hasAttribute("data-delegated")) {
+    ui.animationTrack.setAttribute("data-delegated", "true");
+    ui.animationTrack.addEventListener("click", (e) => {
+      const card = e.target.closest(".animation-preview-card");
+      if (!card) return;
+      const previewKey = card.getAttribute("data-preview-key");
+      const live = state.animationPreviewItemMap.get(previewKey) || getPreviewItemByTrackCard(ui.animationTrack, card);
+      if (live) playVideo(live);
+    });
+  }
+
   state.animationRailLoading = true;
   if (!append) {
     showPreviewRailSkeleton(ui.animationTrack, 8);
@@ -5407,10 +5598,7 @@ async function loadAnimationRail(append = false) {
         <div class="movie-preview-title">${title}</div>
         <div class="movie-preview-subtitle">${episode || "LATEST"}</div>
       `;
-      card.addEventListener("click", () => {
-        const live = getPreviewItemByTrackCard(ui.animationTrack, card) || item;
-        playVideo(live);
-      });
+      // [PHASE 2] Individual card click listener removed - using event delegation
       const posterImg = card.querySelector(".movie-preview-poster");
       if (posterImg) {
         posterImg.addEventListener("error", () => {
@@ -5464,6 +5652,18 @@ async function loadDramaRail(append = false) {
   if (!!state.currentPath && !isVirtualRoot("tv_show", state.currentPath)) return;
   if (state.dramaRailLoading) return;
   if (append && !state.dramaRailHasMore) return;
+
+  // [PHASE 2] Set up event delegation for drama rail (only once)
+  if (!ui.dramaTrack.hasAttribute("data-delegated")) {
+    ui.dramaTrack.setAttribute("data-delegated", "true");
+    ui.dramaTrack.addEventListener("click", (e) => {
+      const card = e.target.closest(".movie-preview-card");
+      if (!card) return;
+      const previewKey = card.getAttribute("data-preview-key");
+      const live = state.dramaPreviewItemMap.get(previewKey) || getPreviewItemByTrackCard(ui.dramaTrack, card);
+      if (live) playVideo(live);
+    });
+  }
 
   state.dramaRailLoading = true;
   if (!append) {
@@ -5522,17 +5722,7 @@ async function loadDramaRail(append = false) {
         <div class="movie-preview-title">${title}</div>
         <div class="movie-preview-subtitle">${subtitle}</div>
       `;
-      card.addEventListener("click", () => {
-        const live = getPreviewItemByTrackCard(ui.dramaTrack, card) || item;
-        if (live.is_dir) {
-          state.currentPath = live.path || "";
-          state.pathStack = state.currentPath ? [state.currentPath] : [];
-          state.query = "";
-          loadLibrary(true);
-        } else {
-          playVideo(live);
-        }
-      });
+      // [PHASE 2] Individual card click listener removed - using event delegation
       card.addEventListener("mouseenter", () => {
         dramaRailUserInteracting = true;
         stopDramaRailAutoSlide();
@@ -5611,14 +5801,16 @@ function setupMoviePreviewRail() {
     if (!moviePreviewUserInteracting) stopMoviePreviewPlayback();
     startMoviePreviewAutoSlide();
   });
+  // [PHASE 3] Use shared debounce utility for scroll events
+  const debouncedTriggerPreview = debounce(() => {
+    triggerLeftmostMoviePreview();
+  }, 130);
+
   ui.moviePreviewTrack.addEventListener("scroll", () => {
     if (!ui.moviePreviewTrack) return;
     const remain = ui.moviePreviewTrack.scrollWidth - (ui.moviePreviewTrack.scrollLeft + ui.moviePreviewTrack.clientWidth);
     if (remain < 260) loadMoviePreviewRail(true);
-    if (moviePreviewScrollTimer) clearTimeout(moviePreviewScrollTimer);
-    moviePreviewScrollTimer = setTimeout(() => {
-      triggerLeftmostMoviePreview();
-    }, 130);
+    debouncedTriggerPreview();
   }, { passive: true });
 }
 
@@ -5646,7 +5838,8 @@ function setupAnimationRail() {
   ui.animationTrack.addEventListener("focusout", () => {
     startAnimationRailAutoSlide();
   });
-  ui.animationTrack.addEventListener("scroll", () => {
+  // [PHASE 3] Use shared throttle utility for scroll events
+  const throttledScrollUpdate = throttle(() => {
     if (!ui.animationTrack) return;
     const cards = Array.from(ui.animationTrack.querySelectorAll(".movie-preview-card"));
     const tr = ui.animationTrack.getBoundingClientRect();
@@ -5658,6 +5851,10 @@ function setupAnimationRail() {
       .sort((a, b) => a.getBoundingClientRect().left - b.getBoundingClientRect().left)[0] || cards[0] || null;
     markLeftAnchorCard(ui.animationTrack, leftmost);
     triggerLeftmostPreviewForTrack(ui.animationTrack, true);
+  }, 100);
+
+  ui.animationTrack.addEventListener("scroll", () => {
+    throttledScrollUpdate();
     const remain = ui.animationTrack.scrollWidth - (ui.animationTrack.scrollLeft + ui.animationTrack.clientWidth);
     if (remain < 260) loadAnimationRail(true);
   }, { passive: true });
@@ -5693,8 +5890,13 @@ function setupDramaRail() {
     dramaRailUserInteracting = !!(active && ui.dramaTrack && ui.dramaTrack.contains(active));
     if (!dramaRailUserInteracting) startDramaRailAutoSlide();
   });
-  ui.dramaTrack.addEventListener("scroll", () => {
+  // [PHASE 3] Use shared throttle utility for scroll events
+  const throttledDramaScrollUpdate = throttle(() => {
     triggerLeftmostPreviewForTrack(ui.dramaTrack, true);
+  }, 100);
+
+  ui.dramaTrack.addEventListener("scroll", () => {
+    throttledDramaScrollUpdate();
     const remain = ui.dramaTrack.scrollWidth - (ui.dramaTrack.scrollLeft + ui.dramaTrack.clientWidth);
     if (remain < 260) loadDramaRail(true);
   }, { passive: true });
@@ -5827,7 +6029,7 @@ function setupSettings() {
       btnSaveCategories.disabled = true;
       btnSaveCategories.innerHTML =
         '<i data-lucide="loader-2" class="animate-spin"></i> Saving...';
-      if (window.lucide) lucide.createIcons();
+      if (window.lucide) optimizedCreateIcons();
 
       const bodyParams = new URLSearchParams();
       bodyParams.append("mapping", JSON.stringify(newMapping));
@@ -5845,12 +6047,12 @@ function setupSettings() {
         btnSaveCategories.innerHTML =
           '<i data-lucide="check-circle"></i> Saved & Synced!';
         btnSaveCategories.classList.add("btn-success");
-        if (window.lucide) lucide.createIcons();
+        if (window.lucide) optimizedCreateIcons();
 
         setTimeout(() => {
           btnSaveCategories.innerHTML = originalHTML;
           btnSaveCategories.classList.remove("btn-success");
-          if (window.lucide) lucide.createIcons();
+          if (window.lucide) optimizedCreateIcons();
         }, 3000);
 
         loadLibrary(); // Reload to apply changes
@@ -5905,7 +6107,7 @@ function setupSettings() {
     btnTestConnection.disabled = true;
     btnTestConnection.innerHTML =
       '<i data-lucide="loader-2" class="animate-spin"></i> Testing...';
-    lucide.createIcons();
+    optimizedCreateIcons();
 
     try {
       const testUrl = `${url.replace(/\/$/, "")}/gds_dviewer/normal/search?query=&limit=1&apikey=${key}`;
@@ -5924,7 +6126,7 @@ function setupSettings() {
     } finally {
       btnTestConnection.disabled = false;
       btnTestConnection.innerHTML = '<i data-lucide="zap"></i> Test';
-      lucide.createIcons();
+      optimizedCreateIcons();
     }
   }
 
@@ -6089,7 +6291,7 @@ function setupPlayer() {
     const playIcons = document.querySelectorAll('[data-lucide="play"]');
     playIcons.forEach((icon) => {
       icon.setAttribute("data-lucide", "pause");
-      if (window.lucide) lucide.createIcons();
+      if (window.lucide) optimizedCreateIcons();
     });
     if (ui.btnCenterPlay) ui.btnCenterPlay.classList.remove("show");
   });
@@ -6098,7 +6300,7 @@ function setupPlayer() {
     const pauseIcons = document.querySelectorAll('[data-lucide="pause"]');
     pauseIcons.forEach((icon) => {
       icon.setAttribute("data-lucide", "play");
-      if (window.lucide) lucide.createIcons();
+      if (window.lucide) optimizedCreateIcons();
     });
     if (ui.btnCenterPlay) ui.btnCenterPlay.classList.add("show");
     showUI();
@@ -6113,6 +6315,13 @@ function setupPlayer() {
 
 function closePlayer() {
   console.log("[PLAY] Closing player");
+
+  // [PHASE 1] Clean up clock timer to prevent memory leak
+  if (clockInterval) {
+    clearInterval(clockInterval);
+    clockInterval = null;
+    dlog("[PHASE 1] Clock timer cleaned up");
+  }
 
   // Close native player if active
   if (state.isNativeActive) {
@@ -6223,12 +6432,12 @@ function startNativeStatePolling() {
         const icon = state.nativePaused ? "play" : "pause";
         if (ui.btnOscPlayPause) {
           ui.btnOscPlayPause.innerHTML = `<i data-lucide="${icon}"></i>`;
-          if (window.lucide) lucide.createIcons();
+          if (window.lucide) optimizedCreateIcons();
         }
         if (ui.btnOscCenterPlay) {
           ui.btnOscCenterPlay.style.display = state.nativePaused ? "flex" : "none";
           ui.btnOscCenterPlay.innerHTML = `<i data-lucide="${icon}"></i>`;
-          if (window.lucide) lucide.createIcons();
+          if (window.lucide) optimizedCreateIcons();
         }
       })
       .catch(() => {});
@@ -7547,7 +7756,7 @@ function setupPremiumOSC() {
       if (osc.classList.contains("hidden")) {
         console.log("[OSC] Showing OSC UI");
         osc.classList.remove("hidden");
-        if (window.lucide) lucide.createIcons();
+        if (window.lucide) optimizedCreateIcons();
       }
     }
     document.body.style.cursor = "default";
@@ -7902,7 +8111,7 @@ function setupPremiumOSC() {
     `;
 
     document.body.appendChild(overlay);
-    if (window.lucide) lucide.createIcons();
+    if (window.lucide) optimizedCreateIcons();
 
     const closeMenu = () => overlay.remove();
     overlay.querySelector(".close-options-btn").addEventListener("click", closeMenu);
@@ -7981,7 +8190,7 @@ function setupPremiumOSC() {
 
     overlay.innerHTML = html;
     document.body.appendChild(overlay);
-    if (window.lucide) lucide.createIcons();
+    if (window.lucide) optimizedCreateIcons();
 
     // Close handler
     overlay.querySelector(".close-options-btn").addEventListener("click", () => overlay.remove());
@@ -8102,7 +8311,9 @@ function setupPremiumOSC() {
       ui.oscClock.textContent = now.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
     }
   };
-  setInterval(updateClock, 10000);
+  // [PHASE 1] Store timer reference for cleanup
+  if (clockInterval) clearInterval(clockInterval);
+  clockInterval = setInterval(updateClock, 10000);
   updateClock();
 
   // Progress Slider
