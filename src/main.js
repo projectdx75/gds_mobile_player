@@ -94,6 +94,7 @@ const state = {
   nextEpisodeItem: null,
   nextEpisodeResolveSeq: 0,
   openingSkipDismissPath: "",
+  playLaunchSeq: 0,
 };
 
 // Platform Detection
@@ -148,6 +149,7 @@ const trickplayManifestCache = new Map();
 let trickplayHideTimer = null;
 let openingSkipCache = null;
 let apiCacheDbPromise = null;
+const deferredPlayKickoff = new WeakSet();
 
 function resetNativeSeekPending() {
   state.nativeSeekPendingSteps = 0;
@@ -2727,25 +2729,37 @@ async function loadLibrary(forceRefresh = false, isAppend = false) {
         loadDramaRail(false).catch(() => {});
       }
 
-      let renderItems = displayItems;
-      if (!isAppend && state.currentPath && Array.isArray(displayItems) && displayItems.some((i) => i && !i.is_dir)) {
-        const reqSeq = ++state.episodeMetaReqSeq;
-        const targetPath = state.currentPath;
-        try {
-          const hydrated = await hydrateItemsWithEpisodeMeta(targetPath, displayItems, state.sourceId, reqSeq);
-          if (reqSeq === state.episodeMetaReqSeq) {
-            renderItems = hydrated.items;
-            if (!hydrated.hasMeta) {
-              dlog("[EP_META] no yaml metadata found for folder:", targetPath);
-            }
-          }
-        } catch (e) {
-          dlog("[EP_META] pre-render hydrate skipped:", e?.message || e);
-        }
-      }
+      // Render immediately for snappier folder/context transitions.
+      const renderItems = displayItems;
+      const shouldAsyncHydrateMeta =
+        !isAppend &&
+        !!state.currentPath &&
+        Array.isArray(displayItems) &&
+        displayItems.some((i) => i && !i.is_dir);
+      const hydrateReqSeq = shouldAsyncHydrateMeta ? ++state.episodeMetaReqSeq : 0;
+      const hydratePath = shouldAsyncHydrateMeta ? state.currentPath : "";
 
       if (!isAppend) renderFolderContextPanel(renderItems);
       renderGrid(grid, renderItems, isFolderCategory, isAppend);
+
+      // Enrich episode metadata in background; don't block first paint.
+      if (shouldAsyncHydrateMeta) {
+        hydrateItemsWithEpisodeMeta(hydratePath, displayItems, state.sourceId, hydrateReqSeq)
+          .then((hydrated) => {
+            if (hydrateReqSeq !== state.episodeMetaReqSeq) return;
+            if (state.currentPath !== hydratePath) return;
+            if (!hydrated?.hasMeta) {
+              dlog("[EP_META] no yaml metadata found for folder:", hydratePath);
+              return;
+            }
+            state.library = hydrated.items || state.library;
+            renderFolderContextPanel(hydrated.items || []);
+            renderGrid(grid, hydrated.items || [], isFolderCategory, false);
+          })
+          .catch((e) => {
+            dlog("[EP_META] async hydrate skipped:", e?.message || e);
+          });
+      }
 
       // [FIX] Ensure scroll is at top after rendering first page
       if (!isAppend && state.currentView === "library") {
@@ -3307,7 +3321,7 @@ function renderGrid(container, items, isFolderCategory = false, isAppend = false
   }
 
   const currentPathText = String(state.currentPath || "");
-  const movieLikePath = /(^|\/)(영화|movie)(\/|$)/i.test(currentPathText);
+  const movieLikePath = /(^|\/)([^/]*영화[^/]*|movie|movies|film|cinema)(\/|$)/i.test(currentPathText);
   const animationLikePath = isAnimationContextPath();
   const animationPathHint = /(^|\/)(애니메이션|animation|anime)(\/|$)/i.test(currentPathText);
   const hasEpisodeLikeStructure = Array.isArray(items)
