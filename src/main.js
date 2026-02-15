@@ -192,6 +192,7 @@ const state = {
   dramaPreviewItemMap: new Map(),
   dramaPreviewCache: new LRUCache(200, "dramaPreviewCache"),
   apiResponseCache: new LRUCache(180, "apiResponseCache"),
+  apiInFlightRequests: new Map(),
   apiCacheHits: 0,
   apiCacheMisses: 0,
   folderContextPrimaryItem: null,
@@ -2113,6 +2114,7 @@ async function clearApiDiskCache() {
 function clearApiResponseCache(reason = "manual") {
   const count = state.apiResponseCache.size;
   state.apiResponseCache.clear();
+  state.apiInFlightRequests.clear();
   dlog(`[GDS-CACHE] cleared (${reason}) entries=${count}, hit=${state.apiCacheHits}, miss=${state.apiCacheMisses}`);
   state.apiCacheHits = 0;
   state.apiCacheMisses = 0;
@@ -2264,15 +2266,18 @@ async function gdsFetch(endpoint, options = {}) {
   if (cacheable) {
     const hit = apiCacheGet(cacheKey, cacheTtlMs);
     if (hit) {
+      console.log(`[GDS-CACHE] HIT(mem) ${endpoint}`);
       dlog(`[GDS-CACHE] HIT (${method}) ${endpoint} ttl=${cacheTtlMs}ms`);
       return hit;
     }
     const diskHit = await apiDiskCacheGet(cacheKey, cacheTtlMs);
     if (diskHit) {
+      console.log(`[GDS-CACHE] HIT(disk) ${endpoint}`);
       dlog(`[GDS-CACHE] DISK-HIT (${method}) ${endpoint} ttl=${cacheTtlMs}ms`);
       apiCacheSet(cacheKey, diskHit);
       return diskHit;
     }
+    console.log(`[GDS-CACHE] MISS ${endpoint}`);
     dlog(`[GDS-CACHE] MISS (${method}) ${endpoint}`);
   }
 
@@ -2303,8 +2308,7 @@ async function gdsFetch(endpoint, options = {}) {
   // 여기서는 fetch API가 자동으로 Tauri에 의해 가로채지지 않는 경우 대비
   const tauriPlugin = window.__TAURI_PLUGIN_HTTP__;
 
-  // Browser fetch fallback with enhanced error reporting
-  try {
+  const doNetworkFetch = async () => {
     const fetchOptions = {
       method,
       headers: options.headers || {},
@@ -2344,6 +2348,24 @@ async function gdsFetch(endpoint, options = {}) {
       apiDiskCacheSet(cacheKey, data).catch(() => {});
     }
     return data;
+  };
+
+  // Browser fetch fallback with enhanced error reporting
+  try {
+    if (cacheable) {
+      const pending = state.apiInFlightRequests.get(cacheKey);
+      if (pending) {
+        console.log(`[GDS-CACHE] JOIN(in-flight) ${endpoint}`);
+        return await pending;
+      }
+      const requestPromise = doNetworkFetch()
+        .finally(() => {
+          state.apiInFlightRequests.delete(cacheKey);
+        });
+      state.apiInFlightRequests.set(cacheKey, requestPromise);
+      return await requestPromise;
+    }
+    return await doNetworkFetch();
   } catch (e) {
     console.error("[GDS-API] Fetch Error:", e);
     throw e;
@@ -2371,6 +2393,20 @@ function hideLoader() {
     loader.classList.remove("active");
     setTimeout(() => { loader.style.width = "0"; }, 300);
   }, 200);
+}
+
+function buildGridSkeletonMarkup(count = 6) {
+  return Array(Math.max(0, Number(count) || 0))
+    .fill(
+      `<div class="card skeleton">
+        <div class="card-skeleton-media"></div>
+        <div class="card-skeleton-info">
+          <span class="card-skeleton-line line-1"></span>
+          <span class="card-skeleton-line line-2"></span>
+        </div>
+      </div>`,
+    )
+    .join("");
 }
 
 async function loadLibrary(forceRefresh = false, isAppend = false) {
@@ -2458,9 +2494,7 @@ async function loadLibrary(forceRefresh = false, isAppend = false) {
     const shouldShowSkeleton =
       forceRefresh || !state.isFirstFreshLoadDone || state.library.length === 0 || grid.children.length === 0;
     if (shouldShowSkeleton) {
-    grid.innerHTML = Array(6)
-      .fill('<div class="card skeleton"></div>')
-      .join("");
+      grid.innerHTML = buildGridSkeletonMarkup(6);
       if (heroSection) heroSection.style.display = "none";
     }
   }
@@ -3434,7 +3468,7 @@ function openEpisodeDrawer(rawItems = [], contextTitle = "회차 보기") {
         if (item.is_dir) {
           state.currentPath = item.path;
           state.pathStack.push(item.path);
-          loadLibrary(item.path);
+          loadLibrary(true);
           updateBreadcrumbChips();
         } else {
           playVideo(item);
@@ -3467,7 +3501,7 @@ function renderGrid(container, items, isFolderCategory = false, isAppend = false
       if (item.is_dir) {
         state.pathStack.push(item.path);
         state.currentPath = item.path;
-        loadLibrary();
+        loadLibrary(true);
       } else {
         playVideo(item);
       }
@@ -3977,9 +4011,7 @@ async function performSearch(query) {
   // Don't clear grid immediately to avoid flicker; only show loading if it takes too long
   const currentItems = grid.querySelectorAll(".card").length;
   if (currentItems === 0) {
-    grid.innerHTML = Array(4)
-      .fill('<div class="card skeleton"></div>')
-      .join("");
+    grid.innerHTML = buildGridSkeletonMarkup(4);
   }
 
   const invoke =

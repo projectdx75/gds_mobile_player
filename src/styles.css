@@ -696,6 +696,49 @@ body.appletv-skin .card:not(.batch-hidden) {
   animation: shimmer 2.2s ease-in-out infinite;
 }
 
+.card.skeleton {
+  display: flex;
+  flex-direction: column;
+  min-height: clamp(220px, 28vw, 350px);
+  border-radius: var(--border-radius-md);
+  overflow: hidden;
+  border: 1px solid rgba(177, 204, 245, 0.18);
+}
+
+.card.skeleton .card-skeleton-media {
+  width: 100%;
+  aspect-ratio: 2 / 3;
+  border-bottom: 1px solid rgba(177, 204, 245, 0.14);
+  background: linear-gradient(90deg, #101827 25%, #1a2a45 50%, #101827 75%);
+  background-size: 200% 100%;
+  animation: shimmer 2.2s ease-in-out infinite;
+}
+
+.card.skeleton .card-skeleton-info {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  padding: 12px 12px 14px;
+  background: rgba(8, 18, 36, 0.8);
+}
+
+.card.skeleton .card-skeleton-line {
+  display: block;
+  height: 12px;
+  border-radius: 8px;
+  background: linear-gradient(90deg, #15233c 25%, #22365a 50%, #15233c 75%);
+  background-size: 200% 100%;
+  animation: shimmer 2.2s ease-in-out infinite;
+}
+
+.card.skeleton .card-skeleton-line.line-1 {
+  width: 88%;
+}
+
+.card.skeleton .card-skeleton-line.line-2 {
+  width: 54%;
+}
+
 @keyframes shimmer {
   0% {
     background-position: 200% 0;
@@ -3794,7 +3837,7 @@ body.appletv-skin .folder-episode-list-btn:hover {
   top: 0;
   right: 0;
   height: 100%;
-  width: min(460px, 42vw);
+  width: min(720px, 62vw);
   min-width: 320px;
   background: linear-gradient(180deg, rgba(11, 20, 40, 0.98) 0%, rgba(8, 16, 32, 0.98) 100%);
   border-left: 1px solid rgba(168, 212, 255, 0.28);
